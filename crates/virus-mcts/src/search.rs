@@ -454,6 +454,28 @@ impl<'net> MctsSearcher<'net> {
         &self.nodes[0].actions
     }
 
+    /// The position the tree is currently rooted at.
+    ///
+    /// The only way to check, from outside, that a re-rooted tree still
+    /// describes the position its owner thinks it does. A pondering client
+    /// re-roots off snapshots it decoded itself, so the tree's root and the
+    /// authoritative snapshot are two independent derivations of the same
+    /// position — and ARCHITECTURE.md invariant 5 says the snapshot wins.
+    /// Comparing them is what turns "we searched the wrong tree" from a silent
+    /// strength regression into a loud, droppable event.
+    pub fn root_state(&self) -> &State {
+        &self.nodes[0].state
+    }
+
+    /// Total visits below the root: the size, in simulations, of the tree that
+    /// a re-root kept.
+    ///
+    /// Distinct from [`MctsSearcher::sims_run`], which is cumulative over the
+    /// searcher's whole life and never goes down.
+    pub fn root_visit_total(&self) -> u64 {
+        u64::from(self.nodes[0].visits)
+    }
+
     /// Per-root-action visit counts, parallel to [`MctsSearcher::root_actions`].
     /// This is the self-play policy target.
     pub fn root_visits(&self) -> &[u32] {
@@ -1246,6 +1268,109 @@ mod tests {
         assert!(searcher.rebase(action));
         assert_eq!(searcher.nodes[0].state, applied);
         assert_eq!(searcher.nodes[0].mover, applied.current_player());
+    }
+
+    /// Batching's virtual loss must be gone by the time a re-root happens.
+    ///
+    /// Hypothesis 1 of bd `vsbot-gei`: a re-root taken while `vl`/`vl_visits`
+    /// were non-zero would orphan those adjustments into the surviving subtree,
+    /// leaving edges that look permanently worse than they are — a systematic
+    /// `Q` corruption that would read exactly like "confident bad moves". The
+    /// structural claim that rules it out is that a round is atomic
+    /// (descend/evaluate/back up), so this asserts the whole arena is clean at
+    /// every point a caller could possibly re-root from.
+    #[test]
+    fn a_batched_search_leaves_no_virtual_loss_behind_for_a_re_root_to_inherit() {
+        for batch_size in [1, 2, 8, 16] {
+            let config = Config {
+                batch_size,
+                ..Config::play()
+            };
+            let mut searcher = MctsSearcher::new(state_with(1, 3), config, None);
+            // Deliberately not a multiple of the batch size, so the last round
+            // is a partial one.
+            searcher.run_sims(453);
+            assert_clean(&searcher, batch_size, "after simulating");
+
+            let action = searcher.best_action().expect("a best action");
+            assert!(searcher.rebase(action));
+            assert_clean(&searcher, batch_size, "after re-rooting");
+
+            searcher.run_sims(211);
+            assert_clean(&searcher, batch_size, "after simulating a re-rooted tree");
+        }
+    }
+
+    /// Every node's book-keeping is self-consistent and free of in-flight state.
+    fn assert_clean(searcher: &MctsSearcher<'_>, batch_size: u16, when: &str) {
+        for (id, node) in searcher.nodes.iter().enumerate() {
+            assert!(
+                node.vl.iter().all(|v| *v == 0),
+                "batch {batch_size}: node {id} still carries virtual loss {:?} {when}",
+                node.vl
+            );
+            assert_eq!(
+                node.vl_visits, 0,
+                "batch {batch_size}: node {id} still counts in-flight descents {when}"
+            );
+            assert!(
+                !node.pending,
+                "batch {batch_size}: node {id} is still marked pending {when}"
+            );
+            assert_eq!(
+                node.visits,
+                node.n.iter().sum::<u32>(),
+                "batch {batch_size}: node {id}'s visit total disagrees with its edges {when}"
+            );
+            if node.expanded {
+                assert_eq!(
+                    node.prior.len(),
+                    node.actions.len(),
+                    "batch {batch_size}: node {id} has a prior of the wrong width {when}"
+                );
+            }
+        }
+    }
+
+    /// The tree's root position is what a caller re-rooting off snapshots has to
+    /// check itself against (bd `vsbot-gei`'s permanent assertion).
+    #[test]
+    fn the_root_state_and_visit_total_describe_the_tree_that_survived_a_re_root() {
+        let root = state_with(1, 3);
+        let mut searcher = MctsSearcher::new(root.clone(), Config::play(), None);
+        assert_eq!(searcher.root_state(), &root);
+        assert_eq!(searcher.root_visit_total(), 0, "an unsearched root is empty");
+
+        searcher.run_sims(400);
+        assert_eq!(searcher.root_state(), &root, "searching does not move the root");
+        assert_eq!(searcher.root_visit_total(), 400);
+
+        let action = searcher.best_action().expect("a best action");
+        let applied = root.apply(action).expect("the searched action is legal");
+        let inherited = {
+            let edge = searcher.nodes[0]
+                .actions
+                .iter()
+                .position(|a| *a == action)
+                .expect("a root action");
+            u64::from(searcher.nodes[searcher.nodes[0].children[edge] as usize].visits)
+        };
+        assert!(searcher.rebase(action));
+        assert_eq!(
+            searcher.root_state(),
+            &applied,
+            "the tree must be rooted at the position the action reaches"
+        );
+        assert_eq!(
+            searcher.root_visit_total(),
+            inherited,
+            "the visit total must describe what the re-root kept, not the whole run"
+        );
+        assert!(
+            searcher.sims_run() > searcher.root_visit_total(),
+            "the cumulative simulation count must survive the re-root that the visit \
+             total does not"
+        );
     }
 
     #[test]

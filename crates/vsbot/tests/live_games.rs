@@ -26,21 +26,33 @@
 //! | `VSBOT_ITEST_SOAK_GAMES` | `20`                                        |
 //! | `VSBOT_ITEST_SOAK_TURN_MS` | `240` — turn budget for the soak          |
 //! | `VSBOT_ITEST_SOAK_OPPONENT` | `greedy` \| `mcts`                         |
+//! | `VSBOT_ITEST_GAUNTLET`   | unset — the ponder gauntlet skips           |
+//! | `VSBOT_ITEST_GAUNTLET_GAMES` | `100` — split across both directions    |
+//! | `VSBOT_ITEST_GAUNTLET_TURN_MS` | `600` — turn budget for the gauntlet  |
 //!
-//! Three scenarios live here. The protocol run pits two instant engines against
+//! Four scenarios live here. The protocol run pits two instant engines against
 //! each other and is about *ordering*; the MCTS run puts the real champion on
 //! one side and is about the engine adapter — that a searched move survives the
 //! round trip and that the domain guard never lets an out-of-domain position
 //! reach the searcher's asserts. The **ponder soak** is the acceptance gate for
 //! S2's T3: twenty-plus games with `VSBOT_PONDER=true` on one side, asserting
 //! zero forfeits, zero illegal moves, and — the point of the exercise — zero
-//! out-of-turn emissions. They each start their own server, so [`SERIAL`] keeps
-//! them from racing for a port.
+//! out-of-turn emissions. The **ponder gauntlet** is the acceptance gate for
+//! `vsbot-gei`: the same engine with pondering on and off, both seat orders,
+//! scored on the server's own verdicts. They each start their own server, so
+//! [`SERIAL`] keeps them from racing for a port.
 //!
 //! ```text
 //! VSBOT_ITEST=1 VSBOT_ITEST_SOAK=1 cargo test -p vsbot --test live_games \
 //!   --release ponder_soak -- --nocapture
+//!
+//! VSBOT_ITEST=1 VSBOT_ITEST_GAUNTLET=1 cargo test -p vsbot --test live_games \
+//!   --release ponder_on_is_not_weaker -- --nocapture
 //! ```
+//!
+//! `VSBOT_PONDER_TRACE=1` adds one line per answered action (see
+//! `vsbot::mcts`), which is how the re-root and early-stop behaviour of a run
+//! is read afterwards.
 //!
 //! The server hard-codes `:8080` in `main.go`, which is no good for a test that
 //! must not fight whatever else the developer has running. It is therefore
@@ -123,7 +135,7 @@ async fn two_bots_play_full_games_without_a_single_illegal_move() {
         label: "protocol",
         target_games,
         budget: Budget::PerAction(Duration::from_millis(50)),
-        ponder: false,
+        ponder: PonderSide::Neither,
         timeout: OVERALL_TIMEOUT,
         challenger: Arc::new(GreedyEngine),
         acceptor: neutral_engine.clone(),
@@ -187,7 +199,7 @@ async fn the_mcts_champion_plays_a_full_game_without_a_single_illegal_move() {
         label: "mcts",
         target_games,
         budget: Budget::PerAction(Duration::from_millis(move_millis)),
-        ponder: false,
+        ponder: PonderSide::Neither,
         timeout: OVERALL_TIMEOUT,
         challenger: setup.engine,
         acceptor: Arc::new(GreedyEngine),
@@ -277,7 +289,7 @@ async fn ponder_soak_plays_twenty_games_without_a_forfeit_or_an_out_of_turn_acti
         label: "ponder-soak",
         target_games,
         budget: Budget::PerTurn(Duration::from_millis(turn_millis)),
-        ponder: true,
+        ponder: PonderSide::Challenger,
         timeout: Duration::from_secs(1800),
         challenger: engine(1),
         acceptor,
@@ -318,6 +330,145 @@ async fn ponder_soak_plays_twenty_games_without_a_forfeit_or_an_out_of_turn_acti
     );
 }
 
+/// The strength gate for pondering (bd `vsbot-gei`): ponder-on against
+/// ponder-off, same engine, same budget, refereed by the real server.
+///
+/// The soak above proves pondering is *safe*; this proves it is not a
+/// downgrade, which is the thing the owner's canary actually failed on. Free
+/// compute that loses games is worse than no compute at all.
+///
+/// # Why both directions
+///
+/// The server seats the challenger at P1 and P1 moves first on an empty board,
+/// so a single-direction run would fold first-mover advantage into the number.
+/// The run is therefore split in half: the ponderer challenges for the first
+/// half and accepts for the second, and the two halves are pooled.
+///
+/// # What is asserted, and what is only reported
+///
+/// The clean-run properties are hard assertions. The score is reported with a
+/// Wilson 95% interval and asserted only *one-sided* — the interval's upper
+/// bound must reach 0.50, i.e. the run must not have demonstrated that
+/// pondering is weaker. Asserting the point estimate itself would make a
+/// hundred-game test a coin flip, and ARCHITECTURE.md invariant 7 is explicit
+/// that strength claims want ≥400 games; the ≥0.50 acceptance number lives in
+/// the bead and is read off this test's printed output, not enforced by it.
+#[allow(clippy::await_holding_lock)] // see the note on the scenario above
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn ponder_on_is_not_weaker_than_ponder_off_over_a_local_gauntlet() {
+    if std::env::var("VSBOT_ITEST_GAUNTLET").as_deref() != Ok("1") {
+        eprintln!("skipping the ponder gauntlet: set VSBOT_ITEST_GAUNTLET=1 (it takes an hour)");
+        return;
+    }
+    let Some(_guard) = enabled("ponder-gauntlet") else {
+        return;
+    };
+    let total_games: u64 = std::env::var("VSBOT_ITEST_GAUNTLET_GAMES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100);
+    let turn_millis: u64 = std::env::var("VSBOT_ITEST_GAUNTLET_TURN_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(600);
+    let per_direction = total_games.div_ceil(2);
+
+    let artifact = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../artifacts/mcts_champion.json");
+    let engine = |seed: u64| {
+        build_engine(
+            EngineKind::Mcts,
+            &MctsSettings {
+                artifact: artifact.clone(),
+                seed,
+            },
+        )
+        .expect("the in-repo champion loads and validates")
+        .engine
+    };
+
+    // Both directions, pooled. The ponderer is the challenger (P1) in the first
+    // block and the acceptor (P2) in the second.
+    let mut ponderer = (0.0, 0u64);
+    let mut lines = Vec::new();
+    for (label, side) in [
+        ("ponder-gauntlet-p1", PonderSide::Challenger),
+        ("ponder-gauntlet-p2", PonderSide::Acceptor),
+    ] {
+        let report = run_scenario(Scenario {
+            label,
+            target_games: per_direction,
+            budget: Budget::PerTurn(Duration::from_millis(turn_millis)),
+            ponder: side,
+            timeout: Duration::from_secs(7_200),
+            challenger: engine(1),
+            acceptor: engine(2),
+        })
+        .await;
+        report.assert_clean(per_direction);
+        let (on, off) = if side == PonderSide::Challenger {
+            (&report.challenger, &report.acceptor)
+        } else {
+            (&report.acceptor, &report.challenger)
+        };
+        assert!(
+            on.ponder_answers > 0,
+            "{label}: no turn was answered out of the ponder tree; the block proved nothing"
+        );
+        assert_eq!(
+            off.ponder_steps, 0,
+            "{label}: the control side must not have pondered"
+        );
+        assert_eq!(
+            on.fallback_actions, 0,
+            "{label}: the pondering side fell back {} times — the time manager did not hold",
+            on.fallback_actions
+        );
+        ponderer.0 += on.score();
+        ponderer.1 += on.decided();
+        lines.push(format!(
+            "  {label}: ponder-on {}W/{}L/{}D ({} pondered answers), ponder-off {}W/{}L/{}D",
+            on.games_won,
+            on.games_lost,
+            on.games_drawn,
+            on.ponder_answers,
+            off.games_won,
+            off.games_lost,
+            off.games_drawn,
+        ));
+    }
+
+    let (score, games) = ponderer;
+    assert!(games > 0, "the gauntlet decided no games");
+    let rate = score / games as f64;
+    let (low, high) = wilson95(score, games);
+    eprintln!(
+        "OK (ponder gauntlet): ponder-on scored {score}/{games} = {rate:.3} \
+         [Wilson95 {low:.3}, {high:.3}] at {turn_millis}ms/turn, both directions pooled\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        high >= 0.50,
+        "ponder-on scored {rate:.3} over {games} games [Wilson95 {low:.3}, {high:.3}] — the \
+         interval is entirely below 0.50, so pondering is measurably WEAKER than not \
+         pondering. Free compute that loses games is a regression, not a feature."
+    );
+}
+
+/// Wilson 95% interval for `score` successes (halves allowed) out of `games`.
+///
+/// The same interval `virus_arena::stats` reports, reimplemented in four lines
+/// rather than depending on the arena crate from `vsbot`'s tests: the dependency
+/// direction in CLAUDE.md puts `arena` alongside `vsbot`, not beneath it.
+fn wilson95(score: f64, games: u64) -> (f64, f64) {
+    const Z: f64 = 1.959_963_984_540_054;
+    let n = games as f64;
+    let p = score / n;
+    let denominator = 1.0 + Z * Z / n;
+    let centre = (p + Z * Z / (2.0 * n)) / denominator;
+    let spread = Z * ((p * (1.0 - p) / n + Z * Z / (4.0 * n * n)).sqrt()) / denominator;
+    ((centre - spread).max(0.0), (centre + spread).min(1.0))
+}
+
 /// The `VSBOT_ITEST` gate plus the cross-scenario lock, or `None` to skip.
 fn enabled(label: &str) -> Option<std::sync::MutexGuard<'static, ()>> {
     if std::env::var("VSBOT_ITEST").as_deref() != Ok("1") {
@@ -342,15 +493,39 @@ enum Budget {
     PerTurn(Duration),
 }
 
+/// Which side of a scenario ponders.
+///
+/// The server always seats the **challenger at P1** (see the seat-imbalance note
+/// in `crossplay.py`), so which side ponders is also which colour ponders. A
+/// gauntlet that only ever pondered as the challenger would be measuring
+/// first-mover advantage as much as pondering; running both directions and
+/// pooling is what cancels it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PonderSide {
+    Neither,
+    Challenger,
+    Acceptor,
+}
+
+impl PonderSide {
+    fn challenger(self) -> bool {
+        self == PonderSide::Challenger
+    }
+
+    fn acceptor(self) -> bool {
+        self == PonderSide::Acceptor
+    }
+}
+
 /// One end-to-end run: which engines, for how many games, at what budget.
 struct Scenario {
     /// Names the scenario's workdir, so concurrent runs never share a server.
     label: &'static str,
     target_games: u64,
     budget: Budget,
-    /// Whether the *challenger* side ponders. The acceptor never does, so one
-    /// run covers both the new behaviour and the control.
-    ponder: bool,
+    /// Which side ponders. The other side is the control, so one run carries
+    /// both the new behaviour and its baseline.
+    ponder: PonderSide,
     /// How long the whole run may take.
     timeout: Duration,
     challenger: Arc<dyn SearchEngine>,
@@ -375,10 +550,25 @@ struct Side {
     illegal_moves: u64,
     actions_sent: u64,
     games_finished: u64,
+    games_won: u64,
+    games_lost: u64,
+    games_drawn: u64,
     fallback_actions: u64,
     ponder_steps: u64,
     ponder_answers: u64,
     last_error: Option<String>,
+}
+
+impl Side {
+    /// Score from this side's point of view: a win is 1, a draw is a half, and
+    /// draws land in the denominator (the `virus_arena::stats` convention).
+    fn score(&self) -> f64 {
+        self.games_won as f64 + self.games_drawn as f64 / 2.0
+    }
+
+    fn decided(&self) -> u64 {
+        self.games_won + self.games_lost + self.games_drawn
+    }
 }
 
 struct Report {
@@ -500,9 +690,9 @@ async fn play(port: u16, scenario: Scenario) -> (Side, Side) {
         challenger: true,
         challenge_interval: Duration::from_secs(2),
         rng_seed: Some(0x5EED),
-        // Only the challenger ponders, so one run carries both the new
-        // behaviour and its control.
-        ponder: scenario.ponder,
+        // Exactly one side ponders, so one run carries both the new behaviour
+        // and its control.
+        ponder: scenario.ponder.challenger(),
         ponder_budget: Duration::from_secs(5),
         fallback_grace: ITEST_FALLBACK_GRACE,
         ..BotConfig::default()
@@ -514,6 +704,8 @@ async fn play(port: u16, scenario: Scenario) -> (Side, Side) {
     let mut acceptor_config = BotConfig {
         backend_url: url,
         name_prefix: "ITestAcceptor".to_owned(),
+        ponder: scenario.ponder.acceptor(),
+        ponder_budget: Duration::from_secs(5),
         fallback_grace: ITEST_FALLBACK_GRACE,
         ..BotConfig::default()
     };
@@ -562,6 +754,9 @@ fn side(name: &'static str, bot: &Bot) -> Side {
         illegal_moves: core.counters.illegal_moves,
         actions_sent: core.counters.actions_sent,
         games_finished: core.counters.games_finished,
+        games_won: core.counters.games_won,
+        games_lost: core.counters.games_lost,
+        games_drawn: core.counters.games_drawn,
         fallback_actions: core.counters.fallback_actions,
         ponder_steps: core.counters.ponder_steps,
         ponder_answers: core.counters.ponder_answers,

@@ -127,6 +127,16 @@ pub struct Counters {
     pub stale_results_dropped: u64,
     /// `game_end` messages for our game.
     pub games_finished: u64,
+    /// Of those, the ones whose winning seat was ours.
+    ///
+    /// The server decides the result — including the territory tiebreak on a
+    /// turn-capped game — so this is the referee's verdict, not the client's
+    /// opinion of the final board. A local gauntlet scores off these three.
+    pub games_won: u64,
+    /// Games whose winning seat was somebody else's.
+    pub games_lost: u64,
+    /// Games that ended with no winning seat.
+    pub games_drawn: u64,
     /// Challenges we initiated.
     pub challenges_sent: u64,
     /// Actions answered with the pre-selected fallback because the engine
@@ -682,6 +692,12 @@ impl Bot {
             return;
         }
         core.counters.games_finished += 1;
+        // Read the seat before `go_idle` clears it.
+        match message.winner {
+            0 => core.counters.games_drawn += 1,
+            seat if seat == i32::from(core.seat) => core.counters.games_won += 1,
+            _ => core.counters.games_lost += 1,
+        }
         core.go_idle();
         drop(core);
         self.log(&format!("game ended, winner seat {}", message.winner));
