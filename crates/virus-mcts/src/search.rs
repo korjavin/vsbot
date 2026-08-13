@@ -626,10 +626,12 @@ impl<'net> MctsSearcher<'net> {
     ///
     /// **The sim-savings measurement.** Equal to [`MctsSearcher::node_count`]
     /// exactly when the arena holds no duplicate, which is what
-    /// [`Config::dag`] guarantees; the shortfall in a plain tree is the number
-    /// of expansions — and net forwards — it spent on a position it had already
-    /// evaluated somewhere else. Comparing the two arms at equal simulations is
-    /// what the S3-T2 numbers are.
+    /// [`Config::dag`] gives whenever [`MctsSearcher::key_collisions`] is zero
+    /// — a rejected key collision leaves the loser position without an index
+    /// entry, so further arrivals at it duplicate. The shortfall in a plain
+    /// tree is the number of expansions — and net forwards — it spent on a
+    /// position it had already evaluated somewhere else. Comparing the two arms
+    /// at equal simulations is what the S3-T2 numbers are.
     ///
     /// `O(nodes)` and allocating, so it is a diagnostic for benches and tests,
     /// not something to call inside a search.
@@ -787,11 +789,17 @@ impl<'net> MctsSearcher<'net> {
     /// [`MctsSearcher::new`] gives the original one: the root is never a merge
     /// target, so noised priors are never shared.
     ///
+    /// The index's own cost is small enough to state and forget: one
+    /// `(u64, u32)` entry per node, against a [`Node`] that owns a whole
+    /// `State` plus six per-edge vectors over a ~34-wide action list — order of
+    /// a few percent. It is also bounded by the arena rather than by the search
+    /// history, precisely because this rebuilds it.
+    ///
     /// The overall story is therefore: **nodes are bounded by what a ponder
     /// budget can reach from the current root, and every opponent action
-    /// collapses that bound.** The DAG lowers the constant — measurably, since
-    /// within-turn permutations are the common case — and changes nothing about
-    /// the shape of the reclamation.
+    /// collapses that bound.** The DAG changes nothing about the shape of that
+    /// reclamation; what it changes is that the bound is spent on distinct
+    /// positions instead of on copies of them.
     pub fn rebase(&mut self, action: Action) -> bool {
         if self.nodes[0].terminal {
             return false;
