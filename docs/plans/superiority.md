@@ -277,16 +277,19 @@ score ≥ the current champion's recorded score against the same opponent minus 
 (≈5 pts at 400). Rationale: the RL gate is self-referential (net vs net); B anchors the
 ladder to fixed external opponents so a cycle-exploiting candidate cannot climb.
 
-**Gate C — owner canary (the promotion).** Per the Goodhart lesson: vs-ai2.52 dominated
-every scripted gate and lost 3 straight to the owner by turtling; "eval changes ship
-canary-first; the owner is the only promotion judge"; gates are "sanity floors, not
-strength proof" (canary doc:9-16). Mechanics, matching the existing runbook: the
-candidate never auto-ships (server doc:96-100); it deploys under a distinct canary bot
-identity on `vs.wandergeek.org`, the owner plays it, and the owner's verdict — not any
-number from A/B — promotes it to the default artifact (one candidate per canary, the
-`canary/` branch discipline, canary doc:89-95). New live budgets (§2b) are canaried the
-same way as new nets: a longer-thinking or pondering bot is a behavior change the owner
-judges — and the 10–15 s turn bound is itself owner-set UX, revisable only by the owner.
+**Gate C — automated live soak (the promotion).** REVISED per owner decision
+2026-08-13: the owner exited the gatekeeper role ("roll candidates without me").
+A candidate that clears Gates A and B deploys under a distinct canary identity on
+`vs.wandergeek.org` and must complete **>= 20 live games with zero protocol
+incidents** (illegal moves, timeouts, out-of-turn emissions) at a pace within the
+10-15 s/turn UX bound; then it **auto-promotes** (one candidate per canary,
+canary doc:89-95; full procedure in docs/CANARY.md). The Goodhart risk this
+leaves open (vs-ai2.52 dominated every scripted gate and lost 3 straight to the
+owner by turtling, canary doc:9-16) is accepted by owner decision and mitigated
+by the human-games curriculum (§2f), the seconds-fast rollback, and the standing
+rule that owner feedback at any time files a bug and can trigger rollback —
+exercised on the 2026-08-13 ponder canary. Behavior changes (budgets, ponder)
+follow the same automated path.
 
 **Never gated on:** holdout top-1, value MAE, or any offline metric — logged for
 debugging only (seven documented disconnects, deep-labels doc:40-44; invariant 7,
