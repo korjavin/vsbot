@@ -46,7 +46,7 @@ services:
       # turn's actions by the intra-turn allocator. The owner's UX bound is
       # 10-15 s per turn (owner directive 2026-08-13); the server's 120 s
       # per-action timer is a failsafe, not a budget.
-      VSBOT_TURN_MILLIS: ${VSBOT_TURN_MILLIS:-12000}
+      VSBOT_TURN_MILLIS: ${VSBOT_TURN_MILLIS:-10000}
 
       # Per-action override. Setting either of these DISABLES the allocator and
       # gives every action a fixed budget — that is for gauntlets and A/Bs, not
