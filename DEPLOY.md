@@ -5,16 +5,14 @@ How the bot is containerized and how it runs against the public server at
 
 ## What is actually deployed today
 
-**A protocol soak test, not a strong bot.** The only engine wired into the
-binary is `GREEDY` — the deliberately weak reference engine that exists so the
-wire protocol can be exercised end to end. `virus-search` (alpha-beta) and
-`virus-mcts` (PUCT + policy/value net) are still stubs, and selecting them is a
-*hard startup failure* rather than a silent fallback, so a deployment can never
-believe it is running the champion while playing at random.
-
-So this stack proves: TLS and the WebSocket handshake, `welcome`/registration,
-reconnect with backoff, turn handling, and move legality. It proves nothing
-about playing strength. Flip `SEARCH` once the engines merge.
+**The gen-5 MCTS champion.** `SEARCH=MCTS` is the default: PUCT over the
+conv policy/value net (`MCTS_ARTIFACT`, baked into the image), batched SIMD
+inference, driven by the intra-turn time allocator at 10 s per 3-action turn.
+A bad or missing artifact is a *hard startup failure*, and a per-game domain
+mismatch (>2 players, non-12×12) falls back to `GREEDY` with a `WARNING` line
+on every change of verdict — a deployment can never silently believe it is
+running the champion while playing at random. Strength claims still come only
+from ≥400-game gauntlets (`docs/benchmarks.md`), never from live play.
 
 ## Environment knobs
 
@@ -26,14 +24,14 @@ unparseable value **fails startup** instead of quietly falling back.
 | --- | --- | --- |
 | `BACKEND_URL` | `ws://localhost:8080/ws` | WebSocket endpoint. The binary appends `?bot=true` and `&namePrefix=…` itself — do not put them in the URL. |
 | `BOT_NAME_PREFIX` | *(empty)* | Prefixed onto the server-assigned name. Compose sets `SuperiorBot`, which the lobby shows as e.g. `SuperiorBot Bot 2127`. |
-| `VSBOT_TURN_MILLIS` | `12000` | Wall-clock budget for a whole **3-action turn**, split 50/30/20 across the turn's actions. This is the number the owner's 10–15 s UX bound is expressed in; the server's 120 s per-action timer is a failsafe, never a budget. |
+| `VSBOT_TURN_MILLIS` | `10000` | Wall-clock budget for a whole **3-action turn**, split 50/30/20 across the turn's actions. Set to 10 s by owner verdict after live play (PR #16); the server's 120 s per-action timer is a failsafe, never a budget. |
 | `VSBOT_MOVE_MILLIS` | *(unset)* | Per-action override. Setting it **disables the intra-turn allocator** — every action gets exactly this, nothing is banked or released. Use it for gauntlets and A/Bs, not for live play. |
 | `MOVE_MILLIS` | *(unset)* | The pre-allocator spelling of `VSBOT_MOVE_MILLIS`, still honoured so an existing `.env` keeps meaning what it meant. If both are set, `VSBOT_MOVE_MILLIS` wins. |
 | `VSBOT_EARLY_STOP` | `true` | Stop as soon as the visit leader cannot be overtaken in what is left of the budget, and give the remainder to the next action. |
 | `VSBOT_EXTENSION` | `true` | Run past an action's target toward its ceiling while the root is unstable. The ceiling is capped by what remains of the turn, so extensions can never break the turn bound. |
-| `VSBOT_PONDER` | `false` | Search the opponent's positions during their turn, re-rooting into the matched child on each of their actions. **Canary-first**: a pondering bot is a behaviour change only the owner promotes (superiority.md Gate C). |
+| `VSBOT_PONDER` | `false` | Search the opponent's positions during their turn, re-rooting into the matched child on each of their actions. **Off pending bug `vsbot-gei`** (2026-08-13 canary found a quality regression); when fixed, it re-ships through the automated canary path (docs/CANARY.md). |
 | `VSBOT_PONDER_SECS` | `30` | Cap on one pondering step. Bounds CPU and tree memory on a host shared with the nightly trainer window. |
-| `SEARCH` | `GREEDY` | `GREEDY` \| `ALPHABETA` \| `MCTS`. `ALPHABETA` aborts startup until its crate is wired. |
+| `SEARCH` | `MCTS` | `GREEDY` \| `ALPHABETA` \| `MCTS`. `MCTS` is the default (compose and image agree). `ALPHABETA` aborts startup — the crate is merged but not yet wired into the binary. |
 | `CHALLENGER` | `false` | Whether the bot initiates games on a timer. **Keep this `false` in production** (see below). |
 | `CHALLENGER_INTERVAL_SECS` | `300` | Challenger period; first tick is jittered. Irrelevant while `CHALLENGER=false`. |
 
@@ -54,9 +52,9 @@ and was answered with the pre-selected fallback instead of a searched move — a
 ### Upgrading past the time manager
 
 Before the allocator, the image hard-coded `MOVE_MILLIS=1000` and every action
-got a second. Now the image sets `VSBOT_TURN_MILLIS=12000` and no per-action
+got a second. Now the image sets `VSBOT_TURN_MILLIS=10000` and no per-action
 override, so a plain `docker compose pull && up -d` **changes the bot's pace**:
-one 12 s turn instead of three 1 s actions. That is the intended S2 behaviour and
+one 10 s turn instead of three 1 s actions. That is the intended S2 behaviour and
 it is inside the owner's UX bound — but it is a behaviour change, so canary it
 rather than rolling it straight onto the default identity.
 
@@ -106,7 +104,7 @@ A healthy start looks like:
 
 ```
 vsbot 0.1.0 starting: url=wss://vs.wandergeek.org/ws search=MCTS challenger=false
-vsbot: budget=12000ms/turn split 50/30/20 across up to 3 actions (early-stop=true, extension=true) ponder=off
+vsbot: budget=10000ms/turn split 50/30/20 across up to 3 actions (early-stop=true, extension=true) ponder=off
 vsbot: engine=MCTS artifact=/opt/vsbot/artifacts/mcts_champion.json …
 [vsbot] connected to wss://vs.wandergeek.org/ws?bot=true&namePrefix=SuperiorBot
 [SuperiorBot Bot 2127] registered as SuperiorBot Bot 2127 (d6c2f97a-…)
@@ -122,7 +120,7 @@ Overrides go in a `.env` file next to `docker-compose.yml` (it is gitignored):
 
 ```
 BOT_NAME_PREFIX=SuperiorBot
-VSBOT_TURN_MILLIS=12000
+VSBOT_TURN_MILLIS=10000
 VSBOT_PONDER=false
 VSBOT_TAG=latest
 ```
