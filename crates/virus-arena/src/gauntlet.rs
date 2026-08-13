@@ -32,7 +32,7 @@
 //!
 //! # Draws
 //!
-//! A game that reaches the ply cap is a **draw**, not a territory decision.
+//! A game that reaches the turn cap is a **draw**, not a territory decision.
 //! That is Java's tally rule and it is the conservative one: territory at the
 //! cap measures who was ahead in a game neither side finished, which is a
 //! different question from who won. The territory verdict is still computed and
@@ -169,8 +169,8 @@ impl GauntletConfig {
 pub enum Termination {
     /// A player was eliminated or ran out of moves; the state is terminal.
     Decided,
-    /// The ply cap was reached. Scored as a draw.
-    PlyCap,
+    /// The turn cap was reached. Scored as a draw.
+    TurnCap,
     /// A side returned no action while legal actions existed. This should never
     /// happen and is surfaced rather than swallowed.
     Stalled,
@@ -293,7 +293,7 @@ pub fn run(
     let mut max_overrun = Duration::ZERO;
     for game in &collected {
         record.add(game.outcome_for_a());
-        if game.termination == Termination::PlyCap {
+        if game.termination == Termination::TurnCap {
             capped += 1;
         }
         max_overrun = max_overrun.max(game.max_overrun);
@@ -350,7 +350,7 @@ pub fn play_game(
     // — but the flags say "turns" and there is no reason for them to mean
     // something else.
     let ply_ceiling = config.ply_ceiling();
-    let mut termination = Termination::PlyCap;
+    let mut termination = Termination::TurnCap;
     let mut plies = 0u32;
     let mut turns = 0u32;
     let mut max_overrun = Duration::ZERO;
@@ -674,7 +674,7 @@ mod tests {
                 "game {} exceeded the ply ceiling",
                 game.index
             );
-            if game.termination == Termination::PlyCap {
+            if game.termination == Termination::TurnCap {
                 assert_eq!(game.turns, 4, "a capped game stops exactly at the cap");
             }
             // The whole point of the fix: at least one game must have a turn

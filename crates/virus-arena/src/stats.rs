@@ -280,7 +280,7 @@ impl fmt::Display for Summary {
             record.margin(),
         )?;
         if self.capped > 0 {
-            writeln!(f, "  ply-capped games: {} (scored as draws)", self.capped)?;
+            writeln!(f, "  turn-capped games: {} (scored as draws)", self.capped)?;
         }
         if self.max_overrun_ms > 0 {
             writeln!(
