@@ -1,0 +1,26 @@
+[package]
+name = "virus-selfplay"
+description = "AlphaZero self-play row generator: MCTS-vs-MCTS games emitted in the SelfPlayMcts JSONL schema."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+virus-core = { workspace = true }
+virus-mcts = { workspace = true }
+# Rows are JSONL and the trainer reads them by key, so the emitter needs a JSON
+# writer. `serde`'s derive fixes the field order of `Row` at compile time, which
+# is what keeps the emitted key order identical to Java's `ObjectNode` insertion
+# order — cosmetic for the trainer, but it makes a `diff` against a Java-emitted
+# file readable, and that diff is the only cheap cross-check we have.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# `src/bin/selfplay.rs` is the CLI a generation script invokes, and it is left
+# to cargo's `src/bin/*.rs` auto-discovery rather than an explicit `[[bin]]`
+# with a `path` — the same reasoning as `virus-arena`'s `arena` bin: the
+# Dockerfile's dependency-cache layer builds `-p vsbot` against stub crates that
+# have only an empty `src/lib.rs`, and an explicitly-pathed target would name a
+# file that does not exist in that layer.

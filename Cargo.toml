@@ -7,6 +7,7 @@ members = [
     "crates/virus-mcts",
     "crates/virus-proto",
     "crates/virus-arena",
+    "crates/virus-selfplay",
     "crates/vsbot",
 ]
 
@@ -24,6 +25,7 @@ virus-search = { path = "crates/virus-search" }
 virus-mcts = { path = "crates/virus-mcts" }
 virus-proto = { path = "crates/virus-proto" }
 virus-arena = { path = "crates/virus-arena" }
+virus-selfplay = { path = "crates/virus-selfplay" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", default-features = false }
