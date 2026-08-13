@@ -1076,7 +1076,21 @@ def main(argv: list[str]) -> int:
     return 0 if report["games"] >= args.games else 1
 
 
+def _terminate(signum, frame):  # noqa: ARG001
+    """Turns SIGTERM into an orderly shutdown.
+
+    Python's default SIGTERM handling exits without unwinding, so the `finally`
+    blocks that kill the server, the bots and the Java container never run and
+    the whole tree is orphaned — each child is in its own session, so nothing
+    else will collect it. `crossplay_pool.py` terminates its shards on
+    interruption and depends on this; so does anyone pressing Ctrl-C's less
+    forgiving cousin.
+    """
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _terminate)
     try:
         sys.exit(main(sys.argv[1:]))
     except Failure as error:

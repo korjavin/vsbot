@@ -86,13 +86,18 @@ def main(argv: list[str]) -> int:
     theirs = "GoBot" if args.opponent == "go" else "JavaBot"
 
     processes = []
-    workdirs = []
+    # (workdir, baseline). The baseline is each shard's max rowid *before* it
+    # starts, exactly as `crossplay.py` takes its own: `--workdir` is documented
+    # as kept rather than cleaned, so a re-run against the same root would
+    # otherwise pool the previous run's games into this one's headline and could
+    # even report success without playing a game.
+    shards: list[tuple[Path, int]] = []
     for index, games in enumerate(per_shard):
         if games == 0:
             continue
         shard = root / f"shard-{index}"
         shard.mkdir(parents=True, exist_ok=True)
-        workdirs.append(shard)
+        shards.append((shard, crossplay.max_rowid(shard / "data" / "games.db")))
         command = [
             sys.executable, str(script),
             "--games", str(games),
@@ -111,7 +116,7 @@ def main(argv: list[str]) -> int:
 
     try:
         while True:
-            pooled = pool(workdirs, ours, theirs)
+            pooled = pool(shards, ours, theirs)
             alive = [p for p in processes if p.poll() is None]
             print(
                 f"  pooled {pooled['total']}/{args.games} | "
@@ -123,17 +128,42 @@ def main(argv: list[str]) -> int:
                 break
             time.sleep(args.poll_secs)
     finally:
-        for process in processes:
-            if process.poll() is None:
-                process.terminate()
+        shutdown(processes)
 
-    pooled = pool(workdirs, ours, theirs)
+    pooled = pool(shards, ours, theirs)
     report = render(pooled, args, theirs)
     print(json.dumps(report, indent=2))
     return 0 if pooled["total"] >= args.games else 1
 
 
-def pool(workdirs: list[Path], ours: str, theirs: str) -> dict:
+def shutdown(processes: list) -> None:
+    """Stops the shards and, through them, everything they started.
+
+    A shard's server, bots and Java container are each in their own session (see
+    `crossplay.spawn`), so signalling this process group would never reach them.
+    What does reach them is the shard's own teardown, which is why `crossplay.py`
+    turns SIGTERM into an orderly exit: terminate the shard, give it time to run
+    its `finally`, and only then escalate. Skipping the wait is how a run leaves
+    a Java container playing into the next run's database.
+    """
+    for process in processes:
+        if process.poll() is None:
+            process.terminate()
+    deadline = time.time() + 30
+    for process in processes:
+        remaining = max(0.0, deadline - time.time())
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            print(
+                f"pool: shard pid {process.pid} ignored SIGTERM; killing it. Check "
+                "for surviving `docker` containers and servers.",
+                file=sys.stderr,
+            )
+            process.kill()
+
+
+def pool(shards: list[tuple[Path, int]], ours: str, theirs: str) -> dict:
     """Sums every shard's tally, unioning the game fingerprints."""
     total = {
         key: 0
@@ -144,8 +174,8 @@ def pool(workdirs: list[Path], ours: str, theirs: str) -> dict:
         )
     }
     fingerprints: set[str] = set()
-    for shard in workdirs:
-        one = crossplay.tally(shard / "data" / "games.db", 0, ours, theirs)
+    for shard, baseline in shards:
+        one = crossplay.tally(shard / "data" / "games.db", baseline, ours, theirs)
         for key in total:
             total[key] += one[key]
         fingerprints |= one["fingerprints"]
