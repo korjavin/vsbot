@@ -170,9 +170,135 @@ one the acceptance run used.
 Repository-backed stack it can; for a pulled image, drop `build:` or set
 `VSBOT_TAG` to a published tag so the image is fetched rather than built.
 
-Driving the Portainer *API* from CI (a redeploy webhook, as `nnue-trainer`
-does) needs a webhook URL stored as a repository secret. That is deliberately
-not set up here — no credentials were available — so redeploys are manual.
+Both paths above are about *this* host, where the source tree is present and a
+stack can be built. A Portainer somewhere else should use the `deploy` branch
+instead — next section.
+
+## Hosting elsewhere via Portainer
+
+For a Portainer that is **not** on this build host, the repository publishes a
+CI-owned `deploy` branch: on every master push, `.github/workflows/docker.yml`
+builds and pushes the image, renders `deploy/docker-compose.yml` with the
+`image:` pinned to that build's immutable `sha-<commit>` tag, force-pushes the
+result to `deploy` as the repository-root `docker-compose.yml`, and then fires
+any configured Portainer redeploy webhooks.
+
+```
+master push ─► build+push ghcr.io/korjavin/vsbot:{latest,sha-<commit>}
+            ─► render deploy/docker-compose.yml with image: …:sha-<commit>
+            ─► git push --force origin deploy
+            ─► POST $PORTAINER_WEBHOOK_URL…      (optional, silent when unset)
+```
+
+So the deploy branch always answers "what is deployed?" with a commit, not with
+a moving `:latest`. Nothing on that branch is hand-written — **never commit to
+`deploy`; it is rewritten on every master push.**
+
+### 0. One-time: make the GHCR package public
+
+> **Do this before creating the stack.** The `vsbot` container package was first
+> published while the repository was private, so the package is still
+> **private** even though the repository is public now — GitHub does not flip
+> package visibility when the repo's changes, and there is no REST API for it
+> either. Verified on 2026-08-13: `docker pull ghcr.io/korjavin/vsbot:latest`
+> after `docker logout ghcr.io` fails with `unauthorized`, and even the
+> anonymous registry token endpoint refuses (`UNAUTHORIZED`).
+
+The fix is a one-time click, and only the repository owner can do it:
+
+1. <https://github.com/users/korjavin/packages/container/package/vsbot>
+   (or github.com → your profile → **Packages** → **vsbot**)
+2. **Package settings** (right-hand side)
+3. **Danger Zone → Change visibility → Public**, confirm with the package name.
+
+Verify from any machine with no credentials:
+
+```bash
+docker logout ghcr.io
+docker pull ghcr.io/korjavin/vsbot:latest     # must succeed
+```
+
+**Fallback if it stays private** (or if you would rather not publish the
+image): give Portainer a registry credential instead. In Portainer,
+**Registries → Add registry → Custom registry**, URL `ghcr.io`, username your
+GitHub username, password a **classic** personal access token with the
+`read:packages` scope. Then, when creating the stack, Portainer will use that
+registry's credentials for the pull. The compose file needs no change either
+way — it is the same image reference. On a plain Docker host without Portainer
+the equivalent is `docker login ghcr.io -u <user> -p <PAT>` once.
+
+### 1. Create the stack from the deploy branch
+
+Portainer → **Stacks** → **Add stack** → **Repository**:
+
+| Field | Value |
+| --- | --- |
+| Repository URL | `https://github.com/korjavin/vsbot` |
+| Repository reference | `refs/heads/deploy` |
+| Compose path | `docker-compose.yml` |
+| Authentication | off (public repository) |
+| GitOps updates | optional — polling works, but the webhook below is instant |
+
+Do **not** point it at `master`: that compose has a `build:` key and a `:latest`
+tag, i.e. it asks a remote host to compile the Rust workspace.
+
+### 2. Environment variables
+
+The stack works with an empty environment — every knob has a production default
+baked into the compose file. Set only what you want to differ (Portainer's
+stack **Environment variables** table):
+
+| Variable | Default on the deploy branch | When to set it |
+| --- | --- | --- |
+| `BACKEND_URL` | `wss://vs.wandergeek.org/ws` | Pointing at a private/staging backend. |
+| `BOT_NAME_PREFIX` | `SuperiorBot` | **Set this if a second installation exists** — two hosts under the same prefix are indistinguishable in the lobby. |
+| `VSBOT_TURN_MILLIS` | `10000` | Slower/faster host, or a canary at the top of the UX bound. |
+| `SEARCH` | `MCTS` | Only to fall back to `GREEDY`. `ALPHABETA` aborts startup. |
+| `VSBOT_PONDER` | `false` | Off pending bd `vsbot-gei`; canary it, do not just turn it on. |
+| `CHALLENGER` | `false` | Keep false against the public server (see above). |
+| `VSBOT_CONTAINER_NAME` | `vsbot` | Only if another container on that host already owns the name. |
+| `VSBOT_CPUS` / `VSBOT_MEMORY` | `2.0` / `512M` | Smaller or larger host. |
+
+The full meaning of each is the table at the top of this file — the deploy
+compose forwards the same set the local one does.
+
+### 3. Wire the redeploy webhook (optional)
+
+In the stack's page, **Webhooks** → enable → copy the URL, then add it as a
+repository secret:
+
+- <https://github.com/korjavin/vsbot/settings/secrets/actions> → **New repository secret**
+- Name: `PORTAINER_WEBHOOK_URL`, value: the copied URL.
+
+Several installations: either put **several URLs in that one secret**, separated
+by commas or whitespace, or use `PORTAINER_WEBHOOK_URL_2` and
+`PORTAINER_WEBHOOK_URL_3`. All of them are optional — with none set the workflow
+says so and moves on, and the deploy branch still updates, so a Portainer with
+GitOps polling enabled will catch up on its own schedule. A webhook that
+answers non-2xx is reported as a warning on the run (and in the job summary)
+but does not fail master: the image and the branch are already correct at that
+point. URLs are never printed.
+
+### 4. Promoting, rolling back, and checking what is live
+
+- **Promote:** merge to master. The deploy branch moves, the webhook fires,
+  Portainer pulls the new pinned tag. Nothing to do by hand. Two merges in
+  quick succession are safe: deploys are serialised, and a run whose commit is
+  no longer master's tip skips its own deploy (a notice on the run says so), so
+  the branch only ever moves forward.
+- **Roll back:** in the Portainer stack editor, change the one `image:` line to
+  the previous `sha-<commit>` tag and redeploy — the whole stack state is that
+  one line. Note the next master push rewrites the deploy branch and a
+  webhook/GitOps redeploy will roll you forward again, so a rollback that must
+  survive is a `git revert` on master, not an edit in Portainer.
+- **Which commit is live:** `git ls-remote origin refs/heads/deploy` and read
+  the compose on that branch, or read the `image:` in Portainer's stack editor.
+
+```bash
+# what the deploy branch currently pins, without cloning it
+git fetch origin deploy
+git show origin/deploy:docker-compose.yml | grep '^\s*image:'
+```
 
 ## Promote and roll back
 
@@ -185,6 +311,10 @@ not set up here — no credentials were available — so redeploys are manual.
 > the rollback drill. This section is only the tag mechanics that runbook calls
 > into — reaching for it directly means skipping the owner's verdict, which is
 > the one thing that promotes anything (`superiority.md` §4 Gate C).
+
+This section is the **local** stack's tag mechanics. A remote Portainer does
+not use `VSBOT_TAG` at all — its tag is pinned in the deploy branch's compose
+(see "Hosting elsewhere via Portainer" above).
 
 Every master merge publishes two tags from `.github/workflows/docker.yml`:
 
