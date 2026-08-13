@@ -124,15 +124,21 @@ const MAX_TURNS: u32 = 100;
 const EPSILON: f64 = 0.15;
 const EXPLORE_TURNS: u32 = 8;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GameOutcome {
     winner: Player,
     a_is_p1: bool,
     capped: bool,
-    sims_a: u64,
-    sims_b: u64,
-    moves_a: u64,
-    moves_b: u64,
+    /// Simulations bought by each of side A's actions, and each of side B's.
+    ///
+    /// Kept per action rather than summed because the **mean is worthless
+    /// here**: a near-terminal endgame position has a small, fully expanded
+    /// tree whose leaves are all terminal, so its simulations need no net at
+    /// all and run three orders of magnitude faster than a midgame one. A
+    /// handful of such actions per game swamp any total. The median is the
+    /// number that describes a typical action.
+    per_action_a: Vec<u64>,
+    per_action_b: Vec<u64>,
 }
 
 impl GameOutcome {
@@ -165,8 +171,7 @@ fn play_game(
     let ply_ceiling = MAX_TURNS * u32::from(ACTIONS_PER_TURN);
     let mut plies = 0u32;
     let mut turns = 0u32;
-    let mut sims = [0u64; 2];
-    let mut moves = [0u64; 2];
+    let mut sims: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
     let mut capped = true;
 
     while turns < MAX_TURNS && plies < ply_ceiling {
@@ -185,8 +190,7 @@ fn play_game(
         // colours of a pair must see the same sequence of search calls.
         let (searched, ran) = arm.choose(&state, net, millis);
         let a_moved = (mover == 1) == a_is_p1;
-        sims[usize::from(!a_moved)] += ran;
-        moves[usize::from(!a_moved)] += 1;
+        sims[usize::from(!a_moved)].push(ran);
 
         let chosen = if turns < EXPLORE_TURNS && rng.next_f64() < EPSILON {
             legal[rng.below(legal.len()).expect("legal is non-empty")]
@@ -215,14 +219,13 @@ fn play_game(
         plies += 1;
     }
 
+    let [per_action_a, per_action_b] = sims;
     GameOutcome {
         winner: if capped { 0 } else { state.outcome_winner() },
         a_is_p1,
         capped,
-        sims_a: sims[0],
-        sims_b: sims[1],
-        moves_a: moves[0],
-        moves_b: moves[1],
+        per_action_a,
+        per_action_b,
     }
 }
 
@@ -340,7 +343,7 @@ fn main() {
     outcomes.sort_by(|x, y| x.score_for_a().total_cmp(&y.score_for_a()));
 
     let (mut wins, mut losses, mut draws, mut capped) = (0u32, 0u32, 0u32, 0u32);
-    let (mut sims_a, mut sims_b, mut moves_a, mut moves_b) = (0u64, 0u64, 0u64, 0u64);
+    let (mut sims_a, mut sims_b): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
     for game in &outcomes {
         match game.score_for_a() {
             s if s > 0.75 => wins += 1,
@@ -348,11 +351,11 @@ fn main() {
             _ => draws += 1,
         }
         capped += u32::from(game.capped);
-        sims_a += game.sims_a;
-        sims_b += game.sims_b;
-        moves_a += game.moves_a;
-        moves_b += game.moves_b;
+        sims_a.extend_from_slice(&game.per_action_a);
+        sims_b.extend_from_slice(&game.per_action_b);
     }
+    sims_a.sort_unstable();
+    sims_b.sort_unstable();
     let n = wins + losses + draws;
     let pooled = (f64::from(wins) + 0.5 * f64::from(draws)) / f64::from(n.max(1));
     let (low, high) = wilson95(f64::from(wins), n);
@@ -363,11 +366,24 @@ fn main() {
         100.0 * f64::from(wins) / f64::from(n.max(1))
     );
     println!("  pooled score {pooled:.4} (W+0.5D)/N   gate A needs >= 0.5500");
-    println!(
-        "  sims/action: A {:.0}, B {:.0}   ({:.2}x)",
-        sims_a as f64 / moves_a.max(1) as f64,
-        sims_b as f64 / moves_b.max(1) as f64,
-        (sims_a as f64 / moves_a.max(1) as f64) / (sims_b as f64 / moves_b.max(1) as f64).max(1e-9)
-    );
+    // Quartiles, not means: see `GameOutcome::per_action_a`. The upper quartile
+    // is where the net-bound positions live and is the number the throughput
+    // work is about; the lower one is the near-terminal endgame, where a
+    // simulation touches no net at all and both arms are identical.
+    let quantile = |sorted: &[u64], q: f64| -> u64 {
+        if sorted.is_empty() {
+            return 0;
+        }
+        sorted[(((sorted.len() - 1) as f64) * q) as usize]
+    };
+    for (label, q) in [("p25", 0.25), ("median", 0.5), ("p75", 0.75)] {
+        let a = quantile(&sims_a, q);
+        let b = quantile(&sims_b, q);
+        println!(
+            "  sims/action {label:>6}: A {a:>9}, B {b:>9}   ({:.2}x)",
+            a as f64 / (b.max(1)) as f64
+        );
+    }
+    println!("  actions searched: A {}, B {}", sims_a.len(), sims_b.len());
     println!("  elapsed {:.1}s", started.elapsed().as_secs_f64());
 }
