@@ -32,19 +32,41 @@
 //! hand-built tree whose movers do not alternate — the case a per-edge negation
 //! gets wrong — and on the mirrored-position identity for the leaf flip.
 //!
+//! # Leaf batching and virtual loss
+//!
+//! A simulation's cost is dominated by the one net forward its expansion pays
+//! for, and a single 13x12x12 forward leaves most of the machine idle (see
+//! [`PolicyValueNet::forward_batch`]). So the searcher does not run one
+//! simulation at a time: it descends [`Config::batch_size`] times in a row,
+//! collecting that many leaves, evaluates them as **one** batched forward, and
+//! only then backs the results up.
+//!
+//! Repeating selection against an unchanged tree would pick the same leaf every
+//! time, so each descent applies a **virtual loss** to the edges it walks: the
+//! edge's effective visit count goes up by one and its effective `Q` is dragged
+//! towards a loss *for the node's own mover*, which is what decorrelates the
+//! batch. Virtual loss is tracked in separate `vl`/`vl_visits` counters rather
+//! than folded into `n`/`w`, so removing it after backup is an exact
+//! decrement — no floating-point residue — and so a search with
+//! `batch_size == 1` is bit-for-bit the serial searcher: nothing is ever in
+//! flight when the only descent of a round selects.
+//!
 //! # Randomness
 //!
 //! Play mode draws nothing: `run_sims` and `run_until_deadline` are pure
-//! functions of the position, the config and the net. Dirichlet root noise and
-//! temperature sampling are self-play only, and both run off the seeded
-//! [`Rng`], so even those are reproducible.
+//! functions of the position, the config and the net, batched or not. Dirichlet
+//! root noise and temperature sampling are self-play only, and both run off the
+//! seeded [`Rng`], so even those are reproducible.
+//!
+//! Thread parallelism lives in [`crate::parallel::ParallelMcts`], a separate
+//! opt-in type: this searcher is single-threaded and deterministic, full stop.
 
 use std::time::{Duration, Instant};
 
 use virus_core::{Action, Player, Scratch, State};
 use virus_eval::{evaluate, EvalParams, EvalWorkspace};
 
-use crate::net::{Encoded, NetScratch, PolicyValueNet, BOARD};
+use crate::net::{BatchScratch, Encoded, Heads, NetScratch, PolicyValueNet, BOARD};
 use crate::rng::Rng;
 
 /// Sentinel for "this edge has no child node yet".
@@ -62,6 +84,23 @@ pub const DEFAULT_VALUE_SCALE: f64 = 12_000.0;
 /// Plies of temperature-1 visit sampling at the start of a self-play game:
 /// 21 plies = 7 turns.
 pub const TEMPERATURE_PLIES: u32 = 21;
+
+/// Default leaves per batched net evaluation.
+///
+/// Tuned on this box's 4 vCPUs against `examples/mctsbench`: the batched trunk
+/// is already at full vector width by 8, and past ~16 the extra decorrelation
+/// pressure on the tree costs more than the remaining throughput buys. 8 and 16
+/// measured within noise of each other; 16 wins slightly at longer budgets,
+/// where the tree is big enough to absorb it.
+pub const DEFAULT_BATCH_SIZE: u16 = 16;
+
+/// Default virtual-loss weight, in leaf-value units.
+///
+/// One whole loss, the AlphaGo setting. Leaf values live in `[-1, 1]`, so an
+/// edge with one descent in flight and no real visits scores `Q = -1` — bad
+/// enough that the next descent in the batch takes a genuinely different
+/// branch, and transient, because it is removed the moment the batch backs up.
+pub const DEFAULT_VIRTUAL_LOSS: f64 = 1.0;
 
 /// Where a leaf's value comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -94,6 +133,16 @@ pub struct Config {
     /// Sample the root action from the visit counts (temperature 1) instead of
     /// taking the argmax. **Self-play only.**
     pub visit_sampling: bool,
+    /// Leaves collected per batched net evaluation. `0` and `1` both mean the
+    /// serial searcher; see the module docs.
+    pub batch_size: u16,
+    /// Virtual-loss weight applied to an edge with a descent in flight.
+    /// Inert at `batch_size <= 1` in a single-threaded search.
+    pub virtual_loss: f64,
+    /// Worker threads for [`crate::parallel::ParallelMcts`]. **Ignored by
+    /// [`MctsSearcher`]**, which is single-threaded by construction; it lives
+    /// here so a caller can carry one configuration through both.
+    pub threads: usize,
 }
 
 impl Default for Config {
@@ -107,6 +156,9 @@ impl Default for Config {
             noise_alpha: 0.3,
             noise_epsilon: 0.25,
             visit_sampling: false,
+            batch_size: DEFAULT_BATCH_SIZE,
+            virtual_loss: DEFAULT_VIRTUAL_LOSS,
+            threads: 1,
         }
     }
 }
@@ -140,14 +192,24 @@ struct Node {
     /// Absolute-frame terminal value; meaningful only when `terminal`.
     terminal_value_abs: f64,
     expanded: bool,
+    /// Set while this node is a collected-but-unevaluated leaf of the current
+    /// batch, so a second descent in the same batch reuses its pending
+    /// evaluation instead of queueing a duplicate forward.
+    pending: bool,
     actions: Vec<Action>,
     prior: Vec<f32>,
     children: Vec<u32>,
     n: Vec<u32>,
     /// Absolute-frame value sums — positive is good for player 1.
     w: Vec<f64>,
+    /// Descents currently in flight through each edge — the virtual loss.
+    /// Always back to all-zero once a batch has backed up.
+    vl: Vec<u32>,
     /// Sum of the edge visits below this node.
     visits: u32,
+    /// `vl` summed over the edges, kept alongside so selection does not have to
+    /// re-add it.
+    vl_visits: u32,
 }
 
 impl Node {
@@ -164,14 +226,35 @@ impl Node {
             terminal,
             terminal_value_abs,
             expanded: false,
+            pending: false,
             actions: Vec::new(),
             prior: Vec::new(),
             children: Vec::new(),
             n: Vec::new(),
             w: Vec::new(),
+            vl: Vec::new(),
             visits: 0,
+            vl_visits: 0,
         }
     }
+}
+
+/// One collected leaf of the current batch.
+#[derive(Clone, Copy, Debug)]
+struct Leaf {
+    node: u32,
+    /// `Some` for a terminal leaf, whose value needs no net; `None` until the
+    /// batched forward fills it in.
+    value: Option<f64>,
+}
+
+/// One collected descent, as a slice of the shared path buffer plus the leaf it
+/// ended at. Several paths may share a leaf.
+#[derive(Clone, Copy, Debug)]
+struct Descent {
+    start: usize,
+    end: usize,
+    leaf: usize,
 }
 
 /// Terminal value in the absolute frame, from the single labelling rule
@@ -195,7 +278,7 @@ pub fn terminal_value_abs(state: &State) -> f64 {
 /// the same rationale as the alpha-beta searcher's leaf evaluation — then
 /// squashed and flipped to positive-is-good-for-player-1. That flip is the
 /// single sign application the whole design turns on.
-fn hand_tuned_value_abs(
+pub(crate) fn hand_tuned_value_abs(
     state: &State,
     value_scale: f64,
     params: &EvalParams,
@@ -221,11 +304,19 @@ pub struct MctsSearcher<'net> {
     nodes: Vec<Node>,
     rng: Rng,
     sims: u64,
-    /// Reusable path buffers, so a simulation allocates nothing.
-    path_nodes: Vec<u32>,
-    path_edges: Vec<u32>,
+    /// Reusable batch buffers, so a round of simulations allocates nothing
+    /// beyond new tree nodes.
+    path: Vec<(u32, u32)>,
+    descents: Vec<Descent>,
+    leaves: Vec<Leaf>,
+    eval_index: Vec<usize>,
+    encoded: Vec<Encoded>,
+    heads: Vec<Heads>,
     scratch: Box<Scratch>,
     net_scratch: Option<NetScratch>,
+    /// Allocated on the first batched forward, not up front: it is ~0.5 MB and
+    /// a `batch_size <= 1` searcher never touches it.
+    batch_scratch: Option<BatchScratch>,
     eval_params: EvalParams,
     eval_workspace: EvalWorkspace,
 }
@@ -267,10 +358,15 @@ impl<'net> MctsSearcher<'net> {
             nodes: vec![Node::new(state)],
             rng: Rng::new(config.seed),
             sims: 0,
-            path_nodes: Vec::with_capacity(64),
-            path_edges: Vec::with_capacity(64),
+            path: Vec::with_capacity(1024),
+            descents: Vec::with_capacity(64),
+            leaves: Vec::with_capacity(64),
+            eval_index: Vec::with_capacity(64),
+            encoded: Vec::with_capacity(64),
+            heads: Vec::with_capacity(64),
             scratch: Scratch::new(),
             net_scratch,
+            batch_scratch: None,
             eval_params: EvalParams::default(),
             eval_workspace: EvalWorkspace::new(),
         };
@@ -286,23 +382,36 @@ impl<'net> MctsSearcher<'net> {
     /// Runs exactly `count` further simulations.
     ///
     /// Deterministic: for a given position, config and net this always builds
-    /// the same tree and returns the same move.
+    /// the same tree and returns the same move. Batching does not change that —
+    /// the leaves of a round are collected, evaluated and backed up in a fixed
+    /// order — but a different [`Config::batch_size`] does build a different
+    /// (equally valid) tree, exactly as a different `cpuct` would.
     pub fn run_sims(&mut self, count: u32) {
         if self.nodes[0].terminal {
             return;
         }
-        for _ in 0..count {
-            self.simulate_once();
+        let batch = u32::from(self.config.batch_size.max(1));
+        let mut done = 0;
+        while done < count {
+            done += self.simulate_round(batch.min(count - done));
         }
     }
 
     /// Simulates until `deadline`, always running at least one simulation.
+    ///
+    /// The deadline is checked between batches, so a budget can overshoot by up
+    /// to one batch — at the tuned [`DEFAULT_BATCH_SIZE`] a couple of
+    /// milliseconds, against the hundreds a real move budget allows. Callers
+    /// that slice a turn into deadlines (the `vsbot` bin does) still land
+    /// inside their fallback discipline; a caller that needs the old
+    /// simulation-granular check can set `batch_size` to 1.
     pub fn run_until_deadline(&mut self, deadline: Instant) {
         if self.nodes[0].terminal {
             return;
         }
+        let batch = u32::from(self.config.batch_size.max(1));
         loop {
-            self.simulate_once();
+            self.simulate_round(batch);
             if Instant::now() >= deadline {
                 return;
             }
@@ -317,6 +426,11 @@ impl<'net> MctsSearcher<'net> {
     /// Simulations run so far.
     pub fn sims_run(&self) -> u64 {
         self.sims
+    }
+
+    /// The configuration this searcher was built with.
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// The root's legal actions, in `virus-core` enumeration order. Empty at a
@@ -394,18 +508,57 @@ impl<'net> MctsSearcher<'net> {
 
     // ---------------------------------------------------------------- core
 
-    fn simulate_once(&mut self) {
-        self.path_nodes.clear();
-        self.path_edges.clear();
+    /// Collects up to `target` descents, evaluates their leaves in one batched
+    /// forward, backs the values up and removes the virtual loss.
+    ///
+    /// Returns the number of simulations actually run, which is `target` unless
+    /// the root is terminal.
+    fn simulate_round(&mut self, target: u32) -> u32 {
+        self.path.clear();
+        self.descents.clear();
+        self.leaves.clear();
+        for _ in 0..target {
+            self.descend();
+        }
+        self.evaluate_leaves();
+        self.backup();
+        let ran = self.descents.len() as u32;
+        self.sims += u64::from(ran);
+        ran
+    }
+
+    /// Walks from the root to a leaf, applying virtual loss on the way down and
+    /// recording the path and the leaf it reached.
+    fn descend(&mut self) {
+        let start = self.path.len();
         let mut id = 0u32;
-        let v_abs = loop {
-            let node = &self.nodes[id as usize];
-            if node.terminal {
-                break node.terminal_value_abs;
+        let leaf = loop {
+            let (terminal, terminal_value, pending, expanded) = {
+                let node = &self.nodes[id as usize];
+                (
+                    node.terminal,
+                    node.terminal_value_abs,
+                    node.pending,
+                    node.expanded,
+                )
+            };
+            if terminal {
+                break self.record_leaf(id, Some(terminal_value));
             }
-            if !node.expanded {
-                break self.expand(id as usize);
+            if pending {
+                // Already queued by an earlier descent in this batch: reuse its
+                // forward rather than evaluating the same position twice.
+                break self.reuse_leaf(id);
             }
+            if !expanded {
+                if !self.begin_expand(id as usize) {
+                    let value = self.nodes[id as usize].terminal_value_abs;
+                    break self.record_leaf(id, Some(value));
+                }
+                self.nodes[id as usize].pending = true;
+                break self.record_leaf(id, None);
+            }
+
             let a = self.select(id as usize);
             let mut child = self.nodes[id as usize].children[a];
             if child == NO_NODE {
@@ -418,37 +571,120 @@ impl<'net> MctsSearcher<'net> {
                 self.nodes.push(Node::new(next));
                 self.nodes[id as usize].children[a] = child;
             }
-            self.path_nodes.push(id);
-            self.path_edges.push(a as u32);
+            self.path.push((id, a as u32));
+            let node = &mut self.nodes[id as usize];
+            node.vl[a] += 1;
+            node.vl_visits += 1;
             id = child;
         };
-        self.backup(v_abs);
-        self.sims += 1;
+        self.descents.push(Descent {
+            start,
+            end: self.path.len(),
+            leaf,
+        });
     }
 
-    /// Credits every edge on the current path with the leaf value.
+    fn record_leaf(&mut self, node: u32, value: Option<f64>) -> usize {
+        self.leaves.push(Leaf { node, value });
+        self.leaves.len() - 1
+    }
+
+    /// The batch slot already holding `node`'s pending evaluation.
+    fn reuse_leaf(&self, node: u32) -> usize {
+        self.leaves
+            .iter()
+            .position(|leaf| leaf.node == node && leaf.value.is_none())
+            .expect("a pending node was recorded as a leaf of this batch")
+    }
+
+    /// Runs the net over every leaf still awaiting a value and finishes those
+    /// nodes' expansions.
+    fn evaluate_leaves(&mut self) {
+        self.eval_index.clear();
+        for (i, leaf) in self.leaves.iter().enumerate() {
+            if leaf.value.is_none() {
+                self.eval_index.push(i);
+            }
+        }
+        if self.eval_index.is_empty() {
+            return;
+        }
+        // Buffers are moved out and back so the `&mut self` expansion calls
+        // below do not collide with the borrows they would otherwise hold.
+        let index = std::mem::take(&mut self.eval_index);
+
+        if index.len() == 1 || self.net.is_none() {
+            // One leaf, or no net at all: batching has nothing to amortise, and
+            // taking the single-position path keeps `batch_size == 1` exactly
+            // the serial searcher.
+            for &i in &index {
+                let id = self.leaves[i].node as usize;
+                let value = self.finish_expand_single(id);
+                self.leaves[i].value = Some(value);
+                self.nodes[id].pending = false;
+            }
+            self.eval_index = index;
+            return;
+        }
+
+        let net = self.net.expect("checked above");
+        let mut encoded = std::mem::take(&mut self.encoded);
+        let mut heads = std::mem::take(&mut self.heads);
+        encoded.clear();
+        heads.clear();
+        for &i in &index {
+            let id = self.leaves[i].node as usize;
+            encoded.push(Encoded::from_state(&self.nodes[id].state));
+        }
+        let scratch = self
+            .batch_scratch
+            .get_or_insert_with(|| net.batch_scratch());
+        net.forward_batch(&encoded, scratch, &mut heads);
+        debug_assert_eq!(heads.len(), index.len());
+        for (slot, &i) in index.iter().enumerate() {
+            let id = self.leaves[i].node as usize;
+            let value = self.finish_expand_with(id, Some(&heads[slot]));
+            self.leaves[i].value = Some(value);
+            self.nodes[id].pending = false;
+        }
+        self.eval_index = index;
+        self.encoded = encoded;
+        self.heads = heads;
+    }
+
+    /// Credits every edge of every collected descent with its leaf value, and
+    /// removes the virtual loss the descent applied.
     ///
     /// `v_abs` is added **as is** at every level. There is no negation here and
     /// there must never be one: the value is already in the absolute frame, and
     /// the mover is reapplied at selection instead. On the 53% of edges that do
     /// not flip the mover, a negamax-style flip here would invert the child's
     /// meaning relative to its parent.
-    fn backup(&mut self, v_abs: f64) {
-        for (parent, edge) in self.path_nodes.iter().zip(&self.path_edges) {
-            let node = &mut self.nodes[*parent as usize];
-            let edge = *edge as usize;
-            node.visits += 1;
-            node.n[edge] += 1;
-            node.w[edge] += v_abs;
+    fn backup(&mut self) {
+        for d in 0..self.descents.len() {
+            let descent = self.descents[d];
+            let v_abs = self.leaves[descent.leaf]
+                .value
+                .expect("every leaf is valued before backup");
+            for step in descent.start..descent.end {
+                let (parent, edge) = self.path[step];
+                let node = &mut self.nodes[parent as usize];
+                let edge = edge as usize;
+                node.visits += 1;
+                node.n[edge] += 1;
+                node.w[edge] += v_abs;
+                // Exactly undoes the descent's virtual loss: integer counters,
+                // so nothing is left behind.
+                node.vl[edge] -= 1;
+                node.vl_visits -= 1;
+            }
         }
     }
 
-    /// Expands `id` and returns the leaf value in the absolute frame.
-    ///
-    /// Expansion and leaf evaluation are fused on purpose: with a net both come
-    /// out of **one** trunk pass. The Java original calls `priors` and then
-    /// `valueMover`, paying for the trunk twice per expanded node.
-    fn expand(&mut self, id: usize) -> f64 {
+    /// Generates `id`'s legal actions and allocates its edge arrays, returning
+    /// `false` when the position has none — in which case the node is marked
+    /// terminal and carries its outcome value.
+    fn begin_expand(&mut self, id: usize) -> bool {
         let actions = {
             let state = &self.nodes[id].state;
             state.legal_actions_with(&mut self.scratch)
@@ -459,16 +695,32 @@ impl<'net> MctsSearcher<'net> {
             let node = &mut self.nodes[id];
             node.terminal = true;
             node.terminal_value_abs = terminal_value_abs(&node.state);
-            return node.terminal_value_abs;
+            return false;
         }
+        let node = &mut self.nodes[id];
+        node.children = vec![NO_NODE; actions.len()];
+        node.n = vec![0; actions.len()];
+        node.w = vec![0.0; actions.len()];
+        node.vl = vec![0; actions.len()];
+        node.actions = actions;
+        true
+    }
 
+    /// Turns one already-[`begin_expand`](Self::begin_expand)ed node's net
+    /// outputs into its prior, and returns the leaf value in the absolute
+    /// frame.
+    ///
+    /// Expansion and leaf evaluation are fused on purpose: with a net both come
+    /// out of **one** trunk pass. The Java original calls `priors` and then
+    /// `valueMover`, paying for the trunk twice per expanded node.
+    fn finish_expand_with(&mut self, id: usize, heads: Option<&Heads>) -> f64 {
         let (prior, value_abs) = {
-            let state = &self.nodes[id].state;
-            let mover = state.current_player();
-            match (self.net, self.net_scratch.as_mut()) {
-                (Some(net), Some(net_scratch)) => {
-                    let heads = net.forward(&Encoded::from_state(state), net_scratch);
-                    let prior = softmax_over(&actions, &heads, net.pair_bias(), state.cols());
+            let node = &self.nodes[id];
+            let state = &node.state;
+            let mover = node.mover;
+            match (self.net, heads) {
+                (Some(net), Some(heads)) => {
+                    let prior = softmax_over(&node.actions, heads, net.pair_bias(), state.cols());
                     let value = match (self.config.value_source, heads.value) {
                         (ValueSource::Net, Some(v)) => {
                             let v = f64::from(v);
@@ -478,7 +730,10 @@ impl<'net> MctsSearcher<'net> {
                     };
                     (prior, value)
                 }
-                _ => (vec![1.0 / actions.len() as f32; actions.len()], None),
+                _ => (
+                    vec![1.0 / node.actions.len() as f32; node.actions.len()],
+                    None,
+                ),
             }
         };
         let value_abs = value_abs.unwrap_or_else(|| {
@@ -490,37 +745,66 @@ impl<'net> MctsSearcher<'net> {
                 &mut self.eval_workspace,
             )
         });
-
         let node = &mut self.nodes[id];
-        node.children = vec![NO_NODE; actions.len()];
-        node.n = vec![0; actions.len()];
-        node.w = vec![0.0; actions.len()];
         node.prior = prior;
-        node.actions = actions;
         node.expanded = true;
         value_abs
     }
 
+    /// [`finish_expand_with`](Self::finish_expand_with) driving its own
+    /// single-position forward.
+    fn finish_expand_single(&mut self, id: usize) -> f64 {
+        let heads = match self.net {
+            Some(net) => {
+                let encoded = Encoded::from_state(&self.nodes[id].state);
+                let scratch = self
+                    .net_scratch
+                    .as_mut()
+                    .expect("a net always brings its scratch");
+                Some(net.forward(&encoded, scratch))
+            }
+            None => None,
+        };
+        self.finish_expand_with(id, heads.as_ref())
+    }
+
+    /// Expands `id` end to end and returns its leaf value. Used for the root,
+    /// which is expanded before any batch exists.
+    fn expand(&mut self, id: usize) -> f64 {
+        if !self.begin_expand(id) {
+            return self.nodes[id].terminal_value_abs;
+        }
+        self.finish_expand_single(id)
+    }
+
     /// PUCT selection: `argmax_a sign(node) * Q_abs(a) + cpuct * P(a) *
-    /// sqrt(N + 1) / (1 + n(a))`.
+    /// sqrt(N + 1) / (1 + n(a))`, over visit counts that include the descents
+    /// currently in flight.
     ///
     /// The sign is the *only* place the mover enters. Converting the
     /// absolute-frame `Q` here, instead of negating on the way up, is what
     /// survives the 53% of edges that keep the mover.
+    ///
+    /// Virtual loss enters as `-virtual_loss` per in-flight descent, *after*
+    /// the sign — a loss for whoever is to move at this node, which is what
+    /// makes it repel the next descent of the batch regardless of seat. With no
+    /// descent in flight every `vl` term is zero and this is the plain PUCT
+    /// formula, unchanged.
     fn select(&self, id: usize) -> usize {
         let node = &self.nodes[id];
         let sign = if node.mover == 1 { 1.0 } else { -1.0 };
-        let sqrt_n = f64::from(node.visits + 1).sqrt();
+        let sqrt_n = f64::from(node.visits + node.vl_visits + 1).sqrt();
+        let virtual_loss = self.config.virtual_loss;
         let mut best = 0;
         let mut best_score = f64::NEG_INFINITY;
         for a in 0..node.actions.len() {
-            let q = if node.n[a] > 0 {
-                sign * node.w[a] / f64::from(node.n[a])
+            let n = node.n[a] + node.vl[a];
+            let q = if n > 0 {
+                (sign * node.w[a] - virtual_loss * f64::from(node.vl[a])) / f64::from(n)
             } else {
                 0.0
             };
-            let u =
-                self.config.cpuct * f64::from(node.prior[a]) * sqrt_n / f64::from(1 + node.n[a]);
+            let u = self.config.cpuct * f64::from(node.prior[a]) * sqrt_n / f64::from(1 + n);
             let score = q + u;
             if score > best_score {
                 best_score = score;
@@ -558,7 +842,7 @@ impl<'net> MctsSearcher<'net> {
 /// Masked, not full-space: the trainer's 20 880-wide action space is mostly
 /// illegal at any given node, and the prior must be a distribution over what
 /// the searcher can actually play.
-fn softmax_over(
+pub(crate) fn softmax_over(
     actions: &[Action],
     heads: &crate::net::Heads,
     pair_bias: f32,
@@ -620,7 +904,33 @@ mod tests {
         node.children = vec![NO_NODE; edges];
         node.n = vec![0; edges];
         node.w = vec![0.0; edges];
+        node.vl = vec![0; edges];
         node
+    }
+
+    /// Drives [`MctsSearcher::backup`] over a single hand-built path, the way
+    /// one descent would have left the buffers.
+    fn backup_path(searcher: &mut MctsSearcher<'_>, path: &[(u32, u32)], v_abs: f64) {
+        searcher.path.clear();
+        searcher.path.extend_from_slice(path);
+        // `backup` removes the virtual loss each step applied, so put it there.
+        for (node, edge) in path {
+            let node = &mut searcher.nodes[*node as usize];
+            node.vl[*edge as usize] += 1;
+            node.vl_visits += 1;
+        }
+        searcher.leaves.clear();
+        searcher.leaves.push(Leaf {
+            node: 0,
+            value: Some(v_abs),
+        });
+        searcher.descents.clear();
+        searcher.descents.push(Descent {
+            start: 0,
+            end: path.len(),
+            leaf: 0,
+        });
+        searcher.backup();
     }
 
     /// A searcher whose tree is replaced wholesale, so the unit tests exercise
@@ -651,9 +961,7 @@ mod tests {
 
         // The leaf is a win for player 1, so v_abs = +1 by definition.
         let v_abs = 1.0;
-        searcher.path_nodes = vec![0, 1];
-        searcher.path_edges = vec![0, 1];
-        searcher.backup(v_abs);
+        backup_path(&mut searcher, &[(0, 0), (1, 1)], v_abs);
 
         assert_eq!(searcher.nodes[0].w[0], v_abs, "root edge keeps the sign");
         assert_eq!(
@@ -664,6 +972,11 @@ mod tests {
         assert_eq!(searcher.nodes[1].n[1], 1);
         assert_eq!(searcher.nodes[0].visits, 1);
         assert_eq!(searcher.nodes[1].visits, 1);
+        // Virtual loss is gone again, exactly.
+        assert_eq!(searcher.nodes[0].vl, vec![0, 0]);
+        assert_eq!(searcher.nodes[1].vl, vec![0, 0]);
+        assert_eq!(searcher.nodes[0].vl_visits, 0);
+        assert_eq!(searcher.nodes[1].vl_visits, 0);
         // Untouched edges stay clean.
         assert_eq!(searcher.nodes[0].w[1], 0.0);
         assert_eq!(searcher.nodes[1].w[0], 0.0);
@@ -691,9 +1004,7 @@ mod tests {
 
         // Absolute frame: the leaf is +1 for player 1 and the child's mover is
         // ALSO player 1, so the edge is worth +1 to the parent.
-        searcher.path_nodes = vec![0];
-        searcher.path_edges = vec![0];
-        searcher.backup(1.0);
+        backup_path(&mut searcher, &[(0, 0)], 1.0);
         // Give the sibling a modest positive value so the choice is a real one.
         searcher.nodes[0].n[1] = 1;
         searcher.nodes[0].w[1] = 0.5;

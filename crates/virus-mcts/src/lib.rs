@@ -41,13 +41,18 @@
 
 pub mod action_id;
 pub mod net;
+pub mod parallel;
 pub mod rng;
 pub mod search;
 
 pub use action_id::{action_from_id, action_id, ACTION_ID_COUNT};
-pub use net::{Encoded, Heads, NetError, NetScratch, PolicyValueNet, BOARD, CELLS, PLANES};
+pub use net::{
+    BatchScratch, Encoded, Heads, NetError, NetScratch, PolicyValueNet, BATCH_LANES, BOARD, CELLS,
+    PLANES,
+};
+pub use parallel::ParallelMcts;
 pub use rng::Rng;
 pub use search::{
-    terminal_value_abs, Config, MctsSearcher, ValueSource, DEFAULT_CPUCT, DEFAULT_VALUE_SCALE,
-    TEMPERATURE_PLIES,
+    terminal_value_abs, Config, MctsSearcher, ValueSource, DEFAULT_BATCH_SIZE, DEFAULT_CPUCT,
+    DEFAULT_VALUE_SCALE, DEFAULT_VIRTUAL_LOSS, TEMPERATURE_PLIES,
 };
