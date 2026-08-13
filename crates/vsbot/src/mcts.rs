@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use virus_core::{Action, State};
 use virus_mcts::{Config, MctsSearcher, NetError, PolicyValueNet, ValueSource, BOARD};
-use virus_proto::clock::{verdict, MoveAllocation, RootProgress};
+use virus_proto::clock::{verdict, MoveAllocation, RootProgress, Verdict};
 use virus_proto::ponder::{PonderInbox, PonderStep};
 use virus_proto::{GreedyEngine, SearchBudget, SearchEngine, SearchOutcome};
 
@@ -74,6 +74,8 @@ pub struct MctsEngine {
     net: PolicyValueNet,
     config: Config,
     artifact: PathBuf,
+    /// Whether to print one [`trace_answer`] line per answered action.
+    trace: bool,
     /// Shape of the most recent position whose domain verdict was logged.
     ///
     /// The bot plays game after game in one process, so the interesting event
@@ -90,12 +92,17 @@ impl MctsEngine {
     /// string, board/plane counts, every tensor shape, every weight finite), so
     /// a wrong or truncated artifact fails **here**, at startup, instead of
     /// producing `NaN` priors on move 40 of a live game.
-    pub fn load(artifact: impl AsRef<Path>, seed: u64) -> Result<MctsEngine, NetError> {
+    pub fn load(
+        artifact: impl AsRef<Path>,
+        seed: u64,
+        trace: bool,
+    ) -> Result<MctsEngine, NetError> {
         let artifact = artifact.as_ref().to_path_buf();
         let net = PolicyValueNet::load(&artifact)?;
         Ok(MctsEngine {
             net,
             artifact,
+            trace,
             config: Config {
                 seed,
                 // The champion ships a value head; `ValueSource::Net` degrades
@@ -188,7 +195,24 @@ impl SearchEngine for MctsEngine {
         // expansion is a net forward and the allocation has to cover it.
         let started = Instant::now();
         let mut searcher = MctsSearcher::new(state.clone(), self.config, Some(&self.net));
-        drive(&mut searcher, budget, started, u64::MAX, || false);
+        let drove = drive(&mut searcher, budget, started, u64::MAX, || false);
+        if self.trace {
+            // The control arm of the same trace: a cold search has nothing
+            // inherited, so `inherited=0` here is the baseline the pondered
+            // lines are read against.
+            trace_answer(
+                AnswerTrace {
+                    path: "choose",
+                    state,
+                    reused: false,
+                    inherited: 0,
+                    drove: Some(drove),
+                    budget,
+                    started,
+                },
+                Some(&searcher),
+            );
+        }
         self.harvest(state, &searcher, budget)
     }
 
@@ -257,6 +281,13 @@ impl SearchEngine for MctsEngine {
             }
 
             let mut interrupt = None;
+            let mut drove = None;
+            // What re-rooting kept, read before this step simulates anything.
+            // It is both the tree's size in memory and — for the trace — the
+            // head start this action was handed by the opponent's turn.
+            let inherited = tree
+                .as_ref()
+                .map_or(0, |(_, searcher)| searcher.root_visit_total());
             if let Some((_, searcher)) = tree.as_mut() {
                 // The cap bounds the *tree*, not the step. `sims_run` is
                 // cumulative and survives a re-root, so it cannot be the
@@ -268,17 +299,16 @@ impl SearchEngine for MctsEngine {
                 // subtree, and the root's visit total is exactly the size of
                 // what survived. Subtracting it re-bases the allowance onto the
                 // tree that is actually in memory.
-                let retained: u64 = searcher.root_visits().iter().map(|n| u64::from(*n)).sum();
                 let cap = searcher
                     .sims_run()
-                    .saturating_sub(retained)
+                    .saturating_sub(inherited)
                     .saturating_add(PONDER_SIM_CAP);
-                drive(searcher, &budget, started, cap, || {
+                drove = Some(drive(searcher, &budget, started, cap, || {
                     if interrupt.is_none() {
                         interrupt = inbox.try_next();
                     }
                     interrupt.is_some()
-                });
+                }));
             }
 
             // Answer whatever the step asked for *before* moving on, even when
@@ -290,6 +320,20 @@ impl SearchEngine for MctsEngine {
                 let outcome = tree
                     .as_ref()
                     .and_then(|(_, searcher)| self.harvest(&state, searcher, &budget));
+                if self.trace {
+                    trace_answer(
+                        AnswerTrace {
+                            path: "ponder",
+                            state: &state,
+                            reused,
+                            inherited,
+                            drove,
+                            budget: &budget,
+                            started,
+                        },
+                        tree.as_ref().map(|(_, searcher)| searcher),
+                    );
+                }
                 let _ = reply.send(outcome);
             }
 
@@ -345,6 +389,35 @@ impl MctsEngine {
     }
 }
 
+/// Why a [`drive`] call returned, and what it spent getting there.
+///
+/// Only the trace reads it, but it is a plain value rather than a log line so
+/// the ponder trace can be assembled in one place instead of scattered
+/// `eprintln!`s through the stop conditions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DriveReport {
+    stop: DriveStop,
+    /// Simulations this call added to the tree.
+    sims_added: u64,
+    /// Wall clock this call spent, measured from the `started` it was given.
+    elapsed: Duration,
+}
+
+/// The condition that ended a [`drive`] call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriveStop {
+    /// A terminal or stuck root: nothing to search.
+    NoActions,
+    /// The position was superseded (ARCHITECTURE.md invariant 5).
+    Cancelled,
+    /// A newer ponder step was already queued.
+    Interrupted,
+    /// The retained tree is at its memory ceiling.
+    SimCap,
+    /// One of the intra-turn stop rules fired.
+    Rule(Verdict),
+}
+
 /// Runs `searcher` under `budget`, applying the intra-turn stop rules between
 /// simulation slices.
 ///
@@ -358,18 +431,23 @@ fn drive(
     started: Instant,
     sim_cap: u64,
     mut interrupted: impl FnMut() -> bool,
-) {
+) -> DriveReport {
+    let sims_before = searcher.sims_run();
+    let report = |stop: DriveStop, searcher: &MctsSearcher<'_>| DriveReport {
+        stop,
+        sims_added: searcher.sims_run() - sims_before,
+        elapsed: started.elapsed(),
+    };
     // A terminal root is left unexpanded, and `run_until_deadline` returns
     // immediately for one. Without this guard the loop would spin hot for the
     // whole budget doing nothing.
     if searcher.root_actions().is_empty() {
-        return;
+        return report(DriveStop::NoActions, searcher);
     }
     let allocation = MoveAllocation {
         target: budget.deadline.saturating_duration_since(started),
         ceiling: budget.ceiling.saturating_duration_since(started),
     };
-    let sims_before = searcher.sims_run();
     let halfway = started + allocation.target / 2;
     let mut leader_at_halfway: Option<usize> = None;
     let mut leader_changed_late = false;
@@ -381,8 +459,14 @@ fn drive(
         let now = Instant::now();
         let slice = CANCEL_POLL_SLICE.min(budget.ceiling.saturating_duration_since(now));
         searcher.run_until_deadline(now + slice);
-        if budget.is_cancelled() || interrupted() || searcher.sims_run() >= sim_cap {
-            return;
+        if budget.is_cancelled() {
+            return report(DriveStop::Cancelled, searcher);
+        }
+        if interrupted() {
+            return report(DriveStop::Interrupted, searcher);
+        }
+        if searcher.sims_run() >= sim_cap {
+            return report(DriveStop::SimCap, searcher);
         }
 
         let now = Instant::now();
@@ -394,22 +478,83 @@ fn drive(
                 Some(_) => {}
             }
         }
+        // The visit counts are the tree's, cumulative across every re-root; the
+        // simulation count is this call's alone. `verdict` depends on exactly
+        // that asymmetry — it is how the uncatchability rule tells a lead this
+        // search produced from one a re-root handed it (bd `vsbot-gei`) — so
+        // neither may quietly become the other.
         let progress = RootProgress::from_visits(
             searcher.root_visits(),
             searcher.sims_run() - sims_before,
             leader_changed_late,
         );
-        if verdict(
+        let ruling = verdict(
             progress,
             now.saturating_duration_since(started),
             allocation,
             &budget.policy,
-        )
-        .is_stop()
-        {
-            return;
+        );
+        if ruling.is_stop() {
+            return report(DriveStop::Rule(ruling), searcher);
         }
     }
+}
+
+/// Everything one [`trace_answer`] line reports about, before it is formatted.
+#[derive(Clone, Copy, Debug)]
+struct AnswerTrace<'a> {
+    /// Which code path answered: `choose` for a cold search, `ponder` for a
+    /// session's reply.
+    path: &'static str,
+    state: &'a State,
+    /// Whether the session re-rooted an existing tree onto this position.
+    reused: bool,
+    /// Root visits the re-root carried in, before this action simulated.
+    inherited: u64,
+    drove: Option<DriveReport>,
+    budget: &'a SearchBudget,
+    started: Instant,
+}
+
+/// One line per answered action: what the tree brought to it, what this action
+/// added, and which rule ended it.
+///
+/// The three numbers the investigation turns on are `inherited` (visits the
+/// re-root carried in), `sims` (what this action actually simulated) and `stop`
+/// — together they say whether an answer was searched or merely read off a
+/// tree the opponent's turn had already settled.
+fn trace_answer(trace: AnswerTrace<'_>, searcher: Option<&MctsSearcher<'_>>) {
+    let AnswerTrace {
+        path,
+        state,
+        reused,
+        inherited,
+        drove,
+        budget,
+        started,
+    } = trace;
+    // Read the top two the same way the stop rules do, so a trace line and the
+    // verdict that produced it can never disagree about which move is leading.
+    let top = searcher.map(|searcher| RootProgress::from_visits(searcher.root_visits(), 0, false));
+    let leader = top.map_or(0, |top| top.leader_visits);
+    let runner_up = top.map_or(0, |top| top.runner_up_visits);
+    let target = budget.deadline.saturating_duration_since(started);
+    let elapsed = drove.map_or(Duration::ZERO, |report| report.elapsed);
+    // "Answered on a hair trigger": the whole action returned inside a fifth of
+    // the time it was allocated. That is the shape of the owner's "much faster,
+    // seems more stupid" canary verdict, so it gets its own flag rather than
+    // being left for the reader to divide out.
+    let hair_trigger = !target.is_zero() && elapsed * 5 < target;
+    eprintln!(
+        "ponder-trace: path={path} moves_left={} reused={reused} inherited={inherited} sims={} \
+         elapsed_ms={} target_ms={} leader={leader} runner_up={runner_up} stop={:?} \
+         hair_trigger={hair_trigger}",
+        state.moves_left(),
+        drove.map_or(0, |report| report.sims_added),
+        elapsed.as_millis(),
+        target.as_millis(),
+        drove.map(|report| report.stop),
+    );
 }
 
 /// Index of the most-visited root action, ties broken by enumeration order —
@@ -441,11 +586,18 @@ fn prior_argmax(searcher: &MctsSearcher<'_>) -> Option<Action> {
 /// Re-roots `searcher` onto `target`, following the actions that lead there.
 ///
 /// Returns `false` — leaving the tree at whatever root it reached — when
-/// `target` is not within [`MAX_REROOT_PLIES`] of the current root, or when one
-/// of the actions on the way was never expanded into a node. The caller then
-/// builds a fresh searcher, which is exactly what happened before pondering
-/// existed.
+/// `target` is not within [`MAX_REROOT_PLIES`] of the current root, when one
+/// of the actions on the way was never expanded into a node, or when the
+/// [state-hash check](tree_is_rooted_at) says the tree does not describe the
+/// position it is supposed to. The caller then builds a fresh searcher, which
+/// is exactly what happened before pondering existed.
 fn reroot(root: &mut State, searcher: &mut MctsSearcher<'_>, target: &State) -> bool {
+    // The tree is only reusable if it is where we last left it. Checked before
+    // anything is applied, so a tree that has already drifted is dropped rather
+    // than re-rooted deeper into the drift.
+    if !tree_is_rooted_at(searcher, root, "before re-root") {
+        return false;
+    }
     if root == target {
         return true;
     }
@@ -462,16 +614,70 @@ fn reroot(root: &mut State, searcher: &mut MctsSearcher<'_>, target: &State) -> 
         }
         *root = next;
     }
-    true
+    // The permanent assertion (bd `vsbot-gei`): the tree's own root position,
+    // against the position decoded from the authoritative snapshot. They are two
+    // independent derivations — `MctsSearcher` builds children with
+    // `apply_generated`, the client decodes the server's board — so agreement is
+    // real evidence and disagreement means the search would answer for a
+    // position that is not on the board.
+    tree_is_rooted_at(searcher, target, "after re-root")
+}
+
+/// Whether `searcher`'s tree is rooted at `expected`, shouting if it is not.
+///
+/// ARCHITECTURE.md invariant 5 in the pondering path: the snapshot is the only
+/// board source, so a tree that disagrees with it is not a tuning problem, it is
+/// a wrong answer waiting to be played. Returning `false` makes the caller throw
+/// the tree away and search the snapshot from scratch — slower, never wrong.
+fn tree_is_rooted_at(searcher: &MctsSearcher<'_>, expected: &State, when: &str) -> bool {
+    let actual = searcher.root_state();
+    // The hash covers the board, the mover, `movesLeft` and the neutral flags,
+    // so it is the cheap decision; equality is the certain one and only runs on
+    // the ~always-taken agreeing branch's failure.
+    if actual.hash() == expected.hash() && actual == expected {
+        return true;
+    }
+    eprintln!(
+        "WARNING: PONDER TREE STATE MISMATCH {when} — the tree is rooted at hash {:#018x} \
+         but the authoritative position hashes to {:#018x}. DROPPING THE TREE and searching \
+         the snapshot from scratch. The snapshot is the only board source \
+         (ARCHITECTURE.md invariant 5); a tree that disagrees with it would answer for a \
+         position that is not on the board. This is a bug in the re-root path, not a \
+         tuning issue.",
+        actual.hash(),
+        expected.hash(),
+    );
+    false
 }
 
 /// The shortest action sequence from `from` to `target`, at most `plies` long.
 ///
-/// Depth-first with an `apply` budget: the branching factor is ~34, so an
-/// unbounded search would be a stall waiting to happen on a position the tree
-/// simply does not contain.
+/// **Iterative deepening, not plain depth-first**, and the difference is not a
+/// micro-optimisation: it decides whether the common case works at all. A
+/// session that has kept up is exactly *one* action behind, the branching
+/// factor is ~34, and [`REROOT_APPLY_BUDGET`] is 4096 — so a depth-first search
+/// spends 1 + 34 + 34² ≈ 1190 `apply` calls exhausting the first action's
+/// three-ply subtree, runs out of budget after three or four of them, and gives
+/// up without ever having tried the other thirty. Any opponent action that is
+/// not near the front of the enumeration order therefore failed to re-root, and
+/// the tree the whole feature exists to keep was rebuilt from scratch instead
+/// (bd `vsbot-gei`). Deepening by ply finds a one-action gap in ~34 calls, which
+/// is the case that actually happens.
+///
+/// The budget is still there for the case the tree genuinely does not contain
+/// the position: three plies of ~34 is a stall waiting to happen otherwise.
 fn path_to(from: &State, target: &State, plies: usize, spent: &mut usize) -> Option<Vec<Action>> {
-    if plies == 0 {
+    (1..=plies).find_map(|depth| path_at_depth(from, target, depth, spent))
+}
+
+/// [`path_to`] restricted to paths of exactly `depth` actions.
+fn path_at_depth(
+    from: &State,
+    target: &State,
+    depth: usize,
+    spent: &mut usize,
+) -> Option<Vec<Action>> {
+    if depth == 0 {
         return None;
     }
     // The hash is a cheap reject; equality is the decision. `moves_left` and the
@@ -485,10 +691,13 @@ fn path_to(from: &State, target: &State, plies: usize, spent: &mut usize) -> Opt
         let Ok(next) = from.apply(action) else {
             continue;
         };
-        if next.hash() == target.hash() && next == *target {
-            return Some(vec![action]);
+        if depth == 1 {
+            if next.hash() == target.hash() && next == *target {
+                return Some(vec![action]);
+            }
+            continue;
         }
-        if let Some(mut rest) = path_to(&next, target, plies - 1, spent) {
+        if let Some(mut rest) = path_at_depth(&next, target, depth - 1, spent) {
             let mut path = vec![action];
             path.append(&mut rest);
             return Some(path);
@@ -523,12 +732,12 @@ mod tests {
     }
 
     fn engine() -> MctsEngine {
-        MctsEngine::load(artifact(), 1).expect("the in-repo champion loads and validates")
+        MctsEngine::load(artifact(), 1, false).expect("the in-repo champion loads and validates")
     }
 
     #[test]
     fn a_missing_or_broken_artifact_is_an_error_not_a_downgrade() {
-        assert!(MctsEngine::load("artifacts/does-not-exist.json", 1).is_err());
+        assert!(MctsEngine::load("artifacts/does-not-exist.json", 1, false).is_err());
     }
 
     #[test]
@@ -880,6 +1089,131 @@ mod tests {
             (sims_run.saturating_sub(full) + PONDER_SIM_CAP).saturating_sub(sims_run),
             0,
             "a retained tree at the cap may not grow"
+        );
+    }
+
+    // ---------------------------------------------------------- re-rooting
+
+    /// A re-root across a single action must succeed whatever that action's
+    /// position in the enumeration.
+    ///
+    /// [`path_to`] is a bounded search and the bound is small next to the
+    /// branching factor, so the *order* it explores in decides whether a
+    /// one-ply gap — the only gap a healthy session ever has to close — is
+    /// found at all. This pins the property the session depends on rather than
+    /// the traversal that happens to provide it.
+    #[test]
+    fn a_one_ply_re_root_succeeds_however_late_the_action_is_enumerated() {
+        let engine = engine();
+        // A few plies in: the opening corner has only a handful of legal moves,
+        // and the property under test is about a *wide* enumeration.
+        let mut state = State::new(12, 12, 2).expect("a legal opening position");
+        for _ in 0..9 {
+            let action = state.legal_actions()[0];
+            state = state.apply(action).expect("a legal action");
+        }
+        let actions = state.legal_actions();
+        assert!(
+            actions.len() > 8,
+            "the position must branch widely for this to mean anything, got {}",
+            actions.len()
+        );
+
+        for action in [
+            actions[0],
+            actions[actions.len() / 2],
+            actions[actions.len() - 1],
+        ] {
+            let target = state.apply(action).expect("a legal action");
+            let mut searcher = MctsSearcher::new(state.clone(), engine.config, Some(&engine.net));
+            // Enough that every root edge has been expanded into a node, which
+            // is what `rebase` needs; PUCT visits every unvisited edge first.
+            searcher.run_sims(4 * actions.len() as u32);
+            let mut root = state.clone();
+            assert!(
+                reroot(&mut root, &mut searcher, &target),
+                "a one-ply re-root across {action:?} failed; the tree holds the child and \
+                 the gap is a single action, so the only thing that can have gone wrong is \
+                 the search for the path"
+            );
+            assert_eq!(searcher.root_state(), &target);
+            assert_eq!(&root, &target);
+        }
+    }
+
+    /// **Every** single-action gap must be closable inside the apply budget.
+    ///
+    /// This is the regression test for the re-root defect in bd `vsbot-gei`: the
+    /// old depth-first [`path_to`] explored the first action's whole three-ply
+    /// subtree before trying the second, so it found roughly the first three
+    /// actions of the enumeration and gave up. The number this prints — the
+    /// worst-case `apply` count over every legal action of a wide position — is
+    /// the evidence that the common case is now cheap rather than lucky.
+    #[test]
+    fn every_single_action_gap_is_re_rootable_within_the_apply_budget() {
+        let mut state = State::new(12, 12, 2).expect("a legal opening position");
+        for _ in 0..9 {
+            let action = state.legal_actions()[0];
+            state = state.apply(action).expect("a legal action");
+        }
+        let actions = state.legal_actions();
+        let mut worst = 0;
+        let mut found = 0;
+        for action in &actions {
+            let target = state.apply(*action).expect("a legal action");
+            let mut spent = 0;
+            let path = path_to(&state, &target, MAX_REROOT_PLIES, &mut spent);
+            worst = worst.max(spent);
+            found += usize::from(path.as_deref() == Some(&[*action][..]));
+        }
+        eprintln!(
+            "re-root path search: {found}/{} single-action gaps found, worst case {worst} \
+             applies against a {REROOT_APPLY_BUDGET} budget",
+            actions.len()
+        );
+        assert_eq!(
+            found,
+            actions.len(),
+            "only {found} of {} one-action gaps were found inside the {REROOT_APPLY_BUDGET} \
+             apply budget; a pondering session is one action behind by construction, so \
+             anything less than all of them throws the tree away for no reason",
+            actions.len()
+        );
+        assert!(
+            worst <= actions.len(),
+            "a one-action gap cost {worst} applies for a position with {} legal actions — \
+             the search is not deepening by ply",
+            actions.len()
+        );
+    }
+
+    /// The permanent state-hash assertion: a tree that does not describe the
+    /// position it is asked about must be refused, not searched.
+    #[test]
+    fn a_tree_rooted_elsewhere_is_refused_rather_than_re_rooted() {
+        let engine = engine();
+        let state = State::new(12, 12, 2).expect("a legal opening position");
+        let searcher = MctsSearcher::new(state.clone(), engine.config, Some(&engine.net));
+        assert!(tree_is_rooted_at(&searcher, &state, "test"));
+
+        let elsewhere = state
+            .apply(state.legal_actions()[0])
+            .expect("a legal action");
+        assert!(
+            !tree_is_rooted_at(&searcher, &elsewhere, "test"),
+            "a tree one ply away from the position must not pass the check"
+        );
+
+        // And the caller-facing consequence: `reroot` refuses to work from a
+        // tracked root the tree does not actually hold, instead of re-rooting
+        // deeper into the disagreement.
+        let mut searcher = MctsSearcher::new(state.clone(), engine.config, Some(&engine.net));
+        searcher.run_sims(64);
+        let mut lying_root = elsewhere.clone();
+        assert!(
+            !reroot(&mut lying_root, &mut searcher, &elsewhere),
+            "the tree is rooted at the opening, not at `elsewhere`; agreeing here would \
+             search a position that is not on the board"
         );
     }
 

@@ -31,7 +31,9 @@
 //! * **early stop** — when the runner-up cannot catch the leader even if it took
 //!   *every* remaining simulation, more thinking cannot change the move. Stop
 //!   and give the time back to the bank. Saves human-facing latency at zero
-//!   strength cost.
+//!   strength cost — but only for a lead **this search produced**. A lead a
+//!   re-root inherited from the opponent's turn is there from the first sample
+//!   and says nothing about whether this action has settled; see [`verdict`].
 //! * **extension** — when the target passes with an unstable root (a leader that
 //!   changed late, or a top-2 gap too small to trust), keep going toward
 //!   [`MoveAllocation::ceiling`]. The bank caps the ceiling, so an extension
@@ -257,7 +259,11 @@ pub struct RootProgress {
     pub leader_visits: u64,
     /// Visits of the second most-visited root action.
     pub runner_up_visits: u64,
-    /// Simulations run so far, for the rate estimate.
+    /// Simulations **this search** has run, for the rate estimate.
+    ///
+    /// Not the tree's cumulative total: on a re-rooted tree the visit counts
+    /// above are inherited and this is not, and [`verdict`] depends on exactly
+    /// that difference to tell "the search has settled" from "the tree is old".
     pub sims: u64,
     /// Whether the visit leader changed after the halfway mark of the target.
     ///
@@ -340,8 +346,32 @@ pub fn verdict(
         let horizon = allocation.ceiling.saturating_sub(elapsed);
         let rate = progress.sims as f64 / elapsed.as_secs_f64();
         let still_available = rate * horizon.as_secs_f64();
-        let lead = (progress.leader_visits - progress.runner_up_visits) as f64;
-        if lead > still_available {
+        let lead = progress.leader_visits - progress.runner_up_visits;
+        // Two conditions, and the second one is the fix for bd `vsbot-gei`.
+        //
+        // The first is the rule itself: the runner-up cannot overtake the
+        // leader with the simulations that are left.
+        //
+        // The second is that the lead must be one *this* search could have
+        // produced. Every simulation adds exactly one visit to one root edge,
+        // so on a tree this search grew from nothing the lead can never exceed
+        // the simulation count and the condition is free — the rule is
+        // bit-for-bit what it always was. On a **re-rooted** tree it is not
+        // free: the visit counts arrive inherited from the opponent's turn, the
+        // lead is enormous from the very first sample, and without this the
+        // rule fires before the action has simulated anything at all. That is
+        // not "the search has settled", it is "the tree is old", and the two
+        // are not the same claim. It ended one pondered action in five inside a
+        // fifth of its allocated time on the live soak — the owner's "much
+        // faster, seems more stupid" canary verdict, in one line of arithmetic.
+        //
+        // Requiring `lead <= sims` makes a warm action spend at least half its
+        // ceiling before the rule may fire (if `sims >= lead > rate * horizon`
+        // and `sims = rate * elapsed`, then `elapsed > horizon`), which is the
+        // right shape: the skipped simulations are not wasted under tree reuse.
+        // The session re-roots into the action we play, so they sharpen exactly
+        // the subtree the next action of the turn inherits.
+        if lead as f64 > still_available && lead <= progress.sims {
             return Verdict::StopUncatchable;
         }
     }
@@ -574,6 +604,85 @@ mod tests {
             ),
             Verdict::Continue
         );
+    }
+
+    /// bd `vsbot-gei`: a lead this search did not produce is not a reason to
+    /// stop it.
+    ///
+    /// The numbers are a real line from the instrumented soak — a pondered
+    /// action that inherited 7326 visits and had run 128 simulations of its own
+    /// when the rule fired, 37 ms into a 739 ms allocation.
+    #[test]
+    fn an_inherited_lead_does_not_end_an_action_before_it_has_searched() {
+        let warm = RootProgress::from_visits(&[7_448, 3], 128, false);
+        assert_eq!(
+            verdict(
+                warm,
+                millis(37),
+                allocation(739, 1_108),
+                &StopPolicy::default()
+            ),
+            Verdict::Continue,
+            "the 7445-visit lead came from the opponent's turn; 128 simulations of our own \
+             is not evidence that this action has settled"
+        );
+
+        // The same tree once the action has actually produced the lead it is
+        // invoking. `sims >= lead` and the runner-up cannot catch up, so the
+        // rule is earned and fires.
+        let earned = RootProgress::from_visits(&[7_448, 3], 8_000, false);
+        assert_eq!(
+            verdict(
+                earned,
+                millis(600),
+                allocation(739, 1_108),
+                &StopPolicy::default()
+            ),
+            Verdict::StopUncatchable
+        );
+    }
+
+    /// The new condition must be *free* for a search that grew its own tree.
+    ///
+    /// Every simulation adds one visit to one root edge, so a cold search's
+    /// lead can never exceed its simulation count and the guard can never
+    /// change a verdict. A deployment that does not ponder must see exactly the
+    /// behaviour it saw before.
+    #[test]
+    fn the_guard_cannot_change_a_verdict_for_a_search_that_grew_its_own_tree() {
+        for (leader, runner_up, elapsed_ms) in [
+            (6_500u32, 500u32, 3_500u64),
+            (4_000, 2_000, 3_500),
+            (900, 100, 4_000),
+            (600, 500, 1_000),
+            (1_050, 1_000, 4_000),
+        ] {
+            // A cold search's simulation count is at least the visits on the
+            // tree; anything from there up leaves the guard satisfied.
+            let sims = u64::from(leader) + u64::from(runner_up);
+            let progress = RootProgress::from_visits(&[leader, runner_up], sims, false);
+            let lead = u64::from(leader - runner_up);
+            assert!(
+                lead <= progress.sims,
+                "a cold search cannot have a lead of {lead} after {sims} simulations"
+            );
+            // And the verdict is decided by the horizon arithmetic alone.
+            let allocation = allocation(4_000, 6_000);
+            let horizon = allocation.ceiling - millis(elapsed_ms);
+            let rate = sims as f64 / (elapsed_ms as f64 / 1_000.0);
+            let uncatchable = lead as f64 > rate * horizon.as_secs_f64();
+            let ruling = verdict(
+                progress,
+                millis(elapsed_ms),
+                allocation,
+                &StopPolicy::default(),
+            );
+            assert_eq!(
+                ruling == Verdict::StopUncatchable,
+                uncatchable,
+                "the guard changed the verdict for a cold root {leader}/{runner_up}"
+            );
+        }
     }
 
     #[test]
