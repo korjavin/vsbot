@@ -1,0 +1,56 @@
+# Guards the trainer-side contracts: the SelfPlayMcts row schema and the shape
+# of a trained artifact.
+#
+# Kept out of ci.yml because it shares nothing with it — no rust toolchain, no
+# cargo cache, and it runs in seconds. Path-filtered so it does not add noise to
+# PRs that touch neither the validators nor the fixtures they check.
+#
+# What it deliberately does NOT do: run trainer/roundtrip.sh. That needs docker,
+# a ~1.4 GB torch wheel and a checkout of ~/Project/nnue-trainer, which is a
+# sibling repo that is not available to this runner. The round trip is a local
+# gate (see trainer/README.md); what CI can hold is that the validators still
+# reject the rows and artifacts they are meant to reject — the property that
+# makes the local run mean anything.
+name: Trainer contracts
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "trainer/**"
+      - "fixtures/mcts/**"
+      - "artifacts/mcts_champion.json"
+      - ".github/workflows/trainer.yml"
+  pull_request:
+    paths:
+      - "trainer/**"
+      - "fixtures/mcts/**"
+      - "artifacts/mcts_champion.json"
+      - ".github/workflows/trainer.yml"
+  workflow_dispatch:
+
+jobs:
+  contracts:
+    name: row + artifact validators
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Stdlib only, on purpose: these validators must run on any box that has a
+      # python, including one with no torch and no docker.
+      - name: Validator self-test
+        run: python3 trainer/selftest.py
+
+      - name: Vendored artifacts still match the schema net.rs loads
+        run: |
+          python3 trainer/validate_artifact.py artifacts/mcts_champion.json
+          python3 trainer/validate_artifact.py fixtures/mcts/mcts_selfplay_tiny.json \
+            --reference artifacts/mcts_champion.json
+
+      - name: Shell syntax
+        run: bash -n trainer/roundtrip.sh
