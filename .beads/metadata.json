@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "vsbot",
+  "project_id": "46b079d5-7086-48f9-a9f8-ddee1978f95e"
+}
