@@ -116,14 +116,14 @@ impl GauntletConfig {
         self.games.div_ceil(2) * 2
     }
 
-    /// The ply cap: `max_turns` whole turns of three actions each.
-    pub fn max_plies(&self) -> u32 {
+    /// A hard ply ceiling, used only as a runaway guard.
+    ///
+    /// A turn is *at most* [`ACTIONS_PER_TURN`] actions, so `max_turns` turns
+    /// can never exceed this many plies. The real cap is counted in turns —
+    /// see [`play_game`] — and this exists so a bug in that counting shows up
+    /// as a finished game rather than a hung worker.
+    pub fn ply_ceiling(&self) -> u32 {
         self.max_turns * u32::from(ACTIONS_PER_TURN)
-    }
-
-    /// The opening window, in plies.
-    pub fn explore_plies(&self) -> u32 {
-        self.explore_turns * u32::from(ACTIONS_PER_TURN)
     }
 
     /// Rejects a configuration that cannot produce a meaningful result.
@@ -176,6 +176,10 @@ pub struct GameOutcome {
     pub termination: Termination,
     /// Actions played.
     pub plies: u32,
+    /// Whole turns completed. Not `plies / 3` — a `PlaceNeutrals` spends a
+    /// turn in one action, so the two counts diverge in any game where a seat
+    /// used its placement.
+    pub turns: u32,
     /// Territory verdict — the corpus label. **Not** the tally.
     pub territory_winner: Player,
     /// Worst per-move deadline overrun in this game.
@@ -321,14 +325,25 @@ pub fn play_game(
         engine::SpecError(format!("{}x{} board: {error}", config.rows, config.cols))
     })?;
 
-    let max_plies = config.max_plies();
-    let explore_plies = config.explore_plies();
+    // Both limits are counted in **turns**, from the actual seat changes, not
+    // derived from a ply count.
+    //
+    // Java derives them as `turns * ACTIONS_PER_TURN` and that is wrong here
+    // for a rule its own engine has: `PlaceNeutrals` consumes a whole turn in a
+    // single action. A game where both players spend their once-per-game
+    // placement therefore fits more than `max_turns` turns inside
+    // `max_turns * 3` plies, and the epsilon window runs past the turn it was
+    // asked for. The drift is small — at most one extra turn per seat per game
+    // — but the flags say "turns" and there is no reason for them to mean
+    // something else.
+    let ply_ceiling = config.ply_ceiling();
     let mut termination = Termination::PlyCap;
     let mut plies = 0u32;
+    let mut turns = 0u32;
     let mut max_overrun = Duration::ZERO;
     let mut work = [0u64; 2];
 
-    while plies < max_plies {
+    while turns < config.max_turns && plies < ply_ceiling {
         if state.game_over() {
             termination = Termination::Decided;
             break;
@@ -357,7 +372,7 @@ pub fn play_game(
         let a_moved = (mover == 1) == a_is_p1;
         work[usize::from(!a_moved)] += stats.work;
 
-        let chosen = if plies < explore_plies && rng.next_f64() < config.epsilon {
+        let chosen = if turns < config.explore_turns && rng.next_f64() < config.epsilon {
             legal[rng.below(legal.len()).expect("legal is non-empty")]
         } else {
             match searched {
@@ -377,13 +392,20 @@ pub fn play_game(
         } else {
             legal[0]
         };
-        state = match state.apply(action) {
+        let next = match state.apply(action) {
             Ok(next) => next,
             Err(_) => {
                 termination = Termination::Stalled;
                 break;
             }
         };
+        // A turn ends when the seat on move changes — which is after three
+        // actions, or after a single `PlaceNeutrals`, or immediately when the
+        // action eliminated somebody and `advance` skipped past them.
+        if next.current_player() != mover {
+            turns += 1;
+        }
+        state = next;
         plies += 1;
     }
     if state.game_over() {
@@ -401,6 +423,7 @@ pub fn play_game(
         a_is_p1,
         termination,
         plies,
+        turns,
         territory_winner: state.outcome_winner(),
         max_overrun,
         work_a: work[0],
@@ -581,6 +604,7 @@ mod tests {
             a_is_p1: true,
             termination: Termination::Decided,
             plies: 10,
+            turns: 3,
             territory_winner: 1,
             max_overrun: Duration::ZERO,
             work_a: 0,
@@ -602,6 +626,55 @@ mod tests {
             }
             .outcome_for_a(),
             Outcome::Draw
+        );
+    }
+
+    /// The turn cap must bite in turns, not in `turns * 3` plies.
+    ///
+    /// A `PlaceNeutrals` spends a whole turn in a single action, so deriving
+    /// the cap from a ply count lets a game with placements run past the turn
+    /// limit it was given. This pins the counting to the actual seat changes.
+    #[test]
+    fn the_turn_cap_is_counted_in_turns() {
+        let config = GauntletConfig {
+            max_turns: 4,
+            // Pure random play, so neutral placements actually occur.
+            epsilon: 1.0,
+            explore_turns: 99,
+            ..small(
+                spec(Engine::Greedy, Budget::Nodes(1)),
+                spec(Engine::Greedy, Budget::Nodes(1)),
+                8,
+            )
+        };
+        let result = run(&config, None).expect("run");
+        let mut saw_short_turn = false;
+        for game in &result.games {
+            assert!(
+                game.turns <= 4,
+                "game {} ran {} turns past a 4-turn cap",
+                game.index,
+                game.turns
+            );
+            assert!(
+                game.plies <= config.ply_ceiling(),
+                "game {} exceeded the ply ceiling",
+                game.index
+            );
+            if game.termination == Termination::PlyCap {
+                assert_eq!(game.turns, 4, "a capped game stops exactly at the cap");
+            }
+            // The whole point of the fix: at least one game must have a turn
+            // shorter than three actions, or the test proves nothing about
+            // neutral placement.
+            if game.plies < game.turns * u32::from(ACTIONS_PER_TURN) {
+                saw_short_turn = true;
+            }
+        }
+        assert!(
+            saw_short_turn,
+            "no game contained a short turn, so this test did not exercise the rule \
+             it exists for"
         );
     }
 

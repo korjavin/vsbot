@@ -331,6 +331,16 @@ impl AlphaBetaSide {
 
 impl Side for AlphaBetaSide {
     fn choose(&mut self, state: &State) -> (Option<Action>, MoveStats) {
+        // The clock starts *before* the searcher is built, not after.
+        //
+        // `Searcher::new` is not free: the enhanced arm allocates a 32 MiB
+        // packed transposition table on its first move of a game, and the plain
+        // arm rebuilds its searcher on every single move. Starting the timer
+        // afterwards would hand alpha-beta that work outside the budget it is
+        // being compared under, and hide it from the overrun telemetry too — so
+        // the one arm whose setup cost is unmetered would be the one this
+        // harness is trying to measure against MCTS at equal wall clock.
+        let started = Instant::now();
         // The oracle is stateless by construction: Java's non-enhanced arm
         // builds a fresh searcher per move, and a plain arm carrying a table
         // between moves would not be the oracle any more. Plain mode allocates
@@ -344,7 +354,6 @@ impl Side for AlphaBetaSide {
             self.searcher = Some(Searcher::new(state, self.options));
         }
         let searcher = self.searcher.as_mut().expect("just built");
-        let started = Instant::now();
         let result = match self.budget {
             Budget::Nodes(limit) => searcher.search_node_budget(state, limit),
             Budget::Depth(depth) => searcher.search_to_depth(state, depth),

@@ -71,11 +71,18 @@ its own labelled number.
 `arena.Wilson95`. At the extremes the normal interval leaves `[0, 100]` and
 collapses to zero width at 0 wins, which reads as certainty.
 
-**Ply-capped games are draws.** Not territory decisions. Territory at the cap
+**Capped games are draws.** Not territory decisions. Territory at the cap
 answers "who was ahead in a game nobody finished", which is a different question
 from who won. The territory verdict is still carried on each `GameOutcome` for
 corpus recording, and the cap-hit count is reported separately so a run decided
 by the cap cannot be mistaken for one decided by the engines.
+
+**The cap and the opening window are counted in turns, from the actual seat
+changes.** Java derives them as `turns × 3` plies, which is wrong given a rule
+its own engine has: `PlaceNeutrals` spends a whole turn in a single action, so a
+game with placements fits more than `--max-turns` turns inside `max_turns × 3`
+plies. The drift is at most one turn per seat per game — but the flags say
+turns, so they mean turns. `plies × 3` is kept only as a runaway guard.
 
 ### Determinism
 

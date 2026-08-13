@@ -56,10 +56,11 @@ fn fingerprint(result: &GauntletResult) -> Vec<String> {
         .iter()
         .map(|game| {
             format!(
-                "{} a_p1={} winner={} plies={} term={:?} territory={} work_a={} work_b={}",
+                "{} a_p1={} winner={} turns={} plies={} term={:?} territory={} work_a={} work_b={}",
                 game.index,
                 game.a_is_p1,
                 game.winner,
+                game.turns,
                 game.plies,
                 game.termination,
                 game.territory_winner,

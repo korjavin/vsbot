@@ -107,10 +107,11 @@ fn real_main() -> Result<ExitCode, SpecError> {
     if options.per_game {
         for game in &result.games {
             println!(
-                "game {:>4} seat_a={} winner={} plies={:>3} {:?} work_a={} work_b={}",
+                "game {:>4} seat_a={} winner={} turns={:>3} plies={:>3} {:?} work_a={} work_b={}",
                 game.index,
                 if game.a_is_p1 { 1 } else { 2 },
                 game.winner,
+                game.turns,
                 game.plies,
                 game.termination,
                 game.work_a,
