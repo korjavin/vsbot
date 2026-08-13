@@ -87,11 +87,18 @@ pub const TEMPERATURE_PLIES: u32 = 21;
 
 /// Default leaves per batched net evaluation.
 ///
-/// Tuned on this box's 4 vCPUs against `examples/mctsbench`: the batched trunk
-/// is already at full vector width by 8, and past ~16 the extra decorrelation
-/// pressure on the tree costs more than the remaining throughput buys. 8 and 16
-/// measured within noise of each other; 16 wins slightly at longer budgets,
-/// where the tree is big enough to absorb it.
+/// Measured on this box with `examples/mctsbench`: throughput plateaus at
+/// **8**, where the batched trunk first fills its vector width, and 8 through
+/// 48 all land within measurement noise of each other at 2.1-2.5x the serial
+/// searcher. Below 8 the batch is a *loss* — [`crate::net::BATCH_LANES`] is the
+/// group size, so a round of 2 leaves pays for a group of 8 and measured 0.6x
+/// serial. Sixteen is the default because it is the smallest multiple of the
+/// lane width that keeps a round full even when a few of its descents land on
+/// terminal nodes or on a leaf another descent already claimed, and it holds
+/// the staleness a batch introduces to two lane groups' worth.
+///
+/// Set it to `1` for the serial searcher; anything between 2 and 7 is strictly
+/// worse than either.
 pub const DEFAULT_BATCH_SIZE: u16 = 16;
 
 /// Default virtual-loss weight, in leaf-value units.
@@ -134,7 +141,9 @@ pub struct Config {
     /// taking the argmax. **Self-play only.**
     pub visit_sampling: bool,
     /// Leaves collected per batched net evaluation. `0` and `1` both mean the
-    /// serial searcher; see the module docs.
+    /// serial searcher; see the module docs and [`DEFAULT_BATCH_SIZE`]. Values
+    /// between 2 and [`crate::net::BATCH_LANES`] are worse than either end —
+    /// the net rounds a batch up to whole lane groups.
     pub batch_size: u16,
     /// Virtual-loss weight applied to an edge with a descent in flight.
     /// Inert at `batch_size <= 1` in a single-threaded search.
