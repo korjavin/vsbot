@@ -12,3 +12,15 @@ virus-core = { workspace = true }
 virus-eval = { workspace = true }
 virus-search = { workspace = true }
 virus-mcts = { workspace = true }
+
+# `src/bin/arena.rs` is the CLI a human runs a gauntlet with. It lives in this
+# crate rather than as a subcommand of `vsbot`: `vsbot` is the deployed
+# container's entrypoint and must not grow a code path that loads gauntlet
+# machinery into the production image.
+#
+# Deliberately left to cargo's `src/bin/*.rs` auto-discovery instead of an
+# explicit `[[bin]]` with a `path`. The Dockerfile's dependency-cache layer
+# builds `-p vsbot` against stub crates that have only an empty `src/lib.rs`,
+# so an explicitly-pathed target would name a file that does not exist in that
+# layer. Today cargo tolerates that; auto-discovery simply finds nothing, which
+# needs no tolerance.
