@@ -234,11 +234,21 @@ impl SearchEngine for MctsEngine {
                 } => (state, budget, Some(reply)),
             };
 
-            let reused = tree
-                .as_mut()
-                .is_some_and(|(root, searcher)| reroot(root, searcher, &state));
+            // Defence in depth behind `BotCore::may_ponder`. A position with a
+            // live mover and `movesLeft == 0` is a transient the server really
+            // does publish, and it is poison: `State::legal_actions` does not
+            // filter on `movesLeft`, so it enumerates moves whose `apply`
+            // decrements `0 - 1` and panics indexing the Zobrist table. A
+            // panicking session takes a blocking worker with it and silently
+            // degrades the rest of the game to the fallback, so the cheap check
+            // belongs on both sides of the channel.
+            let searchable = !state.game_over() && state.moves_left() > 0 && self.in_domain(&state);
+            let reused = searchable
+                && tree
+                    .as_mut()
+                    .is_some_and(|(root, searcher)| reroot(root, searcher, &state));
             if !reused {
-                tree = self.in_domain(&state).then(|| {
+                tree = searchable.then(|| {
                     (
                         state.clone(),
                         MctsSearcher::new(state.clone(), self.config, Some(&self.net)),

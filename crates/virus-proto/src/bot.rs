@@ -342,16 +342,28 @@ impl BotCore {
 
     /// Whether a pondering session may be given this position.
     ///
-    /// The mirror image of [`BotCore::may_act`], and deliberately *narrower*
-    /// than "not our turn": we ponder only positions where somebody else is the
-    /// mover. A position where we are the mover with no actions left is a
-    /// transient the next snapshot resolves, and a game that is over is not
-    /// worth a simulation.
+    /// The mirror image of [`BotCore::may_act`]: the same four conditions with
+    /// the seat test inverted. We ponder only positions where somebody else is
+    /// the mover, and only ones that actually have a move to make.
+    ///
+    /// The `moves_left > 0` clause is not decoration. `movesLeft == 0` with a
+    /// live mover is a real transient the server publishes — the `move_made`
+    /// echo of an opponent's third action arrives before the `turn_change` that
+    /// rotates the turn — and `State::legal_actions` does not filter on
+    /// `movesLeft`, so such a position enumerates moves that `apply` then
+    /// decrements to `0 - 1`. That underflow indexes the Zobrist `movesLeft`
+    /// table at 255 and panics the search worker. `may_act` has always excluded
+    /// it, which is why nothing before pondering could reach it; a ≥20-game live
+    /// soak found it within one game. See the note in `virus-core`'s
+    /// `legal_actions_with` — the underlying enumeration is worth hardening too,
+    /// but the client must not be relying on that.
     pub fn may_ponder(&self) -> bool {
         self.phase == Phase::InGame
             && self.current_game.is_some()
             && self.position.as_ref().is_some_and(|position| {
-                !position.game_over() && position.current_player() != self.seat
+                !position.game_over()
+                    && position.current_player() != self.seat
+                    && position.moves_left() > 0
             })
     }
 

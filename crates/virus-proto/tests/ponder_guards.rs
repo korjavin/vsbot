@@ -468,6 +468,62 @@ async fn pondering_off_means_no_session_at_all() {
     assert_eq!(bot.core().counters.ponder_answers, 0);
 }
 
+/// Regression, found by the ≥20-game live soak within a single game.
+///
+/// The server publishes a real transient where the mover is live and
+/// `movesLeft == 0`: the `move_made` echo of an opponent's third action arrives
+/// before the `turn_change` that rotates the turn. `State::legal_actions` does
+/// not filter on `movesLeft`, so such a position enumerates moves whose `apply`
+/// decrements `0 - 1`; the underflow indexes the Zobrist `movesLeft` table at
+/// 255 and panics the search worker.
+///
+/// `may_act` has always excluded `movesLeft == 0`, which is why nothing before
+/// pondering could reach it. `may_ponder` must exclude it for the same reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_position_with_no_actions_left_is_never_pondered() {
+    let probe = PonderProbe::new(Duration::from_millis(10));
+    let (bot, mut inbox) = Bot::new(config(true), probe.clone());
+
+    let opponent = opponent_to_move();
+    feed(&bot, &game_start(1, &opponent));
+    wait_for_steps(&probe, 1).await;
+    let before = probe.observed().len();
+
+    // The opponent's own position, mid-rotation: still their move, nothing left
+    // to do with it.
+    let mut spent = opponent.snapshot();
+    spent.moves_left = 0;
+    feed(
+        &bot,
+        &json!({ "type": "move_made", "gameId": "g", "snapshot": spent }),
+    );
+
+    assert!(
+        !bot.core().may_ponder(),
+        "a mover with no actions left has nothing to search"
+    );
+    assert_silent(&mut inbox).await;
+    assert_eq!(
+        probe.observed().len(),
+        before,
+        "the transient must not reach the searcher: {:?}",
+        probe.observed()
+    );
+
+    // And the session is still alive for the next real position.
+    let mut moved = opponent.clone();
+    let action = moved
+        .legal_actions()
+        .first()
+        .copied()
+        .expect("the opponent has a move");
+    moved = moved.apply(action).expect("legal");
+    if moved.current_player() == 2 {
+        feed(&bot, &snapshot_frame("move_made", &moved));
+        wait_for_steps(&probe, before + 1).await;
+    }
+}
+
 /// An engine that does not declare `can_ponder` never gets a session, even with
 /// `VSBOT_PONDER=true`. Half-wiring it would leave the client waiting out its
 /// fallback timer once per turn.
