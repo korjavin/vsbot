@@ -84,20 +84,27 @@ def check_row(row, where, problems):
         return None
     if len(pi) < 2:
         problems.add(where, f"pi has {len(pi)} action(s); SelfPlayMcts only emits multi-choice positions (root.actions.length > 1)")
-    if len(pi) != len(set(pi)):
-        dupes = [a for a, c in collections.Counter(pi).items() if c > 1]
-        problems.add(where, f"pi has duplicate action id(s) {dupes[:5]}")
 
+    # Type-check every entry BEFORE any set/Counter work: a JSON array or object
+    # in pi is unhashable, and hashing it first would abort the whole run with a
+    # traceback instead of the aggregated report this tool promises. Malformed
+    # output is exactly the input this validator exists to survive.
+    ints = []
     for action in pi:
         if not isinstance(action, int) or isinstance(action, bool):
             problems.add(where, f"pi entry {action!r} is not an int")
             continue
+        ints.append(action)
         if not 0 <= action < FLAT:
             problems.add(where, f"pi entry {action} outside the flat space [0, {FLAT})")
             continue
         kind = decode(action)
         if kind[0] == "pair" and kind[1] >= kind[2]:
             problems.add(where, f"pair id {action} decodes to (i={kind[1]}, j={kind[2]}) — must be 144 + min*144 + max with i < j")
+
+    if len(ints) != len(set(ints)):
+        dupes = [a for a, c in collections.Counter(ints).items() if c > 1]
+        problems.add(where, f"pi has duplicate action id(s) {dupes[:5]}")
 
     if any(not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in pv):
         problems.add(where, f"pv must be non-negative integer visit counts, got {pv[:5]}...")

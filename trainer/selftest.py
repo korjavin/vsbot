@@ -180,6 +180,29 @@ class RejectionTest(unittest.TestCase):
 
         self.assert_rejected(mutate, "pv sums to 0")
 
+    def test_reports_rather_than_crashes_on_an_unhashable_action(self):
+        # A nested array in pi is well-formed JSON but not an action id. The
+        # duplicate-detection pass used to hash pi before type-checking it, so
+        # this aborted the whole file with a TypeError traceback instead of
+        # reporting the row. Malformed output is what this tool is *for*.
+        def mutate(rows):
+            rows[0]["pi"][0] = [1, 2]
+
+        self.assert_rejected(mutate, "is not an int")
+
+    def test_an_unhashable_action_does_not_hide_later_rows(self):
+        # The aggregated report must survive the bad row and keep checking.
+        rows = good_rows()
+        rows[0]["pi"][0] = {"cell": 4}
+        rows[-1]["mover"] = 3
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_rows(rows, directory)
+            code, out = run("validate_rows.py", path)
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("Traceback", out)
+        self.assertIn("is not an int", out)
+        self.assertIn("mover must be 1 or 2", out)
+
 
 class ArtifactValidatorTest(unittest.TestCase):
     """The vendored fixtures are known-good; mutations of them must be caught."""
@@ -228,6 +251,32 @@ class ArtifactValidatorTest(unittest.TestCase):
 
     def test_rejects_a_value_head_stripped_from_a_value_arch(self):
         self.assert_artifact_rejected(lambda net: net.pop("value_head"), "there is no `value_head`")
+
+    def test_require_identical_gates_a_geometry_mismatch(self):
+        # roundtrip.sh step 5b asserts the 8x2 candidate matches the tiny
+        # fixture exactly. Without --require-identical that was a printed
+        # observation, not a gate: a trainer that ignored --channels/--layers
+        # went green anyway.
+        code, out = run(
+            "validate_artifact.py",
+            str(self.CHAMPION),  # 32x4 — deliberately not the fixture's geometry
+            "--reference",
+            str(self.FIXTURE),
+            "--require-identical",
+        )
+        self.assertEqual(code, 1, f"expected the mismatch to gate:\n{out}")
+        self.assertIn("shape signature differs", out)
+
+    def test_require_identical_passes_for_a_matching_geometry(self):
+        code, out = run(
+            "validate_artifact.py",
+            str(self.FIXTURE),
+            "--reference",
+            str(self.FIXTURE),
+            "--require-identical",
+        )
+        self.assertEqual(code, 0, out)
+        self.assertIn("identical shape signature: True", out)
 
 
 if __name__ == "__main__":

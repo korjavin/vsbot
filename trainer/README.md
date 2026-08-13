@@ -62,7 +62,7 @@ Each step fails loudly:
 * **4 train** — `train_selfplay.py`, unchanged, in the container. A tiny net
   (8 channels × 2 layers), 3 epochs, thrown away.
 * **5 / 5b schema** — `validate_artifact.py` against the champion, then against
-  the vendored tiny fixture.
+  the vendored tiny fixture with `--require-identical`.
 * **6 load** — the artifact is loaded by `virus-mcts`' real loader.
 
 Step 4's geometry is not arbitrary: 8×2 is exactly the shape of the vendored

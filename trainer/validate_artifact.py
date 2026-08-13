@@ -146,6 +146,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("artifact")
     ap.add_argument("--reference", default=None, help="known-good artifact to compare field structure against")
+    ap.add_argument(
+        "--require-identical",
+        action="store_true",
+        help="fail unless the shape signature matches --reference exactly (use when the reference has the same channels/layers)",
+    )
     args = ap.parse_args()
 
     with open(args.artifact) as handle:
@@ -177,10 +182,20 @@ def main():
                 fail(problems, f"{key} differs from reference: {sig.get(key)!r} vs {ref_sig.get(key)!r}")
         print(f"  same field groups: {not missing}")
         print(f"  same arch/board/planes: {all(sig.get(k) == ref_sig.get(k) for k in ('arch', 'board', 'planes'))}")
-        # Informational, not a gate: a smoke net is deliberately smaller than the
-        # champion, so an identical signature is only expected when the reference
-        # was trained at the same channels/layers (the tiny fixture is).
-        print(f"  identical shape signature: {sig == ref_sig}")
+        # Informational by default: a smoke net is deliberately smaller than the
+        # champion, so an identical signature is only *expected* when the
+        # reference was trained at the same channels/layers. When the caller
+        # knows it was (roundtrip.sh step 5b, against the 8x2 tiny fixture),
+        # --require-identical turns that expectation into a gate — otherwise a
+        # trainer that quietly ignored --channels/--layers, or changed an
+        # exported tensor's shape, still goes green.
+        identical = sig == ref_sig
+        print(f"  identical shape signature: {identical}")
+        if args.require_identical and not identical:
+            differing = sorted(k for k in set(sig) | set(ref_sig) if sig.get(k) != ref_sig.get(k))
+            fail(problems, f"--require-identical: shape signature differs from the reference in {differing}")
+            for key in differing:
+                fail(problems, f"    {key}: {sig.get(key)!r} vs reference {ref_sig.get(key)!r}")
 
     if problems:
         print(f"\nFAIL: {len(problems)} problem(s)", file=sys.stderr)

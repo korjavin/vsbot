@@ -31,7 +31,8 @@
 #   CHANNELS/LAYERS  net size — small on purpose      (default 8 / 2)
 #   SEED             trainer seed                     (default 7)
 #   SKIP_RUST=1      skip the cargo load check (prints why, still exits 0)
-#   JOBS             cargo build jobs                 (default 2 — the box is shared)
+#   JOBS             core budget: docker --cpus and cargo --jobs
+#                                                     (default 2 — the box is shared)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -120,12 +121,14 @@ python3 "$ROOT/trainer/validate_artifact.py" "$WORK/candidate.json" --reference 
 # CHANNELS=8/LAYERS=2 is not an arbitrary "small": it is exactly the geometry of
 # fixtures/mcts/mcts_selfplay_tiny.json, the vendored net the Java loader's
 # parity test uses. At the defaults the freshly trained candidate must therefore
-# have a byte-for-byte identical *shape signature* to that fixture — a sharper
-# assertion than "matches the champion's arch", and it is free.
+# have an identical *shape signature* to that fixture — a sharper assertion than
+# "matches the champion's arch", and it is free. --require-identical makes it a
+# gate rather than a printed observation, so a trainer that ignored
+# --channels/--layers, or changed an exported tensor's shape, fails here.
 if [ "$CHANNELS" = 8 ] && [ "$LAYERS" = 2 ] && [ -f "$ROOT/fixtures/mcts/mcts_selfplay_tiny.json" ]; then
   step "5b/6 same geometry as the vendored tiny fixture"
   python3 "$ROOT/trainer/validate_artifact.py" "$WORK/candidate.json" \
-    --reference "$ROOT/fixtures/mcts/mcts_selfplay_tiny.json" | tail -6
+    --reference "$ROOT/fixtures/mcts/mcts_selfplay_tiny.json" --require-identical | tail -6
 fi
 
 # ---------------------------------------------------------------- 6. rust load
