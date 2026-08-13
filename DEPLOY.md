@@ -282,7 +282,10 @@ point. URLs are never printed.
 ### 4. Promoting, rolling back, and checking what is live
 
 - **Promote:** merge to master. The deploy branch moves, the webhook fires,
-  Portainer pulls the new pinned tag. Nothing to do by hand.
+  Portainer pulls the new pinned tag. Nothing to do by hand. Two merges in
+  quick succession are safe: deploys are serialised, and a run whose commit is
+  no longer master's tip skips its own deploy (a notice on the run says so), so
+  the branch only ever moves forward.
 - **Roll back:** in the Portainer stack editor, change the one `image:` line to
   the previous `sha-<commit>` tag and redeploy — the whole stack state is that
   one line. Note the next master push rewrites the deploy branch and a

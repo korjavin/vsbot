@@ -37,6 +37,15 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# Superseded *pull request* builds are pointless, so cancel them. Master runs
+# are never cancelled — one of them may be halfway through pushing an image —
+# they just queue, one per ref. Ordering between two master runs is still not
+# guaranteed by this alone (a queued older run would push a stale deploy
+# branch), which is what the tip check in the deploy job below is for.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-and-push:
     name: build and push ghcr.io image
@@ -147,10 +156,40 @@ jobs:
       # nothing else — the image was already pushed by the job above.
       contents: write
 
+    # One deploy at a time, and never cancelled midway: two jobs force-pushing
+    # the same branch and firing the same webhook is how a stack ends up on a
+    # different commit than the branch says.
+    concurrency:
+      group: vsbot-deploy-branch
+      cancel-in-progress: false
+
     steps:
       - uses: actions/checkout@v4
 
+      # A run that started before a newer master push must not move `deploy`
+      # backwards: the older build can finish last, and its webhook would then
+      # redeploy the older image. If master has moved on, this run stops here —
+      # the run for the newer commit deploys it. Combined with the serialised
+      # concurrency group above, the branch only ever moves forward.
+      - name: Check this commit is still the branch tip
+        id: tip
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          tip=$(git ls-remote origin "refs/heads/${BRANCH}" | cut -f1)
+          if [ -z "$tip" ]; then
+            echo "could not read the tip of ${BRANCH}" >&2
+            exit 1
+          fi
+          if [ "$tip" != "$COMMIT_SHA" ]; then
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Deploy skipped::${BRANCH} is now ${tip}; the run for that commit deploys it"
+            echo "_Deploy skipped: superseded by \`${tip}\`._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Render the deploy-branch compose
+        if: steps.tip.outputs.stale != 'true'
         env:
           IMAGE_REF: ${{ needs.build-and-push.outputs.image_ref }}
         run: |
@@ -164,6 +203,7 @@ jobs:
       # also makes the branch fast-forward-hostile on purpose: it is rewritten,
       # not appended to, which is why the push is `--force`.
       - name: Force-push the deploy branch
+        if: steps.tip.outputs.stale != 'true'
         env:
           IMAGE_REF: ${{ needs.build-and-push.outputs.image_ref }}
           COMMIT_SHA: ${{ github.sha }}
@@ -198,6 +238,7 @@ jobs:
       # Portainer that was down when we knocked is an operational problem, not a
       # bad build. Nothing ever prints a URL.
       - name: Trigger Portainer redeploy webhooks
+        if: steps.tip.outputs.stale != 'true'
         continue-on-error: true
         env:
           WEBHOOKS_1: ${{ secrets.PORTAINER_WEBHOOK_URL }}
