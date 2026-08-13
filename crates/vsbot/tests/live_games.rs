@@ -16,11 +16,19 @@
 //!
 //! Knobs:
 //!
-//! | Variable                | Default                           |
-//! |-------------------------|-----------------------------------|
-//! | `VSBOT_ITEST`           | unset — the test skips            |
-//! | `VSBOT_ITEST_BACKEND`   | `$HOME/Project/virusgame/backend` |
-//! | `VSBOT_ITEST_GAMES`     | `3`                               |
+//! | Variable                | Default                            |
+//! |-------------------------|------------------------------------|
+//! | `VSBOT_ITEST`           | unset — the tests skip             |
+//! | `VSBOT_ITEST_BACKEND`   | `$HOME/Project/virusgame/backend`  |
+//! | `VSBOT_ITEST_GAMES`     | `3` (protocol run), `1` (MCTS run) |
+//! | `VSBOT_ITEST_MCTS_MS`   | `150` — MCTS move budget           |
+//!
+//! Two scenarios live here. The protocol run pits two instant engines against
+//! each other and is about *ordering*; the MCTS run puts the real champion on
+//! one side and is about the engine adapter — that a searched move survives the
+//! round trip and that the domain guard never lets an out-of-domain position
+//! reach the searcher's asserts. They each start their own server, so
+//! [`SERIAL`] keeps them from racing for a port.
 //!
 //! The server hard-codes `:8080` in `main.go`, which is no good for a test that
 //! must not fight whatever else the developer has running. It is therefore
@@ -36,12 +44,21 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use virus_core::{Action, State};
-use virus_proto::{Bot, BotConfig, GreedyEngine, SearchBudget, SearchEngine, SearchOutcome};
+use virus_proto::{
+    Bot, BotConfig, EngineKind, GreedyEngine, SearchBudget, SearchEngine, SearchOutcome,
+};
+use vsbot::{build_engine, MctsSettings};
 
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Each scenario starts its own Go server, and the fallback path when the port
+/// patch does not apply is the hard-coded `:8080`. Serialising the scenarios
+/// keeps that from turning into a flake — cargo runs the tests in one binary on
+/// several threads by default.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Plays greedily, but spends its neutral placement at the first legal
 /// opportunity of every game.
@@ -75,18 +92,183 @@ impl SearchEngine for NeutralOpeningEngine {
     }
 }
 
+// The serialisation guard is deliberately held across the run: that is the
+// whole point of it, and a blocking lock is correct here because the two test
+// futures live on different runtimes and never contend from within one.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_bots_play_full_games_without_a_single_illegal_move() {
-    if std::env::var("VSBOT_ITEST").as_deref() != Ok("1") {
-        eprintln!("skipping: set VSBOT_ITEST=1 to run the live-server integration test");
+    let Some(_guard) = enabled("protocol") else {
         return;
-    }
+    };
     let target_games: u64 = std::env::var("VSBOT_ITEST_GAMES")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(3);
 
-    let workdir = std::env::temp_dir().join(format!("vsbot-itest-{}", std::process::id()));
+    let neutral_engine = Arc::new(NeutralOpeningEngine::default());
+    let report = run_scenario(Scenario {
+        label: "protocol",
+        target_games,
+        move_budget: Duration::from_millis(50),
+        challenger: Arc::new(GreedyEngine),
+        acceptor: neutral_engine.clone(),
+    })
+    .await;
+
+    report.assert_clean(target_games);
+    let placements = neutral_engine.placements.load(Ordering::SeqCst);
+    assert!(
+        placements > 0,
+        "no neutral placement happened; the neutrals_placed-ack path was not exercised"
+    );
+
+    eprintln!(
+        "OK: {} games, challenger sent {} actions, acceptor sent {} actions, \
+         {placements} neutral placements, 0 illegal moves, 0 server errors",
+        report.challenger.games_finished,
+        report.challenger.actions_sent,
+        report.acceptor.actions_sent,
+    );
+}
+
+/// The acceptance gate for `SEARCH=MCTS`: the champion, built through the same
+/// [`build_engine`] the binary calls, plays a full game against the reference
+/// engine on a real server.
+///
+/// This is the run that catches the failure the unit tests cannot: a searched
+/// action that is legal in the *searcher's* copy of the position but not in the
+/// one the server holds. The server forfeits an illegal move instantly, so a
+/// completed game with a clean hub log is the proof.
+#[allow(clippy::await_holding_lock)] // see the note on the scenario above
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_mcts_champion_plays_a_full_game_without_a_single_illegal_move() {
+    let Some(_guard) = enabled("mcts") else {
+        return;
+    };
+    let target_games: u64 = std::env::var("VSBOT_ITEST_GAMES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let move_millis: u64 = std::env::var("VSBOT_ITEST_MCTS_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(150);
+
+    // Exactly what `main` does, artifact included — a test that hand-built an
+    // `MctsEngine` would prove nothing about the deployed wiring.
+    let setup = build_engine(
+        EngineKind::Mcts,
+        &MctsSettings {
+            artifact: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../artifacts/mcts_champion.json"),
+            seed: 1,
+        },
+    )
+    .expect("the in-repo champion loads and validates");
+    assert_eq!(setup.engine.name(), "mcts");
+    eprintln!("vsbot: {}", setup.description);
+
+    let report = run_scenario(Scenario {
+        label: "mcts",
+        target_games,
+        move_budget: Duration::from_millis(move_millis),
+        challenger: setup.engine,
+        acceptor: Arc::new(GreedyEngine),
+    })
+    .await;
+
+    report.assert_clean(target_games);
+    eprintln!(
+        "OK (MCTS): {} games at {move_millis}ms/move, mcts challenger sent {} actions, \
+         greedy acceptor sent {} actions, 0 illegal moves, 0 server errors",
+        report.challenger.games_finished,
+        report.challenger.actions_sent,
+        report.acceptor.actions_sent,
+    );
+}
+
+/// The `VSBOT_ITEST` gate plus the cross-scenario lock, or `None` to skip.
+fn enabled(label: &str) -> Option<std::sync::MutexGuard<'static, ()>> {
+    if std::env::var("VSBOT_ITEST").as_deref() != Ok("1") {
+        eprintln!("skipping {label}: set VSBOT_ITEST=1 to run the live-server integration tests");
+        return None;
+    }
+    // A panicking scenario poisons the lock; the next one is still perfectly
+    // able to run, so take the guard regardless.
+    Some(
+        SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
+}
+
+/// One end-to-end run: which engines, for how many games, at what budget.
+struct Scenario {
+    /// Names the scenario's workdir, so concurrent runs never share a server.
+    label: &'static str,
+    target_games: u64,
+    move_budget: Duration,
+    challenger: Arc<dyn SearchEngine>,
+    acceptor: Arc<dyn SearchEngine>,
+}
+
+struct Side {
+    name: &'static str,
+    errors: u64,
+    illegal_moves: u64,
+    actions_sent: u64,
+    games_finished: u64,
+    last_error: Option<String>,
+}
+
+struct Report {
+    challenger: Side,
+    acceptor: Side,
+    server_output: String,
+}
+
+impl Report {
+    /// Both sides finished their games, neither was forfeited, and the hub
+    /// agrees.
+    fn assert_clean(&self, target_games: u64) {
+        // Independent, server-side confirmation. The hub logs every rejected
+        // action before it forfeits the offender, so a clean log is proof the
+        // clean client counters are not just a client-side blind spot.
+        assert!(
+            !self.server_output.contains("made illegal move"),
+            "the server logged an illegal move:\n{}",
+            tail(&self.server_output)
+        );
+        for side in [&self.challenger, &self.acceptor] {
+            assert_eq!(
+                side.illegal_moves, 0,
+                "{} was forfeited for an illegal move: {:?}",
+                side.name, side.last_error
+            );
+            assert_eq!(
+                side.errors, 0,
+                "{} received {} server errors, last: {:?}",
+                side.name, side.errors, side.last_error
+            );
+            assert!(
+                side.games_finished >= target_games,
+                "{} finished {} games, wanted {target_games}",
+                side.name,
+                side.games_finished
+            );
+            assert!(side.actions_sent > 0, "{} never acted", side.name);
+        }
+    }
+}
+
+/// Builds and starts a server, plays the scenario, and stops the server.
+async fn run_scenario(scenario: Scenario) -> Report {
+    let workdir = std::env::temp_dir().join(format!(
+        "vsbot-itest-{}-{}",
+        std::process::id(),
+        scenario.label
+    ));
     std::fs::create_dir_all(&workdir).expect("temp workdir");
 
     let server = build_server(&workdir);
@@ -113,82 +295,30 @@ async fn two_bots_play_full_games_without_a_single_illegal_move() {
         .spawn()
         .unwrap_or_else(|error| panic!("could not start {}: {error}", server.binary.display()));
 
-    let outcome = tokio::time::timeout(OVERALL_TIMEOUT, play(port, target_games)).await;
+    let target_games = scenario.target_games;
+    let outcome = tokio::time::timeout(OVERALL_TIMEOUT, play(port, scenario)).await;
 
     let _ = child.kill().await;
     let server_output = std::fs::read_to_string(&server_log).unwrap_or_default();
 
-    let Ok(report) = outcome else {
+    let Ok((challenger, acceptor)) = outcome else {
         panic!(
             "the run did not finish {target_games} games within {OVERALL_TIMEOUT:?}\n\
              --- server log tail ---\n{}",
             tail(&server_output)
         );
     };
-
-    // Independent, server-side confirmation. The hub logs every rejected action
-    // before it forfeits the offender, so a clean log is proof the clean client
-    // counters are not just a client-side blind spot.
-    assert!(
-        !server_output.contains("made illegal move"),
-        "the server logged an illegal move:\n{}",
-        tail(&server_output)
-    );
-
-    for side in [&report.challenger, &report.acceptor] {
-        assert_eq!(
-            side.illegal_moves, 0,
-            "{} was forfeited for an illegal move: {:?}",
-            side.name, side.last_error
-        );
-        assert_eq!(
-            side.errors, 0,
-            "{} received {} server errors, last: {:?}",
-            side.name, side.errors, side.last_error
-        );
-        assert!(
-            side.games_finished >= target_games,
-            "{} finished {} games, wanted {target_games}",
-            side.name,
-            side.games_finished
-        );
-        assert!(side.actions_sent > 0, "{} never acted", side.name);
+    Report {
+        challenger,
+        acceptor,
+        server_output,
     }
-    assert!(
-        report.neutral_placements > 0,
-        "no neutral placement happened; the neutrals_placed-ack path was not exercised"
-    );
-
-    eprintln!(
-        "OK: {} games, challenger sent {} actions, acceptor sent {} actions, \
-         {} neutral placements, 0 illegal moves, 0 server errors",
-        report.challenger.games_finished,
-        report.challenger.actions_sent,
-        report.acceptor.actions_sent,
-        report.neutral_placements,
-    );
 }
 
-struct Side {
-    name: &'static str,
-    errors: u64,
-    illegal_moves: u64,
-    actions_sent: u64,
-    games_finished: u64,
-    last_error: Option<String>,
-}
-
-struct Report {
-    challenger: Side,
-    acceptor: Side,
-    neutral_placements: usize,
-}
-
-async fn play(port: u16, target_games: u64) -> Report {
+async fn play(port: u16, scenario: Scenario) -> (Side, Side) {
     wait_for_port(port).await;
 
     let url = format!("ws://127.0.0.1:{port}/ws");
-    let neutral_engine = Arc::new(NeutralOpeningEngine::default());
 
     // The challenger's timer is the sole send driver; a short interval only
     // makes the run quick, it does not change the mechanism.
@@ -196,23 +326,24 @@ async fn play(port: u16, target_games: u64) -> Report {
         Arc::new(BotConfig {
             backend_url: url.clone(),
             name_prefix: "ITestChallenger".to_owned(),
-            move_budget: Duration::from_millis(50),
+            move_budget: scenario.move_budget,
             challenger: true,
             challenge_interval: Duration::from_secs(2),
             rng_seed: Some(0x5EED),
             ..BotConfig::default()
         }),
-        Arc::new(GreedyEngine),
+        scenario.challenger,
     );
     let (acceptor, mut acceptor_inbox) = Bot::new(
         Arc::new(BotConfig {
             backend_url: url,
             name_prefix: "ITestAcceptor".to_owned(),
-            move_budget: Duration::from_millis(50),
+            move_budget: scenario.move_budget,
             ..BotConfig::default()
         }),
-        neutral_engine.clone(),
+        scenario.acceptor,
     );
+    let target_games = scenario.target_games;
 
     let acceptor_task = {
         let bot = acceptor.clone();
@@ -243,11 +374,7 @@ async fn play(port: u16, target_games: u64) -> Report {
     challenger_task.abort();
     acceptor_task.abort();
 
-    Report {
-        challenger: side("challenger", &challenger),
-        acceptor: side("acceptor", &acceptor),
-        neutral_placements: neutral_engine.placements.load(Ordering::SeqCst),
-    }
+    (side("challenger", &challenger), side("acceptor", &acceptor))
 }
 
 fn side(name: &'static str, bot: &Bot) -> Side {

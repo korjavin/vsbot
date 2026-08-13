@@ -124,17 +124,18 @@ impl SearchEngine for GreedyEngine {
 
 /// Which engine the binary should build.
 ///
-/// Only [`EngineKind::Greedy`] is wired today; the other two are the documented
-/// plug-in points for `virus-search` and `virus-mcts`.
+/// [`EngineKind::Mcts`] is the production default and [`EngineKind::Greedy`] is
+/// the reference engine in this crate; [`EngineKind::AlphaBeta`] is the
+/// documented plug-in point for `virus-search`, which is not merged yet.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum EngineKind {
-    /// The reference engine in this crate.
+    /// PUCT + policy/value net (`virus-mcts`). The engine the bot plays with.
     #[default]
+    Mcts,
+    /// The reference engine in this crate: deliberately weak and instant.
     Greedy,
     /// Enhanced iterative-deepening alpha-beta (`virus-search`). Not merged.
     AlphaBeta,
-    /// PUCT + policy/value net (`virus-mcts`). Not merged.
-    Mcts,
 }
 
 impl EngineKind {
@@ -142,9 +143,14 @@ impl EngineKind {
     /// than a silent fallback, because a typo that quietly downgrades the
     /// engine is exactly how a harness ends up reporting the wrong engine's
     /// results (see the Java `unwiredEvalWarning` post-mortem).
+    ///
+    /// An empty value means "unset", which resolves to [`EngineKind::default`]
+    /// — the same answer the binary reaches when `SEARCH` is absent, so the two
+    /// spellings of "I did not choose" can never disagree.
     pub fn parse(value: &str) -> Result<EngineKind, UnknownEngine> {
         match value.trim().to_ascii_uppercase().as_str() {
-            "" | "GREEDY" => Ok(EngineKind::Greedy),
+            "" => Ok(EngineKind::default()),
+            "GREEDY" => Ok(EngineKind::Greedy),
             "ALPHABETA" | "ALPHA_BETA" => Ok(EngineKind::AlphaBeta),
             "MCTS" => Ok(EngineKind::Mcts),
             _ => Err(UnknownEngine(value.to_owned())),
@@ -169,7 +175,7 @@ impl fmt::Display for UnknownEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "unknown SEARCH={:?}; expected GREEDY, ALPHABETA or MCTS",
+            "unknown SEARCH={:?}; expected MCTS, GREEDY or ALPHABETA",
             self.0
         )
     }
