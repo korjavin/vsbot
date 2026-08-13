@@ -1,0 +1,20 @@
+[package]
+name = "vsbot"
+description = "The bot binary: reads env config in one place and wires the engine crates together."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vsbot"
+path = "src/main.rs"
+
+[dependencies]
+virus-core = { workspace = true }
+virus-eval = { workspace = true }
+virus-search = { workspace = true }
+virus-mcts = { workspace = true }
+virus-proto = { workspace = true }
+virus-arena = { workspace = true }

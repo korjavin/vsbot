@@ -1,0 +1,12 @@
+[package]
+name = "virus-mcts"
+description = "PUCT searcher plus convolutional policy/value net inference (f32, single trunk pass)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+virus-core = { workspace = true }
+virus-eval = { workspace = true }
