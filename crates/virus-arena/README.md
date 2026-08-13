@@ -174,6 +174,12 @@ The counting handles both seat orders — free, and correct the day the server c
 alternate — and until then the script prints a loud warning whenever the split
 is lopsided. **Read a cross-play result as a plumbing check, not as strength.**
 
+**`--vsbot-instances > 1` wastes roughly half its games.** `vsbot`'s challenger
+picks any idle peer, including another `vsbot`, so a multi-instance run spends
+about half its time on vsbot-vs-vsbot games. The name filter excludes them from
+the tally — they are never miscounted, only wasted — and the trade for
+concurrency is usually still worth it.
+
 `SEARCH=ALPHABETA` and `SEARCH=MCTS` are rejected by the `vsbot` binary until
 the engine wiring lands (`build_engine` in `crates/vsbot/src/main.rs`), so the
 cross-play arm currently runs `SEARCH=GREEDY` — enough to prove the plumbing,

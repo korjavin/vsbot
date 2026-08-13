@@ -106,7 +106,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--vsbot-instances",
         type=int,
         default=2,
-        help="challenger vsbot processes; keep <= --go-bots",
+        help=(
+            "challenger vsbot processes. More than one buys concurrency at the "
+            "cost of throughput: vsbot's challenger picks any idle peer, "
+            "including another vsbot, so roughly half the games at N>1 are "
+            "vsbot-vs-vsbot. Those are excluded from the tally by the name "
+            "filter, never miscounted -- they are only wasted compute"
+        ),
     )
     parser.add_argument(
         "--challenge-secs",
