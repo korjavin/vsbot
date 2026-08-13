@@ -5,7 +5,7 @@
 //! re-validated every time, and the server's `Active[]` is not trusted.
 
 use virus_core::cell::CellKind;
-use virus_core::{Pos, Snapshot, State};
+use virus_core::{Pos, Position, Snapshot, State};
 
 fn decode(json: &str) -> Result<State, virus_core::SnapshotError> {
     serde_json::from_str::<Snapshot>(json)
@@ -189,6 +189,66 @@ fn round_trips_a_mid_game_position() {
         assert_eq!(position.snapshot(), restored.snapshot());
         assert_eq!(position.hash(), restored.hash());
     }
+}
+
+/// Regression, vsbot-j07 (found by the S2 live soak).
+///
+/// The server publishes a real transient in which the mover is still live and
+/// `movesLeft == 0`: the `move_made` echo of a turn's last action arrives
+/// before the `turn_change` that rotates the seat. No rules transition can
+/// produce it — `State::mutate` rotates the turn the moment the budget hits
+/// zero — but `Snapshot::decode` imports it faithfully, so every enumeration
+/// entry point has to hold the line. Before this, they filtered only on
+/// `game_over` / mover-active, so the position handed out `Move` actions whose
+/// `apply` computed `0 - 1`; the wrapped `255` indexed the Zobrist `movesLeft`
+/// table out of bounds and panicked the search worker (zobrist.rs:114).
+#[test]
+fn a_live_mover_with_no_moves_left_enumerates_nothing() {
+    let spent = decode(&wire(false, [true, true]).replace(r#""movesLeft":3"#, r#""movesLeft":0"#))
+        .expect("the transient decodes — it is a position the server really publishes");
+
+    // Exactly the live shape: running game, live mover, empty turn budget.
+    assert!(!spent.game_over());
+    assert!(spent.active(spent.current_player()));
+    assert_eq!(spent.moves_left(), 0);
+    assert!(!spent.can_act());
+
+    // The same board with a full budget does have actions, so an empty
+    // enumeration below is the `movesLeft` gate and not a dead position.
+    let fresh = decode(&wire(false, [true, true])).expect("decodes");
+    assert!(
+        !fresh.legal_actions().is_empty(),
+        "the board itself is playable"
+    );
+
+    // Every enumeration entry point: `State`, its scratch-taking sibling, and
+    // both `Position` action sets.
+    assert!(spent.legal_actions().is_empty());
+    let mut scratch = virus_core::Scratch::new();
+    assert!(spent.legal_actions_with(&mut scratch).is_empty());
+
+    let position = Position::new(spent.clone());
+    assert!(position.legal_actions().is_empty());
+    assert!(position.search_actions().is_empty());
+    let mut yielded = 0usize;
+    position.for_each_search_action(|_| {
+        yielded += 1;
+        true
+    });
+    position.for_each_legal_action(|_| {
+        yielded += 1;
+        true
+    });
+    assert_eq!(yielded, 0, "no callback may fire for a spent turn");
+
+    // And the boundary oracle rejects the underflowing action instead of
+    // panicking on it.
+    let action = fresh.legal_actions()[0];
+    assert!(matches!(
+        spent.apply(action),
+        Err(virus_core::RuleError::InvalidAction)
+    ));
+    assert_eq!(spent.moves_left(), 0, "the receiver is unchanged");
 }
 
 // ---------------------------------------------------------------- rejections

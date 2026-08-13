@@ -61,7 +61,7 @@ impl Position {
 
     /// [`Position::new`] using caller-supplied scratch space.
     pub fn new_with(state: State, scratch: &mut Scratch) -> Position {
-        if state.game_over() || !state.active(state.current_player()) {
+        if !state.can_act() {
             return Position {
                 state,
                 moves: Some(Vec::new()),
@@ -134,7 +134,7 @@ impl Position {
     /// Enumerates the authoritative action set. Returning `false` stops
     /// enumeration.
     pub fn for_each_legal_action(&self, mut yield_action: impl FnMut(Action) -> bool) {
-        if self.state.game_over() || !self.state.active(self.state.current_player()) {
+        if !self.state.can_act() {
             return;
         }
         for target in self.move_list() {
@@ -155,7 +155,7 @@ impl Position {
     ///
     /// Returning `false` stops enumeration.
     pub fn for_each_search_action(&self, mut yield_action: impl FnMut(Action) -> bool) {
-        if self.state.game_over() || !self.state.active(self.state.current_player()) {
+        if !self.state.can_act() {
             return;
         }
         let moves = self.move_list();

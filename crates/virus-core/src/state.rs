@@ -192,6 +192,24 @@ impl State {
         self.valid_player(player) && self.active[player as usize - 1]
     }
 
+    /// Whether the side to move may play an action at all: the game is running,
+    /// the mover is active, and the turn still has actions in it.
+    ///
+    /// The `moves_left > 0` clause is load-bearing, not defensive dressing. No
+    /// rules transition can produce a running position with a live mover and
+    /// `moves_left == 0` ([`State::mutate`] rotates the turn the moment the
+    /// budget hits zero), but an *imported* one can: the server publishes that
+    /// exact transient when the `move_made` echo of a turn's last action arrives
+    /// before the `turn_change` that rotates the seat. Enumerating actions there
+    /// hands the caller moves whose `apply` computes `0 - 1`, and the wrapped
+    /// `255` indexes the Zobrist `moves_left` table out of bounds — a panicked
+    /// search worker, observed live. Every enumeration entry point gates on this
+    /// predicate so the bug class is unreachable at the source.
+    #[inline]
+    pub fn can_act(&self) -> bool {
+        !self.over && self.active(self.current) && self.moves_left > 0
+    }
+
     /// Whether a seat has already spent its once-per-game neutral placement.
     pub fn neutral_used(&self, player: Player) -> bool {
         self.valid_player(player) && self.neutral_used[player as usize - 1]
@@ -393,6 +411,10 @@ impl State {
     // `Position::for_each_search_action` keeps step 1 identical and replaces
     // step 2 with a curated subset above the branch threshold; see
     // `position.rs`.
+    //
+    // Every entry point first gates on `State::can_act`, so a position the
+    // mover cannot legally act in — finished, mover eliminated, or the turn
+    // budget already spent — enumerates nothing at all.
 
     /// Every legal action for the side to move, in the canonical enumeration
     /// order documented above.
@@ -402,7 +424,7 @@ impl State {
 
     /// [`State::legal_actions`] using caller-supplied scratch space.
     pub fn legal_actions_with(&self, scratch: &mut Scratch) -> Vec<Action> {
-        if self.over || !self.active(self.current) {
+        if !self.can_act() {
             return Vec::new();
         }
         let mut targets = Vec::new();
@@ -612,7 +634,10 @@ impl State {
     // ---------------------------------------------------------------- legality
 
     fn legal_action_with(&self, action: Action, scratch: &mut Scratch) -> bool {
-        if !self.active(self.current) {
+        // `can_act` rather than `active`: a mover with no actions left has no
+        // legal action, so `apply` rejects it instead of underflowing the turn
+        // budget. See [`State::can_act`].
+        if !self.can_act() {
             return false;
         }
         match action {
