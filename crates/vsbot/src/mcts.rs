@@ -282,6 +282,9 @@ impl SearchEngine for MctsEngine {
 
             let mut interrupt = None;
             let mut drove = None;
+            // What re-rooting kept, read before this step simulates anything.
+            // It is both the tree's size in memory and — for the trace — the
+            // head start this action was handed by the opponent's turn.
             let inherited = tree
                 .as_ref()
                 .map_or(0, |(_, searcher)| searcher.root_visit_total());
@@ -296,10 +299,9 @@ impl SearchEngine for MctsEngine {
                 // subtree, and the root's visit total is exactly the size of
                 // what survived. Subtracting it re-bases the allowance onto the
                 // tree that is actually in memory.
-                let retained = searcher.root_visit_total();
                 let cap = searcher
                     .sims_run()
-                    .saturating_sub(retained)
+                    .saturating_sub(inherited)
                     .saturating_add(PONDER_SIM_CAP);
                 drove = Some(drive(searcher, &budget, started, cap, || {
                     if interrupt.is_none() {
@@ -477,10 +479,10 @@ fn drive(
             }
         }
         // The visit counts are the tree's, cumulative across every re-root; the
-        // simulation count is this call's alone. That pairing is deliberate and
-        // it is what the uncatchability rule needs: the lead to be closed is the
-        // one that is actually on the tree, and the simulations left to close it
-        // with are the ones this action can still afford.
+        // simulation count is this call's alone. `verdict` depends on exactly
+        // that asymmetry — it is how the uncatchability rule tells a lead this
+        // search produced from one a re-root handed it (bd `vsbot-gei`) — so
+        // neither may quietly become the other.
         let progress = RootProgress::from_visits(
             searcher.root_visits(),
             searcher.sims_run() - sims_before,
@@ -531,17 +533,11 @@ fn trace_answer(trace: AnswerTrace<'_>, searcher: Option<&MctsSearcher<'_>>) {
         budget,
         started,
     } = trace;
-    let (leader, runner_up) = searcher.map_or((0, 0), |searcher| {
-        let mut top = (0u32, 0u32);
-        for &n in searcher.root_visits() {
-            if n > top.0 {
-                top = (n, top.0);
-            } else if n > top.1 {
-                top.1 = n;
-            }
-        }
-        top
-    });
+    // Read the top two the same way the stop rules do, so a trace line and the
+    // verdict that produced it can never disagree about which move is leading.
+    let top = searcher.map(|searcher| RootProgress::from_visits(searcher.root_visits(), 0, false));
+    let leader = top.map_or(0, |top| top.leader_visits);
+    let runner_up = top.map_or(0, |top| top.runner_up_visits);
     let target = budget.deadline.saturating_duration_since(started);
     let elapsed = drove.map_or(Duration::ZERO, |report| report.elapsed);
     // "Answered on a hair trigger": the whole action returned inside a fifth of
