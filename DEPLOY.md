@@ -175,6 +175,16 @@ not set up here — no credentials were available — so redeploys are manual.
 
 ## Promote and roll back
 
+> **Canary first — no net, budget or behaviour change becomes the default
+> without an owner canary.** The standing procedure is **[`docs/CANARY.md`](docs/CANARY.md)**:
+> the gate ledger a candidate needs before it may be deployed at all, how to run
+> it under its own lobby name (`BOT_NAME_PREFIX=Canary-<candidate>`) alongside
+> the incumbent, what the owner plays, where the verdict is recorded (the
+> candidate's bead), the `artifacts/champions/gen-N.json` history convention, and
+> the rollback drill. This section is only the tag mechanics that runbook calls
+> into — reaching for it directly means skipping the owner's verdict, which is
+> the one thing that promotes anything (`superiority.md` §4 Gate C).
+
 Every master merge publishes two tags from `.github/workflows/docker.yml`:
 
 - `ghcr.io/korjavin/vsbot:latest` — moves with master.
