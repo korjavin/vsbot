@@ -16,9 +16,10 @@ exist in this document.
 
 The path is **not** a new paradigm. It is: (1) take the proven gen-5 MCTS champion, (2)
 multiply its compute by everything the predecessors left on the table — Rust throughput,
-the 120 s/move server budget both predecessors ignored (they play a flat 1 s:
+the usable turn budget both predecessors ignored (they play a flat 1 s/action:
 `GoBotSearcher.PRODUCTION_BUDGET_MILLIS`, cited at
-`20260807-search-strength.md:26-27`; `MCTS_MOVE_MILLIS=1000` default, server doc:117),
+`20260807-search-strength.md:26-27`; `MCTS_MOVE_MILLIS=1000` default, server doc:117 —
+while the owner tolerates 10–15 s for the full 3-action turn, i.e. ~3–5 s/action),
 pondering, and parallel/batched MCTS — and (3) keep turning the RL crank with bigger,
 better-targeted generations feeding the **existing** python trainer unchanged. The owner
 remains the only promotion judge (canary doc:9-16); every gauntlet gate below is a sanity
@@ -40,9 +41,11 @@ consecutive promoted generations. We reuse both verbatim.
 
 Game/search constants everything below builds on: ~34 legal actions/position, 47.1 % of
 edges flip the mover (feasibility doc:29-37); ~55 recorded actions/game (feasibility
-doc:44-45); server timer = **120 s per move with auto-resign**
-(`~/Project/virusgame/backend/hub.go:2590-2604`, `backend/types.go:206`); illegal move =
-instant forfeit (`ARCHITECTURE.md:35`).
+doc:44-45); server timer = 120 s per move with auto-resign
+(`~/Project/virusgame/backend/hub.go:2590-2604`, `backend/types.go:206`) — but that is a
+**technical failsafe only**: the owner's UX bound is **10–15 s for the full 3-action
+turn (~3–5 s per action)** (owner directive, 2026-08-13) and it, not the timer, is the
+live budget ceiling; illegal move = instant forfeit (`ARCHITECTURE.md:35`).
 
 ## 2. Ranked levers (expected Elo / effort)
 
@@ -65,7 +68,7 @@ Two caveats apply to every compute-shaped lever (a, b, d):
 | rank | lever | expected Elo | effort | evidence anchor |
 |---|---|---|---|---|
 | 1 | (a) Rust throughput at 1 s/move | +75…+250 vs gen-5 Java (1.5–3.3 doublings if Rust lands 3–10×/core; measure in S0) | ~0 marginal (funded by `vsbot-tfa`) | 4.5 M MACs/eval, Java est. 0.5–2 ms/eval → 500–2000 sims/move (feasibility doc:135-139, 149-153) |
-| 2 | (b) 120 s/move + time manager + ponder | +150…+400 vs 1 s self (up to 6.9 doublings; decaying curve, S2-T2 measures) | small | timer: `hub.go:2590-2604`; both predecessors flat 1 s (see §0); ponder feasibility §2b |
+| 2 | (b) 10–15 s turn budget + time manager + ponder | +100…+250 vs 1 s self (~2–2.3 doublings from 3–5 s/action, + ≤1 more from ponder; decaying curve, S2-T2 measures) | small | owner UX bound 10–15 s/turn (directive 2026-08-13); server timer 120 s is failsafe only (`hub.go:2590-2604`); both predecessors flat 1 s (see §0); ponder feasibility §2b |
 | 3 | (c) RL ladder in Rust | +38…+113 per promoted generation, compounding | medium | measured per-gen gains: 65.75 % gen-1 → 55.5 % gen-5 (deep-labels doc:144-146; bd `nnue-trainer-1jh.3`) |
 | 4 | (d) MCTS engineering the Java v1 skipped | 2–4× more sims at equal time (≈ +100…+200 via the same curve) **and** bigger/better generations | medium-high | skipped list: feasibility doc:318-324; lazy-SMP analogue measured 1.6–2.5× (`20260807-search-strength.md:226-227`) |
 | 5 | (f) human-games curriculum, aimed at the owner | unquantifiable by gauntlet **by design** — owner-canary judged | small (exists; extend) | gen-5 = first curriculum-trained gen, promoted (bd `nnue-trainer-1jh.3` notes); server doc:63-84 |
@@ -88,19 +91,24 @@ pin correctness. The first gauntlet that matters (S1) is Rust-gen-5 vs Java-gen-
 1 s/move: same net, more sims — if that isn't ≥ 0.55 pooled over 400, the throughput
 didn't materialize and ranks 2–4 all shrink.
 
-### 2b. The 120 s budget: time management + pondering
+### 2b. The turn budget: time management + pondering
 
 **Clock model.** The server arms a fresh 120 s auto-resign timer per move
-(`hub.go:2590-2604`) — there is **no banked clock**. So "time management" here is not
-chess clock allocation; it is: pick a per-action budget ≤ a safety margin under 120 s,
-spend it where it matters, and never time out or move illegally (both are instant losses:
-`types.go:206`, `ARCHITECTURE.md:35`).
+(`hub.go:2590-2604`) — there is **no banked clock** — but the binding constraint is the
+owner's UX bound: **10–15 s for the whole 3-action turn** (owner directive, 2026-08-13);
+a bot that thinks longer is unacceptable to play against regardless of what the timer
+allows. So "time management" is intra-turn allocation: split ~10–15 s across the turn's
+3 actions (uneven is fine — action 1 sets the turn's direction and deserves more; a
+stable root can release its remainder to the next action), and never time out or move
+illegally (both are instant losses: `types.go:206`, `ARCHITECTURE.md:35`).
 
 Design:
 
-- `VSBOT_MOVE_MILLIS` env (read in the `vsbot` bin per `CLAUDE.md` config convention),
-  default 1000 (parity with predecessors), raised deliberately per opponent profile. Hard
-  ceiling ~100 s: leaves ≥ 20 s for WS RTT, snapshot re-validation, and salvage.
+- `VSBOT_TURN_MILLIS` env (read in the `vsbot` bin per `CLAUDE.md` config convention),
+  default 12000, allocated across the turn's actions; `VSBOT_MOVE_MILLIS` remains as a
+  per-action override (default 1000 = predecessor parity until S2 ships the allocator).
+  Hard per-action ceiling stays well under the 120 s failsafe with margin for WS RTT,
+  snapshot re-validation, and salvage.
 - **Fallback-first discipline**: select a legal fallback (prior argmax over the legal
   mask) before the long search starts; any deadline overrun answers with it. This is the
   MCTS analogue of invariant 3 (`ARCHITECTURE.md:41`).
@@ -109,8 +117,8 @@ Design:
   extend toward the ceiling when the root is unstable (leader changes, top-2 visit gap
   small). Both are standard MCTS time-manager rules; measured, not assumed, in S2.
 - **Budget asymmetry is legitimate.** Gauntlets and the RL gate stay at fixed sims/time
-  (protocol of §4); the *live* bot exploiting 120 s against opponents playing 1 s is the
-  point of the exercise, not an experimental confound.
+  (protocol of §4); the *live* bot exploiting its 10–15 s turn budget against opponents
+  playing 1 s/action is the point of the exercise, not an experimental confound.
 
 **Pondering is protocol-feasible today, no server cooperation needed.** The server
 streams a snapshot on every action, including the opponent's: `move_made` carries a
@@ -169,8 +177,8 @@ only lever in this project's history with five consecutive out-of-noise promotio
 The Java searcher shipped with an explicit deferral list: "Leaf-eval batching, virtual
 loss / tree parallelism, DAG transpositions via `GoState.hash()`, Gumbel/
 sequential-halving root selection, resign thresholds" (feasibility doc:318-324) — each
-"a known upgrade with a trigger". The triggers have now fired (we want 120 s budgets and
-bigger generations). In dependency order:
+"a known upgrade with a trigger". The triggers have now fired (we want the full 10–15 s
+turn budget plus ponder, and bigger generations). In dependency order:
 
 1. **Leaf batching + in-tree parallelism with virtual loss.** Run B simulations'
    selection phases concurrently (virtual loss decorrelates paths), evaluate leaves as
@@ -185,9 +193,9 @@ bigger generations). In dependency order:
    key (`20260807-search-strength.md:110-112`); an MCTS DAG merges them instead of
    duplicating subtrees. Key must include movesLeft/neutralUsed/side (invariant 6,
    `ARCHITECTURE.md:44`; `GoState.hash()` precedent, feasibility doc:41-43). Payoff:
-   sim savings + memory (which binds at 120 s budgets — a 100 k-sim tree with ~34-wide
-   nodes is ~10⁶ edges; at long ponder budgets node pooling + re-rooting + DAG are what
-   keep RSS bounded).
+   sim savings + memory (which binds once ponder runs across the opponent's whole
+   thinking time — a 100 k-sim tree with ~34-wide nodes is ~10⁶ edges; at long ponder
+   budgets node pooling + re-rooting + DAG are what keep RSS bounded).
 3. **Gumbel root selection for self-play.** At 192–256 sims, Gumbel/sequential-halving
    produces better policy targets and stronger move selection than PUCT+Dirichlet at
    equal sims (literature — the exact regime we generate in). Self-play only at first;
@@ -235,12 +243,12 @@ judge.
 
 What throughput actually matters: (i) self-play sims/s → generation size × target
 quality per nightly window; (ii) gauntlet games/h → gate latency (400 games/gate);
-(iii) single-move compute at ≤ 120 s → live strength.
+(iii) single-turn compute at ≤ 10–15 s (+ ponder) → live strength.
 
 | resource | spec | role | source |
 |---|---|---|---|
 | owner's server, nightly trainer window | container `cpus: 4.0`, `mem_limit: 3g`, `nice 10`, window from 03:00; measured ~5–7 h/generation at 1000 games × 192 sims incl. 4×100-game gauntlet + minutes of training | **the sole RL crank** — the laptop is retired from training by owner constraint (bd `nnue-trainer-1jh.3` notes) | server doc:24-33, :129-138 |
-| owner's server, bot process | shares the same host; 120 s/move available live | production play + ponder (capped, see §2b) | server doc; `hub.go:2590` |
+| owner's server, bot process | shares the same host; live budget = 10–15 s/turn (owner UX bound; 120 s timer is failsafe only) | production play + ponder (capped, see §2b) | owner directive 2026-08-13; `hub.go:2590` |
 | this devbox | 4 vCPU AMD EPYC-Genoa, 8 GB (measured 2026-08-13: `nproc`, `/proc/cpuinfo`, `free`) | development, benches, parity, small gauntlets — it is *smaller* than the 8-core reference box that did 1500 games/192 sims in 2.5–3.5 h (server doc:131), so full-size gauntlets belong on the server window too | measured |
 | trainer (python/torch CPU) | minutes per generation at ≤100 k params | not a binding resource | feasibility doc:164-166; server doc:135 |
 
@@ -277,7 +285,8 @@ candidate never auto-ships (server doc:96-100); it deploys under a distinct cana
 identity on `vs.wandergeek.org`, the owner plays it, and the owner's verdict — not any
 number from A/B — promotes it to the default artifact (one candidate per canary, the
 `canary/` branch discipline, canary doc:89-95). New live budgets (§2b) are canaried the
-same way as new nets: a 120 s ponder bot is a behavior change the owner judges.
+same way as new nets: a longer-thinking or pondering bot is a behavior change the owner
+judges — and the 10–15 s turn bound is itself owner-set UX, revisable only by the owner.
 
 **Never gated on:** holdout top-1, value MAE, or any offline metric — logged for
 debugging only (seven documented disconnects, deep-labels doc:40-44; invariant 7,
@@ -308,10 +317,13 @@ re-rank §2 (this outcome means throughput did not materialize and S3 jumps the 
 
 ### S2 — time manager + pondering
 *Depends: S1 (ships in virus-proto/vsbot).*
-T1: `VSBOT_MOVE_MILLIS` + fallback-first deadline discipline + early-stop/extension
-rules (§2b). T2: **sims→Elo curve**: self-gauntlet cells at 1 s vs 4 s, 4 s vs 16 s,
-16 s vs 60 s, 400 games each, fixed-time arena — this is the number every §2 estimate
-re-derives from. T3: ponder (search on opponent-to-move snapshots, tree re-root on
+T1: `VSBOT_TURN_MILLIS` intra-turn allocator (default 12 s/turn; `VSBOT_MOVE_MILLIS`
+per-action override) + fallback-first deadline discipline + early-stop/extension
+rules (§2b). T2: **sims→Elo curve**: self-gauntlet cells at 1 s vs 2 s, 2 s vs 4 s,
+4 s vs 8 s per action, 400 games each, fixed-time arena — this is the number every §2
+estimate re-derives from (8 s/action ≈ the ceiling of the owner's 10–15 s turn bound
+with ponder carry-over; longer cells are pure research, not deployable). T3: ponder
+(search on opponent-to-move snapshots, tree re-root on
 their actions, emit only on authoritative turn-driver, version-gated cancellation).
 **Acceptance:** T2 curve recorded (Elo per doubling at three points); T3 shows no
 regression in a 400-game arena with simulated opponent latency and a ≥20-game live soak
