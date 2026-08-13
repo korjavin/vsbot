@@ -16,6 +16,8 @@
 //! | `VSBOT_CROSSPLAY_GAMES`    | `50`                               |
 //! | `VSBOT_CROSSPLAY_SEARCH`   | `GREEDY`                           |
 //! | `VSBOT_CROSSPLAY_TIMEOUT`  | `1800` (seconds)                   |
+//! | `VSBOT_CROSSPLAY_EXPLORE_EPS`  | `0.15` — opening randomisation |
+//! | `VSBOT_CROSSPLAY_EXPLORE_SEED` | `20260813`                     |
 //! | `VSBOT_ITEST_BACKEND`      | `$HOME/Project/virusgame/backend`  |
 //!
 //! The work is done by `crossplay/crossplay.py`, which boots the three
@@ -37,6 +39,10 @@ use std::process::Command;
 /// how the harness came to report `49-1` over what were five distinct games
 /// (bd `vsbot-t3q.1`). `--self-test` exercises them against a synthetic
 /// database in about a second.
+///
+/// It also covers the exploration seed split added for bd `vsbot-t3q.2` — pure
+/// arithmetic, and the thing that keeps two vsbots in one lobby from replaying
+/// each other's openings and undoing the diversity the run is measuring.
 #[test]
 fn the_crossplay_tally_is_correct() {
     let script = repo_root().join("crates/virus-arena/crossplay/crossplay.py");
@@ -62,6 +68,12 @@ fn vsbot_plays_the_go_bot_through_the_real_server() {
     let games = env_or("VSBOT_CROSSPLAY_GAMES", "50");
     let search = env_or("VSBOT_CROSSPLAY_SEARCH", "GREEDY");
     let timeout = env_or("VSBOT_CROSSPLAY_TIMEOUT", "1800");
+    // The script's own default, restated here so this wrapper cannot quietly
+    // measure a *less* diverse run than a hand-invoked one: the whole reason a
+    // cross-play tally is trustworthy is that its games differ (bd
+    // `vsbot-t3q.2`). Set it to 0 only to reproduce the pre-fix harness.
+    let explore_eps = env_or("VSBOT_CROSSPLAY_EXPLORE_EPS", "0.15");
+    let explore_seed = env_or("VSBOT_CROSSPLAY_EXPLORE_SEED", "20260813");
 
     let root = repo_root();
     let script = root.join("crates/virus-arena/crossplay/crossplay.py");
@@ -86,6 +98,10 @@ fn vsbot_plays_the_go_bot_through_the_real_server() {
         .arg(&search)
         .arg("--timeout")
         .arg(&timeout)
+        .arg("--explore-eps")
+        .arg(&explore_eps)
+        .arg("--explore-seed")
+        .arg(&explore_seed)
         .arg("--vsbot")
         .arg(&vsbot);
     if let Ok(backend) = std::env::var("VSBOT_ITEST_BACKEND") {

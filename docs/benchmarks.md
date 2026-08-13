@@ -11,6 +11,10 @@ independent samples — read its distinct-game count before quoting it. They are
 here because they are the project's first real datapoints and because
 reproducing them is how you check the harness still works.
 
+**Every cross-play number on this page (§3, §3a, §4) predates the opening
+randomisation added in §3b and is superseded.** Their sample size is their
+distinct-game count, not their game count. Re-run, don't quote.
+
 Reproduce any row by pasting its command. Node-budget rows reproduce exactly;
 fixed-time rows do not, by construction (see "Determinism" below).
 
@@ -245,6 +249,95 @@ covers that counting logic in CI.
 The original conclusion stands, narrowed: the harness runs end to end and
 records real, completed games. It was never measuring strength.
 
+### 3b. The diversity fix, and what it supersedes (bd `vsbot-t3q.2`, resolved)
+
+**Every cross-play number recorded above — §3, §3a and §4 — was measured
+without opening randomisation and is superseded.** Their tallies are real
+games honestly counted, but their *sample sizes* are the distinct-game counts,
+not the game counts, so none of them may be quoted as a rate or gate anything:
+§3's `49-1` was 5 distinct games, §4's 400-game S1 was 65. Nothing below
+re-states them; they stay on the page as the record of how the defect was
+found. Re-run anything that needs to be a number.
+
+The lever the earlier sections said did not exist now does, on the one side
+this repository controls. `vsbot` takes `VSBOT_EXPLORE_EPS` /
+`VSBOT_EXPLORE_TURNS` / `VSBOT_EXPLORE_SEED` (`crates/vsbot/src/explore.rs`):
+inside an opening window it plays a uniformly random legal action instead of
+the searched one, drawn from a per-game SplitMix64 stream derived
+`mix64(seed ^ GOLDEN_GAMMA · (game + 1))` — the arena's derivation without its
+colour-pair folding, which cross-play cannot use. `crossplay.py` drives it by
+default (`--explore-eps 0.15 --explore-turns 8`) and hands every phase, every
+vsbot instance and every pooled shard a **disjoint** derived seed, so nothing
+in a run replays anything else in it. The window is counted in vsbot's *own*
+turns because a client never sees the opponent's, and 8 of them is ~24 coin
+flips — the same opening noise per game an `arena` run spends across both of
+its sides.
+
+Only vsbot explores. The Go bot-hoster's `BOT_EXPLORE_EPSILON` fires on every
+turn of every game from an unseeded global RNG, which would weaken the opponent
+throughout and unreproducibly; it stays pinned to `0` (`--opponent-explore-eps`
+exists, and is never right for a gating run). The Java bot's
+`CHALLENGER_EXPLORE` only reaches its `SEARCH=GOBOT` path, so it does nothing in
+the `SEARCH=MCTS` configuration §4 measures. The asymmetry handicaps **vsbot** —
+it plays a few random opening moves its opponent does not — which is the
+conservative direction for a "vsbot is stronger" claim, and is why a re-run
+number is a floor rather than a ceiling.
+
+Verification, 50 games against the Go bot, same command shape as §3:
+
+```bash
+cargo build --release -p vsbot
+python3 crates/virus-arena/crossplay/crossplay.py --games 50 --search GREEDY --json
+```
+
+```json
+{ "vsbot_search": "GREEDY", "explore_eps": 0.15, "explore_turns": 8,
+  "explore_seed": 20260813, "opponent_explore_eps": 0.0,
+  "wins": 11, "losses": 39, "draws": 0, "games": 50,
+  "as_p1": 50, "as_p2": 0, "win_rate": 22.0,
+  "wilson95_low": 12.8, "wilson95_high": 35.2,
+  "distinct_games": 50, "red_flag_terminations": 0 }
+```
+
+| | before (§3) | after |
+|---|---|---|
+| Distinct games | **5 / 50** | **50 / 50** |
+| Low-diversity warning | fired | silent |
+| W-L-D | 49-1-0 (98.0%) | 11-39-0 (22.0%) |
+| Forfeits | 0 | 0 |
+
+**50 of 50 games distinct**, and the harness's low-diversity warning stops
+firing. The two vsbot instances logged 61 and 79 exploration moves over 24 and
+28 games — ~2.7 a game, under the ~3.6 the window's ~24 flips at eps 0.15
+predict, because games that end inside the window and plies whose search was
+superseded do not consume it.
+
+The second row of that table is the real headline. **§3's 98% collapses to 22%
+once the opening is not a single replayed game** — right beside the arena's 25%
+for `greedy` against the byte-exact GoBot oracle, and well below the 40% the
+arena measures for `greedy` seated exclusively at P1, which is roughly what the
+one-sided exploration handicap should cost. Two independent harnesses now agree
+on the greedy floor, which is the strongest evidence yet that §3a's diagnosis
+was right and that this harness measures what it claims to. (Run on a loaded box
+— load average ~8 with a T2 curve run and a ponder gauntlet in flight — which
+affects a `ms:`-budgeted arm's absolute numbers but not the diversity count.)
+
+**What a seed pins, and what it cannot.** Two 10-game runs at the same
+`--explore-seed 424242`, one vsbot and one Go bot each, reproduced **8 of their
+10 games byte-identically and in the same order** (both 10/10 distinct). The two
+that diverged account for the whole difference in tally, 1-9-0 against 0-10-0.
+That is the honest ceiling: the Go bot
+searches on a wall clock, so a cross-play *game* is no more reproducible than
+the arena's `ms:` mode. What the seed does pin is the **exploration schedule** —
+which of our plies are overridden and by which legal action — as a pure function
+of `(seed, game index, position)`, asserted in `crates/vsbot/src/explore.rs`'s
+tests and in `crossplay --self-test`. Deriving the coin from the position rather
+than from a running stream is what makes that true in a client, where a
+superseded search can still be in flight when its replacement starts.
+
+What is still missing is unchanged and structural: colours cannot be balanced
+against the Go bot, because its challenger only targets its own pool.
+
 ## 4. S1 — Rust MCTS vs the Java gen-5 champion, same net, 1 s/move
 
 `superiority.md` S1: dethrone the Java champion at 1 s a move. Both sides run
@@ -326,10 +419,11 @@ of that size producing a pooled 0.5875 is a *negative* result for the "more
 sims wins" thesis, and is the loss analysis S1 asked for.
 
 **What would make this gate-eligible**: an opening-randomisation lever on at
-least one side, so 400 games are 400 samples. Neither engine exposes one in
-play mode today (`vsbot`'s `MCTS_SEED` does not perturb no-dirichlet argmax
-play; the Java live path hard-codes root noise off). Until then the
-distinct-game count is the number to read.
+least one side, so 400 games are 400 samples. **That lever now exists** —
+§3b — and this row predates it, so **the 0.5875 above is superseded and may not
+gate.** Re-running S1 on `--explore-eps 0.15` is bd `vsbot-x70`'s job; the
+number it returns will be a floor, because only vsbot carries the opening noise.
+Until it is re-run, the distinct-game count is the number to read.
 
 ---
 
@@ -375,6 +469,6 @@ different numbers within the interval.
 |---|---|---|
 | Anything at 400 games **in the arena** | Wall clock. Row 2 took 24 min for 100 games on 4 cores, so 400 is ~1.6 h; row 1 is ~33 min. Nothing blocks it but time. (Row 4 is at 400 games, but through cross-play, where the game count is not the sample size.) | A longer run |
 | Cross-play with balanced colours **against the Go bot** | Structural, and now confirmed by reading the code rather than assumed: the bot-hoster's challenger targets `Manager.IsAcceptor(userID)`, which is false for every id outside its own pool, so it cannot challenge `vsbot` and cannot seat it at P2. `--direction theirs` is refused for that opponent rather than quietly returning another one-chair number | a bot-hoster change |
-| A cross-play number that is a strength result | Even colour-balanced, cross-play has no opening randomisation, so its games are largely replays (§3a). The distinct-game count says how many samples a run really had; until a diversity knob exists, treat the count, not the game count, as `n` | an opening-randomisation lever on at least one side |
+| A cross-play number that is a strength result | The diversity half is **done** (§3b): `--explore-eps` makes 50 games 50 distinct games. What is left is the colour half — against the Go bot the chair cannot be alternated at all, and against the Java bot it can, so an `--direction alternate` S1 re-run on the new lever is the next real number. Every cross-play figure recorded before §3b is superseded | re-running §4 with `--explore-eps 0.15`; a bot-hoster change for the Go arm |
 | Two different net artifacts in one gauntlet | The harness shares one loaded net across all games and threads; a net-vs-net run needs a second one threaded through the sides. Refused with an error rather than silently playing one artifact against itself | a follow-up bead |
 | Rust:Java throughput ratio (superiority.md S0) | Needs criterion benches in `virus-mcts`, which are that bead's scope, not this one's | S0 |

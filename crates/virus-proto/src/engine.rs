@@ -148,6 +148,22 @@ pub trait SearchEngine: Send + Sync + 'static {
         false
     }
 
+    /// Called once per accepted `game_start`, before the opening search.
+    ///
+    /// The engine seam is otherwise stateless across games by design, and every
+    /// engine in this repository ignores this hook. It exists for the one thing
+    /// a `choose`-only seam genuinely cannot express: a **per-game** random
+    /// stream. Cross-play measured 400 games that contained 65 distinct ones
+    /// (bd `vsbot-t3q.2`) because two deterministic bots replay one opening
+    /// forever, and the fix — seeded eps-greedy openings, the same discipline
+    /// `virus_arena::gauntlet` applies — needs to know where one game ends and
+    /// the next begins. A decorator cannot infer that from positions alone: a
+    /// rematch can open on a board identical to the last game's.
+    ///
+    /// Implementations must be **fast and non-blocking**; this runs on the
+    /// WebSocket read loop. The default does nothing.
+    fn on_game_start(&self) {}
+
     /// Runs a pondering session until the client tears it down.
     ///
     /// Called once per game on a blocking worker. The implementation loops on
