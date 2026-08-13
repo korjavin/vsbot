@@ -46,7 +46,7 @@ use crate::stats::{Outcome, Record, Summary};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use virus_core::{Action, Player, State, ACTIONS_PER_TURN};
-use virus_mcts::PolicyValueNet;
+use virus_mcts::{PolicyValueNet, BOARD as NET_BOARD};
 
 /// Java's `GauntletMatch.Config.maxTurns`, in whole turns.
 pub const DEFAULT_MAX_TURNS: u32 = 100;
@@ -143,6 +143,19 @@ impl GauntletConfig {
         }
         if self.max_turns == 0 {
             return Err(engine::SpecError("max_turns must be at least 1".to_owned()));
+        }
+        // The net's input encoding has no representation for another board
+        // size, so `MctsSearcher::new` asserts 12x12 when a net is supplied.
+        // Catching it here turns a panic inside a worker — which the harness
+        // can only report as "a worker panicked" — into a message that names
+        // the actual mistake, before any game runs.
+        if (self.side_a.needs_net() || self.side_b.needs_net())
+            && (self.rows != NET_BOARD || self.cols != NET_BOARD)
+        {
+            return Err(engine::SpecError(format!(
+                "an MCTS side needs a {NET_BOARD}x{NET_BOARD} board, got {}x{}",
+                self.rows, self.cols
+            )));
         }
         // Two-player only: MCTS's absolute frame is a one-axis construct and
         // pairing is a two-colour idea. Both would need redesign, not a
@@ -704,6 +717,22 @@ mod tests {
         .validate()
         .is_err());
         assert!(base.validate().is_ok());
+
+        // The 7x7 test board plus an MCTS side is the combination that would
+        // otherwise panic inside a worker thread.
+        let mcts = GauntletConfig {
+            side_a: spec(Engine::Mcts, Budget::Nodes(8)),
+            ..base.clone()
+        };
+        let error = mcts.validate().expect_err("7x7 MCTS must be refused");
+        assert!(error.0.contains("12x12"), "{error}");
+        assert!(GauntletConfig {
+            rows: 12,
+            cols: 12,
+            ..mcts
+        }
+        .validate()
+        .is_ok());
     }
 
     /// Epsilon-zero means the opening RNG never fires, which is the mode a
