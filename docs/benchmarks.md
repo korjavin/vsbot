@@ -157,30 +157,92 @@ The plumbing works. 53 vsbot-vs-GoBot games were recorded, all terminating
 3 were vsbot-vs-vsbot and never matched the name filter. The Go bots really
 searched: 2968 logged searches at depth 4–5, 5k–35k nodes each.
 
-**Do not read 98% as a strength result, and note that it disagrees with the
-arena.** Two independent reasons to distrust the magnitude:
+### 3a. Why that 98% was not a strength result (bd `vsbot-t3q.1`, resolved)
 
-1. **Every game was vsbot-as-P1.** The server seats the challenger at P1 and
-   only vsbot challenges, so the colour bias the `arena` cancels by pairing is
-   fully present here. The script warns about exactly this.
-2. **The arena says the opposite.** Colour-paired on the same 12×12 board,
-   `greedy` vs `ab-plain` (which *is* the byte-exact GoBot oracle) at `depth:4`
-   — the depth the Go bots were reaching under load — went **5-15-0 to the
-   alpha-beta**, a 25% score for greedy. First-mover advantage alone does not
-   turn 25% into 98%.
+**The 98% was a harness artifact. The live Go bot is fine.** It disagreed with
+the arena — which puts `greedy` at 25% against the byte-exact GoBot oracle — by
+far more than a colour bias can explain, so it got its own bead. The answer is
+two compounding defects in the cross-play harness, and neither is an engine
+problem.
 
-   ```bash
-   ./target/release/arena --a greedy --b ab-plain \
-       --a-budget nodes:1 --b-budget depth:4 --games 20 --seed 777 --threads 2
-   ```
+**First, the Go bot was searching properly**, which rules out the candidates the
+bead led with (a diverged binary, a differently-configured search, CPU
+starvation). A 12-game re-run logged 734 searches at **depth 3–7, median 4, mean
+15 317 nodes**. The arena's `ab-plain --b-budget depth:4` spends ~3.3 M nodes
+over ~110 plies — about 30 k nodes a move at the same depth. The deployed bot
+and the offline oracle are the same searcher doing the same work; the hoster
+calls `gamesearch.Choose` under the 1000 ms `ProductionBudget`, and
+`crossplay.py` already pins `BOT_EXPLORE_EPSILON=0` so nothing randomises it
+weaker. Row attribution in `games.db` was verified too, and is correct.
 
-So there is an unexplained gap between the offline oracle and the live Go bot.
-Candidates, none of them investigated here: the bot-hoster configures its search
-differently from `search.Choose` at fixed depth; CPU starvation (3 Go bots plus
-another gauntlet on 4 cores) degraded it further than the depth log suggests; or
-something in the live protocol path costs the Go bot games it should win. **This
-is a finding, not a result — it needs its own bead.** The one thing it does
-establish is that the harness runs end to end and records real, completed games.
+**Defect 1 — every game was played from one chair, and the chair is worth
+something.** The server seats the challenger at P1 (`hub.go`
+`handleAcceptChallenge`: `Player1: challenge.FromUser`) and only vsbot
+challenged. Quantified with a 200-game colour-paired control:
+
+```bash
+./target/release/arena --a greedy --b ab-plain \
+    --a-budget nodes:1 --b-budget depth:4 --games 200 --seed 777 --threads 1 \
+    --per-game
+```
+
+```
+greedy:n1 vs ab-plain:d4
+  W-L-D 65-135-0 over 200 games (indicative)
+  win rate 32.5% (draws not half-wins)  wilson95 [26.4%, 39.3%]
+```
+
+| Split | Result |
+|---|---|
+| greedy seated **P1** | 40 / 100 = **40.0%** |
+| greedy seated **P2** | 25 / 100 = **25.0%** |
+| P1 seat, either engine | 115 / 200 = **57.5%** of all games |
+
+So moving first is worth about **+7.5 points of win rate** (~52 Elo) on this
+board, and seating greedy exclusively at P1 lifts it from 25% to **40%**. Real,
+and worth cancelling — but it does not turn 25% into 98%.
+
+**Defect 2 — the 50 games were not 50 samples.** Nothing randomises a
+cross-play opening and both bots play argmax, so the run *replays the same
+game*. A 12-game re-run reproduced the anomaly exactly (12-0-0, 100%) and
+contained only **5 distinct games**, with the opening identical across all
+twelve. That is the whole gap: at a true one-chair rate of 40%, a genuine 12-0
+has probability 0.4¹² ≈ 1.7 × 10⁻⁵. The games were not independent, so the
+published Wilson interval `[89.5%, 99.6%]` — binomial over 50 assumed-
+independent games — was measuring a sample size that did not exist.
+
+**Why one opening returns ~100%.** Replay the pair with the opening noise off,
+so the identical opening is played from both chairs:
+
+```bash
+./target/release/arena --a greedy --b ab-plain \
+    --a-budget nodes:1 --b-budget depth:4 --games 2 --seed 777 --eps 0 \
+    --threads 1 --per-game
+```
+
+```
+game 0 seat_a=1 winner=1   greedy is P1 -> greedy wins
+game 1 seat_a=2 winner=1   ab-plain is P1 -> ab-plain wins
+```
+
+**P1 won both.** In that position the first move decides the game whichever
+engine holds it: the greedy floor beats the depth-4 oracle from the P1 chair,
+and the oracle beats greedy from it. Cross-play locked onto exactly one opening
+and always played it from the winning chair, so it returned that single game's
+outcome fifty times. The arena's 25% is the same matchup averaged over *diverse*
+openings with the colours paired — which is what makes it the trustworthy
+number.
+
+**What the harness does about it now.** `--direction alternate` splits a run
+into two phases so half the games are played from each chair (needs an opponent
+that can challenge back — see below); every report carries per-seat win rates
+and a **distinct-game count**, fingerprinted over the move sequence with the
+wall-clock `duration_cs` stripped; and a run whose games are mostly replays says
+so loudly instead of quoting a confident interval. `crossplay --self-test`
+covers that counting logic in CI.
+
+The original conclusion stands, narrowed: the harness runs end to end and
+records real, completed games. It was never measuring strength.
 
 ---
 
@@ -225,9 +287,7 @@ different numbers within the interval.
 | Gap | Why | Unblocked by |
 |---|---|---|
 | Anything at 400 games | Wall clock. Row 2 took 24 min for 100 games on 4 cores, so 400 is ~1.6 h; row 1 is ~33 min. Nothing blocks it but time. | A longer run |
-| Cross-play with a real engine | `vsbot`'s `build_engine` rejects `SEARCH=ALPHABETA` and `SEARCH=MCTS` until the engine wiring lands, so the cross-play arm ran `SEARCH=GREEDY` | the vsbot engine-wiring bead |
-| **Why live GoBot loses to greedy 49-1 when the offline oracle beats greedy 15-5** | Found by running row 3 against the arena and noticing they disagree. Filed as bd `vsbot-t3q.1`; it matters because `superiority.md` Gate B anchors the ladder to "never regress against the Go bot" | bd `vsbot-t3q.1` |
-| Cross-play with balanced colours | Structural: the server seats the challenger at P1 and only vsbot challenges | a server change, or a seat-swapping challenge mode |
-| Cross-play vs the Java bot | No JVM on this host; shipping an untested boot sequence would be worse than shipping none | a host with a JDK |
+| Cross-play with balanced colours **against the Go bot** | Structural, and now confirmed by reading the code rather than assumed: the bot-hoster's challenger targets `Manager.IsAcceptor(userID)`, which is false for every id outside its own pool, so it cannot challenge `vsbot` and cannot seat it at P2. `--direction theirs` is refused for that opponent rather than quietly returning another one-chair number | a bot-hoster change |
+| A cross-play number that is a strength result | Even colour-balanced, cross-play has no opening randomisation, so its games are largely replays (§3a). The distinct-game count says how many samples a run really had; until a diversity knob exists, treat the count, not the game count, as `n` | an opening-randomisation lever on at least one side |
 | Two different net artifacts in one gauntlet | The harness shares one loaded net across all games and threads; a net-vs-net run needs a second one threaded through the sides. Refused with an error rather than silently playing one artifact against itself | a follow-up bead |
 | Rust:Java throughput ratio (superiority.md S0) | Needs criterion benches in `virus-mcts`, which are that bead's scope, not this one's | S0 |
