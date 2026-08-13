@@ -74,6 +74,8 @@ pub struct MctsEngine {
     net: PolicyValueNet,
     config: Config,
     artifact: PathBuf,
+    /// Whether to print one [`trace_answer`] line per answered action.
+    trace: bool,
     /// Shape of the most recent position whose domain verdict was logged.
     ///
     /// The bot plays game after game in one process, so the interesting event
@@ -90,12 +92,17 @@ impl MctsEngine {
     /// string, board/plane counts, every tensor shape, every weight finite), so
     /// a wrong or truncated artifact fails **here**, at startup, instead of
     /// producing `NaN` priors on move 40 of a live game.
-    pub fn load(artifact: impl AsRef<Path>, seed: u64) -> Result<MctsEngine, NetError> {
+    pub fn load(
+        artifact: impl AsRef<Path>,
+        seed: u64,
+        trace: bool,
+    ) -> Result<MctsEngine, NetError> {
         let artifact = artifact.as_ref().to_path_buf();
         let net = PolicyValueNet::load(&artifact)?;
         Ok(MctsEngine {
             net,
             artifact,
+            trace,
             config: Config {
                 seed,
                 // The champion ships a value head; `ValueSource::Net` degrades
@@ -189,7 +196,7 @@ impl SearchEngine for MctsEngine {
         let started = Instant::now();
         let mut searcher = MctsSearcher::new(state.clone(), self.config, Some(&self.net));
         let drove = drive(&mut searcher, budget, started, u64::MAX, || false);
-        if trace_enabled() {
+        if self.trace {
             // The control arm of the same trace: a cold search has nothing
             // inherited, so `inherited=0` here is the baseline the pondered
             // lines are read against.
@@ -311,7 +318,7 @@ impl SearchEngine for MctsEngine {
                 let outcome = tree
                     .as_ref()
                     .and_then(|(_, searcher)| self.harvest(&state, searcher, &budget));
-                if trace_enabled() {
+                if self.trace {
                     trace_answer(
                         AnswerTrace {
                             path: "ponder",
@@ -489,16 +496,6 @@ fn drive(
             return report(DriveStop::Rule(ruling), searcher);
         }
     }
-}
-
-/// Whether the per-answer ponder trace is on (`VSBOT_PONDER_TRACE=1`).
-///
-/// Off by default and read once: the trace is a diagnostic for the pondering
-/// investigation (bd `vsbot-gei`), one line per action, and a deployment that
-/// does not want it should not pay an env lookup a turn for the privilege.
-fn trace_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VSBOT_PONDER_TRACE").as_deref() == Ok("1"))
 }
 
 /// Everything one [`trace_answer`] line reports about, before it is formatted.
@@ -739,12 +736,12 @@ mod tests {
     }
 
     fn engine() -> MctsEngine {
-        MctsEngine::load(artifact(), 1).expect("the in-repo champion loads and validates")
+        MctsEngine::load(artifact(), 1, false).expect("the in-repo champion loads and validates")
     }
 
     #[test]
     fn a_missing_or_broken_artifact_is_an_error_not_a_downgrade() {
-        assert!(MctsEngine::load("artifacts/does-not-exist.json", 1).is_err());
+        assert!(MctsEngine::load("artifacts/does-not-exist.json", 1, false).is_err());
     }
 
     #[test]

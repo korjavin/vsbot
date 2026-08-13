@@ -85,6 +85,13 @@ pub struct MctsSettings {
     /// plumbed so that a debugging session which *does* enable exploration is
     /// reproducible rather than mysterious.
     pub seed: u64,
+    /// One diagnostic line per answered action (`VSBOT_PONDER_TRACE`).
+    ///
+    /// Off by default. It is the instrument bd `vsbot-gei` was diagnosed with —
+    /// re-root hit rate, inherited visits, simulations this action added, and
+    /// which stop rule ended it — and it is kept because those are the numbers
+    /// any future ponder regression will be argued about.
+    pub ponder_trace: bool,
 }
 
 impl Default for MctsSettings {
@@ -92,6 +99,7 @@ impl Default for MctsSettings {
         MctsSettings {
             artifact: PathBuf::from(DEFAULT_MCTS_ARTIFACT),
             seed: 1,
+            ponder_trace: false,
         }
     }
 }
@@ -160,6 +168,13 @@ impl Settings {
         })?
         .unwrap_or(mcts_defaults.seed);
 
+        let ponder_trace = parse_field(
+            read("VSBOT_PONDER_TRACE").as_deref(),
+            "VSBOT_PONDER_TRACE",
+            flag,
+        )?
+        .unwrap_or(mcts_defaults.ponder_trace);
+
         let engine = match read("SEARCH") {
             Some(raw) => {
                 EngineKind::parse(&raw).map_err(|error| ConfigError("SEARCH", error.to_string()))?
@@ -190,6 +205,7 @@ impl Settings {
                     .map(PathBuf::from)
                     .unwrap_or(mcts_defaults.artifact),
                 seed,
+                ponder_trace,
             },
         })
     }
@@ -258,14 +274,16 @@ impl fmt::Debug for EngineSetup {
 pub fn build_engine(kind: EngineKind, mcts: &MctsSettings) -> Result<EngineSetup, String> {
     match kind {
         EngineKind::Mcts => {
-            let engine = MctsEngine::load(&mcts.artifact, mcts.seed).map_err(|error| {
-                format!(
-                    "SEARCH=MCTS could not load {}: {error}. Set MCTS_ARTIFACT to a valid \
-                     policy/value export, or run SEARCH=GREEDY deliberately — the bot will \
-                     not quietly downgrade itself.",
-                    mcts.artifact.display()
-                )
-            })?;
+            let engine = MctsEngine::load(&mcts.artifact, mcts.seed, mcts.ponder_trace).map_err(
+                |error| {
+                    format!(
+                        "SEARCH=MCTS could not load {}: {error}. Set MCTS_ARTIFACT to a valid \
+                         policy/value export, or run SEARCH=GREEDY deliberately — the bot will \
+                         not quietly downgrade itself.",
+                        mcts.artifact.display()
+                    )
+                },
+            )?;
             let description = format!("engine=MCTS {}", engine.describe());
             Ok(EngineSetup {
                 engine: Arc::new(engine),
@@ -301,6 +319,7 @@ mod tests {
 
     fn champion() -> MctsSettings {
         MctsSettings {
+            ponder_trace: false,
             artifact: Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../artifacts/mcts_champion.json"),
             seed: 1,
@@ -496,6 +515,7 @@ mod tests {
     #[test]
     fn a_bad_artifact_fails_startup_rather_than_downgrading_to_greedy() {
         let missing = MctsSettings {
+            ponder_trace: false,
             artifact: PathBuf::from("/nonexistent/gen99.json"),
             seed: 1,
         };

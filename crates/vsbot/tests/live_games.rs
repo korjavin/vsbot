@@ -189,6 +189,7 @@ async fn the_mcts_champion_plays_a_full_game_without_a_single_illegal_move() {
             artifact: Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../artifacts/mcts_champion.json"),
             seed: 1,
+            ponder_trace: tracing(),
         },
     )
     .expect("the in-repo champion loads and validates");
@@ -272,6 +273,7 @@ async fn ponder_soak_plays_twenty_games_without_a_forfeit_or_an_out_of_turn_acti
             &MctsSettings {
                 artifact: artifact.clone(),
                 seed,
+                ponder_trace: tracing(),
             },
         )
         .expect("the in-repo champion loads and validates")
@@ -380,6 +382,7 @@ async fn ponder_on_is_not_weaker_than_ponder_off_over_a_local_gauntlet() {
             &MctsSettings {
                 artifact: artifact.clone(),
                 seed,
+                ponder_trace: tracing(),
             },
         )
         .expect("the in-repo champion loads and validates")
@@ -467,6 +470,15 @@ fn wilson95(score: f64, games: u64) -> (f64, f64) {
     let centre = (p + Z * Z / (2.0 * n)) / denominator;
     let spread = Z * ((p * (1.0 - p) / n + Z * Z / (4.0 * n * n)).sqrt()) / denominator;
     ((centre - spread).max(0.0), (centre + spread).min(1.0))
+}
+
+/// Whether these runs should print the per-action ponder trace.
+///
+/// The binary reads `VSBOT_PONDER_TRACE` in `Settings::from`; these tests build
+/// their engines directly, so they read the same variable themselves rather than
+/// inventing a second spelling for it.
+fn tracing() -> bool {
+    std::env::var("VSBOT_PONDER_TRACE").as_deref() == Ok("1")
 }
 
 /// The `VSBOT_ITEST` gate plus the cross-scenario lock, or `None` to skip.
