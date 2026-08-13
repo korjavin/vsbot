@@ -142,6 +142,11 @@ pub struct EvalParams {
     /// Flat bonus per opponent articulation cell we stand beside.
     pub predatory_cut_base: i64,
     /// Divisor applied to the predatory cut-loss ratio.
+    ///
+    /// Must be non-zero; [`evaluate_all`] asserts it. Go divides here without a
+    /// guard and would panic just the same, only from inside the innermost
+    /// loop — a tuner that walks this field to `0` gets a named failure here
+    /// instead.
     pub predatory_cut_loss_div: i64,
 }
 
@@ -211,11 +216,20 @@ pub fn static_eval(state: &State, score_player: Player) -> Score {
 ///
 /// Seats that do not exist on this board (a 2-player game has no seat 3 or 4)
 /// and eliminated seats both count as inactive and score `-MATE_SCORE / 2`.
+///
+/// # Panics
+/// Panics when `params.predatory_cut_loss_div` is zero. One predictable branch
+/// per evaluation is free next to the ~6 us the evaluation itself costs, and it
+/// beats a bare divide-by-zero raised from inside the predatory-cut loop.
 pub fn evaluate_all(
     state: &State,
     params: &EvalParams,
     workspace: &mut EvalWorkspace,
 ) -> [Score; MAX_PLAYERS] {
+    assert!(
+        params.predatory_cut_loss_div != 0,
+        "EvalParams::predatory_cut_loss_div must be non-zero"
+    );
     let mut utility = [0 as Score; MAX_PLAYERS];
     if state.game_over() {
         for (seat, value) in utility.iter_mut().enumerate() {
@@ -367,6 +381,13 @@ pub fn evaluate_all(
 ///
 /// The multiplications happen *before* the division — the whole point of the
 /// helper. Doing it the other way loses the fraction and breaks parity.
+///
+/// The `weight <= 0` guard is deliberate and load-bearing, not a defensive
+/// habit: Go clamps here, so a term whose weight goes non-positive contributes
+/// exactly `0` rather than flipping sign. A tuner that walks a weight below
+/// zero sees a flat zero region, which is precisely the response surface Go's
+/// SPSA tuner was calibrated against. "Fixing" this to honour negative weights
+/// would diverge from the oracle on any perturbed vector.
 #[inline]
 fn normalized(value: i64, denominator: i64, weight: i64) -> i64 {
     if value <= 0 || denominator <= 0 || weight <= 0 {
@@ -398,6 +419,41 @@ mod tests {
         assert_eq!(normalized(-1, 144, 30), 0);
         assert_eq!(normalized(7, 0, 30), 0);
         assert_eq!(normalized(7, 144, 0), 0);
+    }
+
+    /// Go clamps non-positive weights to a zero contribution instead of letting
+    /// the term flip sign. A tuner walking a weight negative must see the same
+    /// flat region the Go SPSA tuner saw, so this is pinned deliberately.
+    #[test]
+    fn negative_weights_clamp_to_zero_like_go() {
+        assert_eq!(normalized(7, 144, -30), 0);
+        assert_eq!(normalized(7, 144, -1), 0);
+
+        let state = State::new(12, 12, 2).expect("12x12 two-player board");
+        let zeroed = EvalParams {
+            normal: 0,
+            ..EvalParams::default()
+        };
+        let negative = EvalParams {
+            normal: -30,
+            ..EvalParams::default()
+        };
+        let mut workspace = EvalWorkspace::new();
+        assert_eq!(
+            evaluate_all(&state, &zeroed, &mut workspace),
+            evaluate_all(&state, &negative, &mut workspace)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "predatory_cut_loss_div must be non-zero")]
+    fn zero_cut_loss_divisor_is_rejected_up_front() {
+        let state = State::new(12, 12, 2).expect("12x12 two-player board");
+        let params = EvalParams {
+            predatory_cut_loss_div: 0,
+            ..EvalParams::default()
+        };
+        evaluate_all(&state, &params, &mut EvalWorkspace::new());
     }
 
     #[test]
