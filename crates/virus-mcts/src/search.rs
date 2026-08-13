@@ -51,6 +51,83 @@
 //! `batch_size == 1` is bit-for-bit the serial searcher: nothing is ever in
 //! flight when the only descent of a round selects.
 //!
+//! # DAG transpositions (superiority.md §2d item 2)
+//!
+//! A turn is three actions and the actions of a turn largely commute: playing
+//! `A` then `B` reaches exactly the same position as `B` then `A`. A tree keeps
+//! those as two separate subtrees and expands both, paying a net forward per
+//! duplicate; a **DAG** keeps one node and lets both parents point at it. The
+//! Java transposition-table audit already proved these collisions are real and
+//! that the full state key catches them
+//! (`20260807-search-strength.md:110-112`).
+//!
+//! [`Config::dag`] turns it on. The key is [`State::hash`] — the incremental
+//! Zobrist key, which by ARCHITECTURE.md invariant 6 already covers the grid,
+//! the side to move, `moves_left`, `neutral_used` **and** `active`. Nothing is
+//! added to it here; a merge is additionally confirmed by a full `State`
+//! equality check, so a 64-bit key collision costs a duplicated node and never
+//! a wrong merge.
+//!
+//! Four things make this safe, in the order they would otherwise bite:
+//!
+//! * **Value merging is frame-safe.** Backup is absolute-frame (invariant 1),
+//!   so a node's `W` means the same thing no matter which parent a visit
+//!   arrived through. In a negamax tree, whose sign depends on ply parity,
+//!   merging two parents of *different* movers would silently invert half the
+//!   statistics. Here it is a commutative add, exactly as it is for
+//!   [`crate::parallel::ParallelMcts`].
+//! * **The DAG is acyclic by the rules, not by luck.** Every action strictly
+//!   decreases the lexicographic tuple `(empty cells, -fortified cells,
+//!   -neutral cells)`: a move onto an empty cell spends an empty cell, a
+//!   capture turns an enemy `Normal` into a `Fortified`, and `PlaceNeutrals`
+//!   turns two `Normal`s into `Neutral`s. No action ever reverses any of the
+//!   three, so no position can reach itself and a descent cannot loop. The same
+//!   argument says two paths of *different* lengths cannot meet: the tuple is
+//!   strictly monotone along a path, so a shared position is always at a shared
+//!   depth. Transpositions are within-turn permutations, which is precisely the
+//!   case this is for.
+//! * **The root is never a merge target.** Only nodes created as *children* are
+//!   entered in the index, so nothing can ever be redirected onto node 0 — and
+//!   therefore Dirichlet root noise, which lives in the root's `prior` and
+//!   nowhere else, can never leak into an interior node. (It could not happen
+//!   anyway, by the acyclicity argument, but the index makes it structural
+//!   rather than a proof someone has to re-derive.) A [`MctsSearcher::rebase`]
+//!   re-establishes the same property for the new root.
+//! * **Virtual loss is per *edge*, so merging nodes does not disturb it.** A
+//!   descent increments `vl` on the `(parent, edge)` pairs it walks and backup
+//!   decrements exactly those; two descents reaching one merged node through
+//!   different parents perturb different counters. What *does* change is that
+//!   the merged node is far more often already `pending` in the same batch,
+//!   which the existing leaf-reuse path handles and which is where the sim
+//!   savings show up.
+//!
+//! ## What it saves, and what it does not
+//!
+//! Be precise here, because the plan (superiority.md §2d.2) says "sim savings +
+//! memory" and only one of those is a node-count reduction.
+//!
+//! A simulation expands exactly one leaf, so at `batch_size == 1` **both arms
+//! hold `sims + 1` nodes**. The DAG does not make the arena smaller at equal
+//! simulations. What it changes is what those expansions were spent on: a plain
+//! tree re-expands positions it has already evaluated — a second net forward, a
+//! second subtree, a second set of statistics that never learns from the
+//! first — while the DAG's arena is duplicate-free by construction, so every
+//! forward buys a position it has never seen and every visit lands on
+//! statistics the other order can read. That is the sim saving, and it is
+//! measured as the plain tree's duplicate count.
+//!
+//! Batching adds a second, smaller saving that *is* a node-count reduction: a
+//! merged node reached twice inside one batch is already `pending` the second
+//! time, so the round runs fewer forwards than it had descents.
+//!
+//! The memory claim is therefore about the ponder regime rather than about any
+//! one search: at a fixed simulation budget the arena is the same size, but a
+//! long ponder is bounded by *distinct reachable positions*, and the DAG is
+//! what stops a tree from spending that bound on copies. Reclamation itself is
+//! unchanged and lives in [`MctsSearcher::rebase`] — the index is rebuilt from
+//! the survivors on every re-root, so neither an unreachable node nor a stale
+//! key outlives it.
+//!
 //! # Randomness
 //!
 //! Play mode draws nothing: `run_sims` and `run_until_deadline` are pure
@@ -61,6 +138,8 @@
 //! Thread parallelism lives in [`crate::parallel::ParallelMcts`], a separate
 //! opt-in type: this searcher is single-threaded and deterministic, full stop.
 
+use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 use std::time::{Duration, Instant};
 
 use virus_core::{Action, Player, Scratch, State};
@@ -115,6 +194,62 @@ pub const DEFAULT_BATCH_SIZE: u16 = 8;
 /// branch, and transient, because it is removed the moment the batch backs up.
 pub const DEFAULT_VIRTUAL_LOSS: f64 = 1.0;
 
+/// Whether [`Config::dag`] merges transpositions by default.
+///
+/// Set from the S3-T2 acceptance gauntlet; see the PR body and the module's
+/// "DAG transpositions" section.
+pub const DEFAULT_DAG: bool = true;
+
+/// A `HashMap` hasher for keys that are *already* hashes.
+///
+/// The transposition index is keyed by [`State::hash`], an incremental Zobrist
+/// key that is uniformly distributed by construction, so running it through
+/// SipHash buys nothing. Two reasons this is more than a micro-optimisation:
+///
+/// * `std`'s `RandomState` is seeded per process, so iteration order differs
+///   run to run. Nothing here iterates the index — it is only ever `get` and
+///   `insert`, both order-independent — but "this searcher is deterministic" is
+///   a contract the crate keeps *by construction*, and a fixed hasher keeps it
+///   that way even if someone later adds an iteration.
+/// * It is one multiply instead of a SipHash round on the child-creation path.
+#[derive(Clone, Copy, Debug, Default)]
+struct ZobristHasher(u64);
+
+impl Hasher for ZobristHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    /// Never called for a `u64` key, and a footgun if it silently were, so it
+    /// is a real (FNV-1a) hash rather than a `unimplemented!` or a no-op.
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        // Fibonacci mixing. A Zobrist key is already uniform in every bit, so
+        // this is belt and braces against a future key that is not.
+        self.0 = value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+/// [`ZobristHasher`]'s `BuildHasher`; stateless, hence seedless, hence stable.
+#[derive(Clone, Copy, Debug, Default)]
+struct BuildZobristHasher;
+
+impl BuildHasher for BuildZobristHasher {
+    type Hasher = ZobristHasher;
+
+    fn build_hasher(&self) -> ZobristHasher {
+        ZobristHasher(0)
+    }
+}
+
+/// Position key -> node index, for the nodes eligible to be merged into.
+type Transpositions = HashMap<u64, u32, BuildZobristHasher>;
+
 /// Where a leaf's value comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ValueSource {
@@ -158,6 +293,16 @@ pub struct Config {
     /// [`MctsSearcher`]**, which is single-threaded by construction; it lives
     /// here so a caller can carry one configuration through both.
     pub threads: usize,
+    /// Merge transpositions: two action orders reaching the same position share
+    /// one node, and the tree becomes a DAG. See the module's "DAG
+    /// transpositions" section for the safety argument and
+    /// [`MctsSearcher::rebase`] for the memory story.
+    ///
+    /// **Ignored by [`crate::parallel::ParallelMcts`]**, the mirror of
+    /// [`Config::threads`] being ignored here: the shared-tree engine indexes
+    /// its nodes by `Arc` identity and merging them needs a concurrent index,
+    /// which is its own piece of work.
+    pub dag: bool,
 }
 
 impl Default for Config {
@@ -174,6 +319,7 @@ impl Default for Config {
             batch_size: DEFAULT_BATCH_SIZE,
             virtual_loss: DEFAULT_VIRTUAL_LOSS,
             threads: 1,
+            dag: DEFAULT_DAG,
         }
     }
 }
@@ -317,6 +463,19 @@ pub struct MctsSearcher<'net> {
     config: Config,
     net: Option<&'net PolicyValueNet>,
     nodes: Vec<Node>,
+    /// [`State::hash`] -> node index, for [`Config::dag`]. Empty and untouched
+    /// when the flag is off. **Node 0 is never in it**, so the root — the only
+    /// node that can carry Dirichlet noise — is never a merge target.
+    transpositions: Transpositions,
+    /// Child links resolved to an existing node instead of allocating one: the
+    /// duplicate expansions, and the net forwards they would have cost, that
+    /// the DAG saved.
+    merges: u64,
+    /// Zobrist keys that matched but whose positions did not. Expected to stay
+    /// at zero over any realistic search; a non-zero count is not a correctness
+    /// problem (the position check catches it and the node is duplicated) but
+    /// it is the number to look at if the merge rate ever looks wrong.
+    key_collisions: u64,
     rng: Rng,
     sims: u64,
     /// Reusable batch buffers, so a round of simulations allocates nothing
@@ -371,6 +530,9 @@ impl<'net> MctsSearcher<'net> {
             config,
             net,
             nodes: vec![Node::new(state)],
+            transpositions: Transpositions::default(),
+            merges: 0,
+            key_collisions: 0,
             rng: Rng::new(config.seed),
             sims: 0,
             path: Vec::with_capacity(1024),
@@ -446,6 +608,52 @@ impl<'net> MctsSearcher<'net> {
     /// The configuration this searcher was built with.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Nodes currently in the arena, root included.
+    ///
+    /// A simulation expands exactly one leaf, so at `batch_size == 1` this is
+    /// `sims + 1` whether or not [`Config::dag`] is on — the DAG's saving is
+    /// that none of those nodes is a duplicate position, not that there are
+    /// fewer of them. Under a batch it *is* also smaller, because a merged node
+    /// reached twice in one round is evaluated once. See the module's "What it
+    /// saves, and what it does not".
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Distinct positions in the arena.
+    ///
+    /// **The sim-savings measurement.** Equal to [`MctsSearcher::node_count`]
+    /// exactly when the arena holds no duplicate, which is what
+    /// [`Config::dag`] guarantees; the shortfall in a plain tree is the number
+    /// of expansions — and net forwards — it spent on a position it had already
+    /// evaluated somewhere else. Comparing the two arms at equal simulations is
+    /// what the S3-T2 numbers are.
+    ///
+    /// `O(nodes)` and allocating, so it is a diagnostic for benches and tests,
+    /// not something to call inside a search.
+    pub fn distinct_positions(&self) -> usize {
+        self.nodes
+            .iter()
+            .map(|node| node.state.hash())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
+    /// Child links that resolved to an existing node instead of allocating a
+    /// new one. Always `0` when [`Config::dag`] is off.
+    pub fn merges(&self) -> u64 {
+        self.merges
+    }
+
+    /// Zobrist keys that matched a node holding a *different* position.
+    ///
+    /// Such a match is rejected — the merge is confirmed by full `State`
+    /// equality, so a collision costs a duplicated node and never a wrong
+    /// merge — and counted here so the rate is observable rather than assumed.
+    pub fn key_collisions(&self) -> u64 {
+        self.key_collisions
     }
 
     /// The root's legal actions, in `virus-core` enumeration order. Empty at a
@@ -556,6 +764,34 @@ impl<'net> MctsSearcher<'net> {
     /// Returns `false` and leaves the tree untouched when `action` is not a root
     /// action or has never been expanded into a node; the caller then builds a
     /// fresh searcher. Never partially applies.
+    ///
+    /// # Memory, and why a DAG does not leak here
+    ///
+    /// This is the arena's only reclamation point, and it is a *tracing* one:
+    /// it walks what is reachable from the new root and moves those nodes into
+    /// a fresh `Vec`, so everything else — the discarded siblings and their
+    /// whole subtrees — is dropped, not merely orphaned. That is unchanged by
+    /// [`Config::dag`]; the breadth-first walk already guards on `mapping`, so
+    /// a node reachable through several parents is discovered once, renumbered
+    /// once and moved once, and a diamond is not a double free or a double
+    /// count.
+    ///
+    /// What the DAG adds is the **index**, which is the part that would leak if
+    /// it were left alone — and would be worse than a leak: a key still
+    /// pointing at a discarded node's old slot would merge a future child onto
+    /// whatever now occupies that index. So the index is rebuilt from the
+    /// survivors, in their new numbering, every time. It is rebuilt rather than
+    /// patched because a re-root is already `O(nodes)`, so a second linear pass
+    /// costs nothing measurable and cannot go stale the way a patch can. The
+    /// rebuild skips node 0, which re-establishes for the new root the property
+    /// [`MctsSearcher::new`] gives the original one: the root is never a merge
+    /// target, so noised priors are never shared.
+    ///
+    /// The overall story is therefore: **nodes are bounded by what a ponder
+    /// budget can reach from the current root, and every opponent action
+    /// collapses that bound.** The DAG lowers the constant — measurably, since
+    /// within-turn permutations are the common case — and changes nothing about
+    /// the shape of the reclamation.
     pub fn rebase(&mut self, action: Action) -> bool {
         if self.nodes[0].terminal {
             return false;
@@ -609,7 +845,28 @@ impl<'net> MctsSearcher<'net> {
             kept.push(node);
         }
         self.nodes = kept;
+        self.rebuild_transpositions();
         true
+    }
+
+    /// Re-derives the transposition index from the surviving arena.
+    ///
+    /// See [`MctsSearcher::rebase`] for why this is a rebuild and not a patch.
+    /// Node 0 is skipped so the new root cannot be merged onto.
+    fn rebuild_transpositions(&mut self) {
+        self.transpositions.clear();
+        if !self.config.dag {
+            return;
+        }
+        self.transpositions.reserve(self.nodes.len());
+        for id in 1..self.nodes.len() {
+            // First writer wins, matching `link_child`: with the survivors in
+            // breadth-first order this is the shallowest node holding the key,
+            // and it is a deterministic choice either way.
+            self.transpositions
+                .entry(self.nodes[id].state.hash())
+                .or_insert(id as u32);
+        }
     }
 
     // ---------------------------------------------------------------- core
@@ -673,9 +930,7 @@ impl<'net> MctsSearcher<'net> {
                     node.state
                         .apply_generated_with(node.actions[a], &mut self.scratch)
                 };
-                child = self.nodes.len() as u32;
-                self.nodes.push(Node::new(next));
-                self.nodes[id as usize].children[a] = child;
+                child = self.link_child(id as usize, a, next);
             }
             self.path.push((id, a as u32));
             let node = &mut self.nodes[id as usize];
@@ -688,6 +943,44 @@ impl<'net> MctsSearcher<'net> {
             end: self.path.len(),
             leaf,
         });
+    }
+
+    /// Points `parent`'s `edge` at the node for `next`, creating that node only
+    /// if the DAG has no node for the position already.
+    ///
+    /// With [`Config::dag`] off this is exactly the old "push a node, store its
+    /// index" — the tree the searcher has always built, allocation for
+    /// allocation.
+    ///
+    /// With it on, a hit in the index is confirmed against the full `State`
+    /// before it is used: [`State::hash`] is 64 bits, and a birthday collision
+    /// inside a big tree is unlikely but not impossible. A collision loses the
+    /// merge (a duplicate node is created, and the incumbent keeps the key)
+    /// rather than silently welding two different positions together — the one
+    /// failure mode a transposition table must not have.
+    fn link_child(&mut self, parent: usize, edge: usize, next: State) -> u32 {
+        if self.config.dag {
+            if let Some(&existing) = self.transpositions.get(&next.hash()) {
+                if self.nodes[existing as usize].state == next {
+                    self.merges += 1;
+                    self.nodes[parent].children[edge] = existing;
+                    return existing;
+                }
+                self.key_collisions += 1;
+            }
+        }
+        let key = next.hash();
+        let child = self.nodes.len() as u32;
+        self.nodes.push(Node::new(next));
+        self.nodes[parent].children[edge] = child;
+        if self.config.dag {
+            // Only ever a fresh key: a hit that was confirmed returned above,
+            // and a hit that collided leaves the incumbent in place, so the
+            // index stays a function of node *creation* order and therefore
+            // deterministic.
+            self.transpositions.entry(key).or_insert(child);
+        }
+        child
     }
 
     fn record_leaf(&mut self, node: u32, value: Option<f64>) -> usize {
@@ -1379,6 +1672,390 @@ mod tests {
             "the cumulative simulation count must survive the re-root that the visit \
              total does not"
         );
+    }
+
+    // ------------------------------------------------------ DAG transpositions
+
+    /// Every `(parent, edge)` pointing at each node, i.e. the DAG read upwards.
+    fn parents_of(searcher: &MctsSearcher<'_>) -> Vec<Vec<(u32, usize)>> {
+        let mut parents = vec![Vec::new(); searcher.nodes.len()];
+        for (id, node) in searcher.nodes.iter().enumerate() {
+            for (edge, child) in node.children.iter().enumerate() {
+                if *child != NO_NODE {
+                    parents[*child as usize].push((id as u32, edge));
+                }
+            }
+        }
+        parents
+    }
+
+    /// A position whose turn has all three actions left, searched hard enough
+    /// that the top of the tree is fully built out.
+    fn searched(dag: bool, batch_size: u16, sims: u32) -> MctsSearcher<'static> {
+        let config = Config {
+            dag,
+            batch_size,
+            ..Config::play()
+        };
+        let mut searcher = MctsSearcher::new(state_with(1, 3), config, None);
+        searcher.run_sims(sims);
+        searcher
+    }
+
+    /// The acceptance case, stated directly: two orders of the same two actions
+    /// reach one node.
+    ///
+    /// The pairs are taken from the tree the search actually built rather than
+    /// hand-picked, and then *re-derived independently* through
+    /// `State::apply` — so the assertion is not "the searcher agrees with
+    /// itself" but "the node both orders share really is the position the rules
+    /// say both orders reach".
+    #[test]
+    fn a_within_turn_permutation_reaches_exactly_one_node() {
+        let searcher = searched(true, 1, 4_000);
+        let root = &searcher.nodes[0];
+        let mut diamonds = 0;
+
+        for (ea, ca) in root.children.iter().enumerate() {
+            for (eb, cb) in root.children.iter().enumerate() {
+                if ea >= eb || *ca == NO_NODE || *cb == NO_NODE {
+                    continue;
+                }
+                let (a, b) = (root.actions[ea], root.actions[eb]);
+                let (ca, cb) = (*ca as usize, *cb as usize);
+                // The grandchild reached as a-then-b, and as b-then-a.
+                let ab = searcher.nodes[ca]
+                    .actions
+                    .iter()
+                    .position(|x| *x == b)
+                    .map(|e| searcher.nodes[ca].children[e]);
+                let ba = searcher.nodes[cb]
+                    .actions
+                    .iter()
+                    .position(|x| *x == a)
+                    .map(|e| searcher.nodes[cb].children[e]);
+                let (Some(ab), Some(ba)) = (ab, ba) else {
+                    continue;
+                };
+                if ab == NO_NODE || ba == NO_NODE {
+                    continue;
+                }
+
+                // Independent derivation, straight from the rules.
+                let root_state = &searcher.nodes[0].state;
+                let via_ab = root_state.apply(a).and_then(|s| s.apply(b));
+                let via_ba = root_state.apply(b).and_then(|s| s.apply(a));
+                let (Ok(via_ab), Ok(via_ba)) = (via_ab, via_ba) else {
+                    continue;
+                };
+                assert_eq!(
+                    via_ab, via_ba,
+                    "the two orders of {a:?} and {b:?} do not commute after all"
+                );
+
+                assert_eq!(
+                    ab, ba,
+                    "{a:?} then {b:?} and {b:?} then {a:?} reach the same position but \
+                     landed on nodes {ab} and {ba}"
+                );
+                assert_eq!(
+                    searcher.nodes[ab as usize].state, via_ab,
+                    "the merged node holds a different position than the rules reach"
+                );
+                assert_eq!(
+                    searcher.nodes[ab as usize].state.hash(),
+                    via_ab.hash(),
+                    "invariant 6: the key must agree with the position"
+                );
+                diamonds += 1;
+            }
+        }
+        assert!(
+            diamonds > 0,
+            "no permutation pair was explored — the test proved nothing"
+        );
+    }
+
+    /// The same tree built without [`Config::dag`] keeps those permutations
+    /// apart, which is what makes the test above about the DAG and not about
+    /// the position.
+    #[test]
+    fn without_the_dag_the_same_permutation_is_two_nodes() {
+        let searcher = searched(false, 1, 4_000);
+        let root = &searcher.nodes[0];
+        let mut split = 0;
+        for (ea, ca) in root.children.iter().enumerate() {
+            for (eb, cb) in root.children.iter().enumerate() {
+                if ea >= eb || *ca == NO_NODE || *cb == NO_NODE {
+                    continue;
+                }
+                let (a, b) = (root.actions[ea], root.actions[eb]);
+                let (ca, cb) = (*ca as usize, *cb as usize);
+                let child_of = |node: usize, action: Action| {
+                    searcher.nodes[node]
+                        .actions
+                        .iter()
+                        .position(|x| *x == action)
+                        .map(|e| searcher.nodes[node].children[e])
+                        .filter(|c| *c != NO_NODE)
+                };
+                let (Some(ab), Some(ba)) = (child_of(ca, b), child_of(cb, a)) else {
+                    continue;
+                };
+                if searcher.nodes[ab as usize].state == searcher.nodes[ba as usize].state {
+                    assert_ne!(ab, ba, "a plain tree must not share nodes");
+                    split += 1;
+                }
+            }
+        }
+        assert!(split > 0, "the comparison arm explored no permutation pair");
+        assert_eq!(searcher.merges(), 0, "the flag is off");
+        assert!(searcher.transpositions.is_empty(), "the index is not built");
+    }
+
+    /// Merged statistics, as an exact identity rather than an inequality.
+    ///
+    /// At `batch_size == 1` nothing is ever in flight, so a descent that
+    /// reaches a node either **stops** there — which happens exactly once per
+    /// node, on the visit that expands it — or **passes through**, crediting
+    /// one edge and one `visits`. So for every non-root, non-terminal node the
+    /// visits arriving from *all* its parents must equal its own visit total
+    /// plus that single expansion stop. With the DAG on, "all its parents" is
+    /// genuinely plural, and this identity is what says the node pools their
+    /// work instead of double-counting or losing it.
+    #[test]
+    fn a_merged_node_pools_the_visits_of_every_parent() {
+        let searcher = searched(true, 1, 4_000);
+        let parents = parents_of(&searcher);
+        let mut shared = 0;
+
+        for (id, node) in searcher.nodes.iter().enumerate().skip(1) {
+            let arrivals: u32 = parents[id]
+                .iter()
+                .map(|(parent, edge)| searcher.nodes[*parent as usize].n[*edge])
+                .sum();
+            if node.terminal {
+                assert_eq!(node.visits, 0, "node {id} is terminal but was walked past");
+                continue;
+            }
+            if !node.expanded {
+                assert_eq!(arrivals, 0, "node {id} was visited without being expanded");
+                continue;
+            }
+            assert_eq!(
+                arrivals,
+                node.visits + 1,
+                "node {id}: {} parents delivered {arrivals} visits but the node counts {}",
+                parents[id].len(),
+                node.visits
+            );
+            if parents[id].len() > 1 {
+                shared += 1;
+                assert!(
+                    parents[id]
+                        .iter()
+                        .all(|(p, e)| searcher.nodes[*p as usize].n[*e] > 0),
+                    "node {id} has a parent edge that never carried a visit"
+                );
+            }
+        }
+        assert!(
+            shared > 0,
+            "nothing was merged — the identity proved nothing"
+        );
+    }
+
+    /// **What the DAG actually saves, stated exactly.**
+    ///
+    /// Not nodes per simulation: a simulation expands exactly one leaf either
+    /// way, so both arms hold `sims + 1` nodes at `batch_size == 1`. What
+    /// changes is *what those expansions were spent on*. A plain tree re-expands
+    /// positions it has already evaluated — a second net forward, a second
+    /// subtree, a second set of statistics that never learns from the first. The
+    /// DAG's arena is duplicate-free by construction, so every forward it pays
+    /// for buys a position it has never seen.
+    ///
+    /// The saving is therefore the plain tree's duplicate count, and that is
+    /// what this measures. (Batching adds a second, smaller saving on top: a
+    /// merged node reached twice inside one batch is `pending` the second time,
+    /// so the round runs fewer forwards than it had descents. That one *does*
+    /// show up as nodes, and is asserted below.)
+    #[test]
+    fn the_dag_spends_every_expansion_on_a_position_it_has_not_seen() {
+        let distinct = |searcher: &MctsSearcher<'_>| {
+            searcher
+                .nodes
+                .iter()
+                .map(|node| node.state.hash())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        };
+
+        let with = searched(true, 1, 4_000);
+        let without = searched(false, 1, 4_000);
+        assert_eq!(with.sims_run(), without.sims_run());
+
+        assert_eq!(
+            distinct(&with),
+            with.node_count(),
+            "the DAG's arena must hold no duplicate position at all"
+        );
+        let duplicates = without.node_count() - distinct(&without);
+        assert!(
+            duplicates > 0,
+            "the plain tree expanded no duplicate — nothing to save"
+        );
+        assert!(with.merges() > 0);
+        assert_eq!(
+            with.key_collisions(),
+            0,
+            "a 64-bit key should not collide in a {}-node arena",
+            with.node_count()
+        );
+
+        // With a batch, leaf reuse turns some of those merges into forwards the
+        // round never runs, which is visible as a smaller arena.
+        let with = searched(true, 8, 4_000);
+        let without = searched(false, 8, 4_000);
+        assert!(
+            with.node_count() < without.node_count(),
+            "batched DAG expanded {} nodes, batched tree {}",
+            with.node_count(),
+            without.node_count()
+        );
+    }
+
+    /// Dirichlet root noise lives in node 0's `prior` and nowhere else, so the
+    /// one thing that would leak it is an interior edge pointing back at the
+    /// root. The index makes that structurally impossible; this checks it.
+    #[test]
+    fn the_root_is_never_a_merge_target_so_its_noised_prior_cannot_leak() {
+        let config = Config {
+            dag: true,
+            root_noise: true,
+            seed: 0xD1CE,
+            ..Config::play()
+        };
+        let mut searcher = MctsSearcher::new(state_with(1, 3), config, None);
+        let noised = searcher.nodes[0].prior.clone();
+        searcher.run_sims(2_000);
+
+        assert!(
+            !searcher.transpositions.values().any(|id| *id == 0),
+            "the root is in the transposition index"
+        );
+        for (id, node) in searcher.nodes.iter().enumerate() {
+            assert!(
+                node.children.iter().all(|c| *c != 0),
+                "node {id} points back at the root"
+            );
+        }
+        assert_eq!(
+            searcher.nodes[0].prior, noised,
+            "the search overwrote the noised root prior"
+        );
+        // And the noise really was there to leak.
+        let plain = MctsSearcher::new(
+            state_with(1, 3),
+            Config {
+                dag: true,
+                ..Config::play()
+            },
+            None,
+        );
+        assert_ne!(
+            plain.nodes[0].prior, noised,
+            "the root prior was not actually noised"
+        );
+    }
+
+    /// A re-root must leave the index describing the arena it now has: every
+    /// key resolving to a live node that really holds that position, nothing
+    /// pointing at the new root, and nothing left over from the discarded
+    /// subtrees.
+    #[test]
+    fn re_rooting_rebuilds_the_index_and_reclaims_the_unreachable_nodes() {
+        for batch_size in [1u16, 8] {
+            let mut searcher = searched(true, batch_size, 3_000);
+            let before_nodes = searcher.node_count();
+            let before_keys = searcher.transpositions.len();
+            assert!(before_keys > 0);
+
+            let action = searcher.best_action().expect("a best action");
+            assert!(searcher.rebase(action));
+
+            assert!(
+                searcher.node_count() < before_nodes,
+                "batch {batch_size}: nothing was reclaimed"
+            );
+            assert!(
+                searcher.transpositions.len() < before_keys,
+                "batch {batch_size}: the index still holds discarded keys"
+            );
+            assert_index_sound(&searcher, batch_size, "after re-rooting");
+
+            // Reachability: the arena must be exactly what the new root reaches.
+            let mut seen = vec![false; searcher.node_count()];
+            let mut queue = vec![0u32];
+            seen[0] = true;
+            while let Some(id) = queue.pop() {
+                for child in &searcher.nodes[id as usize].children {
+                    if *child != NO_NODE && !seen[*child as usize] {
+                        seen[*child as usize] = true;
+                        queue.push(*child);
+                    }
+                }
+            }
+            assert!(
+                seen.iter().all(|s| *s),
+                "batch {batch_size}: the arena kept a node the root cannot reach"
+            );
+
+            searcher.run_sims(1_000);
+            assert_clean(&searcher, batch_size, "after searching a re-rooted DAG");
+            assert_index_sound(&searcher, batch_size, "after searching a re-rooted DAG");
+            assert!(searcher.best_action().is_some());
+        }
+    }
+
+    /// Every index entry names a live node that holds exactly that key, and the
+    /// root is not among them.
+    fn assert_index_sound(searcher: &MctsSearcher<'_>, batch_size: u16, when: &str) {
+        for (key, id) in &searcher.transpositions {
+            assert!(
+                (*id as usize) < searcher.nodes.len(),
+                "batch {batch_size}: key {key:#018x} points outside the arena {when}"
+            );
+            assert_ne!(
+                *id, 0,
+                "batch {batch_size}: key {key:#018x} points at the root {when}"
+            );
+            assert_eq!(
+                searcher.nodes[*id as usize].state.hash(),
+                *key,
+                "batch {batch_size}: node {id} does not hold key {key:#018x} {when}"
+            );
+        }
+        assert!(
+            searcher.transpositions.len() < searcher.nodes.len().max(1),
+            "batch {batch_size}: the index cannot have an entry per node plus the root {when}"
+        );
+    }
+
+    /// Batching's leaf reuse and the DAG compound: a merged node reached twice
+    /// in one batch is `pending` the second time. The arena must still come out
+    /// of every round clean.
+    #[test]
+    fn a_batched_dag_search_leaves_nothing_in_flight() {
+        for batch_size in [1u16, 2, 8, 16] {
+            let mut searcher = searched(true, batch_size, 1_453);
+            assert_clean(&searcher, batch_size, "after simulating a DAG");
+            assert_index_sound(&searcher, batch_size, "after simulating a DAG");
+            assert!(searcher.merges() > 0, "batch {batch_size}: nothing merged");
+            let action = searcher.best_action().expect("a best action");
+            assert!(searcher.rebase(action));
+            assert_clean(&searcher, batch_size, "after re-rooting a DAG");
+        }
     }
 
     #[test]

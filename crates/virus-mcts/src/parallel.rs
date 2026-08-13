@@ -48,6 +48,19 @@
 //! [`ParallelMcts::collisions`], because a collision rate that is not small is
 //! the first thing to look at when threads fail to scale.
 //!
+//! # No DAG here
+//!
+//! [`Config::dag`] is **ignored** by this engine, the mirror of
+//! [`Config::threads`] being ignored by [`crate::MctsSearcher`]. The serial
+//! searcher merges transpositions through an index keyed by [`State::hash`]
+//! (see [`crate::search`]); this one addresses its nodes by `Arc` identity
+//! behind per-edge `OnceLock`s, so merging needs a *concurrent* index and a
+//! creation path that is atomic across two different parents. That is a
+//! separate piece of work with its own risks, and threads measured worthless on
+//! this box (PR #8 and the S3-T1 numbers), so the DAG went where the throughput
+//! is. `parallel_with_one_thread_matches_the_serial_searcher` pins the pairing
+//! by asking the serial side for `dag: false`.
+//!
 //! # Determinism
 //!
 //! With `threads == 1` this engine is deterministic and identical to
