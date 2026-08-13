@@ -485,6 +485,13 @@ async fn play(port: u16, scenario: Scenario) -> (Side, Side) {
 
     let url = format!("ws://127.0.0.1:{port}/ws");
 
+    // These runs are scaled down to hundreds of milliseconds a turn and the
+    // developer box is shared, so a scheduler hiccup can be a large fraction of
+    // an action's ceiling. A generous grace keeps that from reading as an engine
+    // overrun; the fallback's *timing* is pinned precisely by
+    // `virus-proto/tests/time_manager.rs`, where nothing else is competing.
+    const ITEST_FALLBACK_GRACE: Duration = Duration::from_secs(2);
+
     // The challenger's timer is the sole send driver; a short interval only
     // makes the run quick, it does not change the mechanism.
     let mut challenger_config = BotConfig {
@@ -497,6 +504,7 @@ async fn play(port: u16, scenario: Scenario) -> (Side, Side) {
         // behaviour and its control.
         ponder: scenario.ponder,
         ponder_budget: Duration::from_secs(5),
+        fallback_grace: ITEST_FALLBACK_GRACE,
         ..BotConfig::default()
     };
     scenario.budget.apply(&mut challenger_config);
@@ -506,6 +514,7 @@ async fn play(port: u16, scenario: Scenario) -> (Side, Side) {
     let mut acceptor_config = BotConfig {
         backend_url: url,
         name_prefix: "ITestAcceptor".to_owned(),
+        fallback_grace: ITEST_FALLBACK_GRACE,
         ..BotConfig::default()
     };
     scenario.budget.apply(&mut acceptor_config);
