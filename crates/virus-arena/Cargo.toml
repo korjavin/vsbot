@@ -12,3 +12,11 @@ virus-core = { workspace = true }
 virus-eval = { workspace = true }
 virus-search = { workspace = true }
 virus-mcts = { workspace = true }
+
+# `arena` is the CLI a human runs a gauntlet with. It is a `[[bin]]` in this
+# crate rather than a subcommand of `vsbot`: `vsbot` is the deployed container's
+# entrypoint and must not grow a code path that loads gauntlet machinery into
+# the production image.
+[[bin]]
+name = "arena"
+path = "src/bin/arena.rs"
