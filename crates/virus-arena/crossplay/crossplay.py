@@ -266,6 +266,15 @@ def max_rowid(db: Path) -> int:
         return 0
 
 
+# A game the harness itself ended by killing a process is not a result. Every
+# other termination is: `illegal_move` and `timeout` are instant forfeits in
+# production (ARCHITECTURE.md), so they are real losses and are counted — but
+# also reported separately, because a run full of them means something is wrong
+# with the bot, not with the opponent.
+ARTIFACT_TERMINATIONS = {"disconnect"}
+RED_FLAG_TERMINATIONS = {"illegal_move", "timeout"}
+
+
 def tally(db: Path, baseline: int, ours: str, theirs: str) -> dict:
     """W-L-D from vsbot's perspective, counting both seat orders.
 
@@ -274,13 +283,22 @@ def tally(db: Path, baseline: int, ours: str, theirs: str) -> dict:
     in either order — which is the fix for the seat-ordered filter the Python
     original used.
     """
-    empty = {"wins": 0, "losses": 0, "draws": 0, "as_p1": 0, "as_p2": 0, "total": 0}
+    empty = {
+        "wins": 0,
+        "losses": 0,
+        "draws": 0,
+        "as_p1": 0,
+        "as_p2": 0,
+        "total": 0,
+        "discarded": 0,
+        "red_flags": 0,
+    }
     if not db.exists():
         return empty
     try:
         with read_only(db) as connection:
             rows = connection.execute(
-                "SELECT player1_name, player2_name, result FROM games "
+                "SELECT player1_name, player2_name, result, termination FROM games "
                 "WHERE rowid > ? "
                 "AND ((player1_name LIKE ?  AND player2_name LIKE ?) "
                 "  OR (player1_name LIKE ?  AND player2_name LIKE ?))",
@@ -290,13 +308,22 @@ def tally(db: Path, baseline: int, ours: str, theirs: str) -> dict:
         return empty
 
     out = dict(empty)
-    for player1, player2, result in rows:
+    for player1, player2, result, termination in rows:
         our_seat = 1 if (player1 or "").startswith(ours) else 2
         # A bot named with both prefixes would be ambiguous; the prefixes are
         # chosen not to overlap, and this guard keeps a mistake from silently
         # scoring the wrong side.
         if (player2 or "").startswith(ours) and our_seat == 1:
             continue
+        # Shutdown races: the poll that ends the run and the SIGTERM that
+        # follows it are not atomic, so an in-flight game can land in the table
+        # as a `disconnect` loss for whoever was killed first. Counting those
+        # would put a harness artifact in the headline.
+        if (termination or "") in ARTIFACT_TERMINATIONS:
+            out["discarded"] += 1
+            continue
+        if (termination or "") in RED_FLAG_TERMINATIONS:
+            out["red_flags"] += 1
         out["as_p1" if our_seat == 1 else "as_p2"] += 1
         out["total"] += 1
         if result == 0:
@@ -319,6 +346,35 @@ def wilson95(wins: int, games: int) -> tuple[float, float]:
     center = (p + z * z / (2 * n)) / denominator
     margin = z * ((p * (1 - p) + z * z / (4 * n)) / n) ** 0.5 / denominator
     return (100 * (center - margin), 100 * (center + margin))
+
+
+def warn_about_seat_imbalance(report: dict) -> None:
+    """Says out loud that a lopsided cross-play run carries a colour bias.
+
+    The `arena` gauntlet cancels first-mover advantage by pairing colours. This
+    harness *cannot*: the server seats the challenger at P1, only vsbot
+    challenges (the Go pool is accept-only so it does not spar with itself), and
+    a Go challenger would only ever target one of its own acceptors. So every
+    game here is vsbot-as-P1 against GoBot-as-P2, and P1 moves first on an empty
+    board.
+
+    The counting code handles both seat orders — free, and correct the day the
+    server can alternate — but until then the honest output is a warning, not a
+    silent number. The Python original had the same bias and never mentioned it.
+    """
+    total = report["games"]
+    if total == 0:
+        return
+    minority = min(report["as_p1"], report["as_p2"])
+    if minority * 4 >= total:  # each colour has at least a quarter of the games
+        return
+    print(
+        f"crossplay: WARNING — colours are not balanced "
+        f"({report['as_p1']} P1 / {report['as_p2']} P2). This number includes "
+        "first-mover advantage and is NOT comparable to an `arena` gauntlet, "
+        "which cancels it by pairing. Treat it as a plumbing check.",
+        file=sys.stderr,
+    )
 
 
 # ----------------------------------------------------------------------- main
@@ -463,6 +519,8 @@ def main(argv: list[str]) -> int:
         "games": result["total"],
         "as_p1": result["as_p1"],
         "as_p2": result["as_p2"],
+        "discarded_disconnects": result["discarded"],
+        "red_flag_terminations": result["red_flags"],
         "win_rate": (100.0 * result["wins"] / result["total"]) if result["total"] else 0.0,
         "wilson95_low": low,
         "wilson95_high": high,
@@ -488,7 +546,17 @@ def main(argv: list[str]) -> int:
             f"wilson95 [{low:.1f}%, {high:.1f}%]"
         )
         print(f"    seats: {report['as_p1']} as P1, {report['as_p2']} as P2")
-        print(f"    logs: {workdir}")
+        if report["discarded_disconnects"]:
+            print(
+                f"    discarded {report['discarded_disconnects']} disconnect(s) "
+                "(harness shutdown artifacts, not results)"
+            )
+        if report["red_flag_terminations"]:
+            print(
+                f"    !! {report['red_flag_terminations']} game(s) ended in a forfeit "
+                "(illegal move or timeout) — investigate before reading the tally"
+            )
+    warn_about_seat_imbalance(report)
     if temporary is not None and args.workdir == "":
         # Keep the logs when the run did not reach its target; they are the
         # only evidence of why.

@@ -145,11 +145,15 @@ Four things it fixes relative to `nnue-trainer/eval_java_vs_go.py`, which it is
 ported from:
 
 * **The name filter is not seat-ordered.** The original counted only rows where
-  its bot sat in seat 1 and silently discarded every game from the other chair —
-  a colour bias baked into the measurement. Both orders are counted here and the
-  per-seat split is printed.
+  its bot sat in seat 1 and silently discarded every game from the other chair.
+  Both orders are counted here and the per-seat split is printed.
 * **Draws are counted.** The original dropped `result = 0` from both numerator
   and denominator, so a drawish opponent looked like an even one.
+* **Disconnects are discarded.** The poll that ends a run and the SIGTERM that
+  follows it are not atomic, so an in-flight game lands in the table as a
+  `disconnect` loss for whoever was killed first. `illegal_move` and `timeout`
+  *are* counted — they are instant forfeits in production — but reported
+  separately, because a run full of them is a bot problem, not an opponent.
 * **The port is allocated, not assumed.** The Go server hard-codes `:8080`; the
   script builds it through `go build -overlay` with a patched `main.go` (the
   checkout on disk is never written to) so a run cannot fight whatever the
@@ -158,7 +162,17 @@ ported from:
 * **Shutdown escalates.** The original sent `SIGTERM` to the process groups and
   never checked; a server holding a WebSocket read would survive it.
 
-### Known limitation
+### Known limitations
+
+**Colours cannot be balanced, so this number is not an `arena` number.** The
+server seats the challenger at P1; only `vsbot` challenges (the Go pool is
+accept-only so it does not spar with itself, and a Go challenger only ever
+targets one of its own acceptors). Every cross-play game is therefore
+vsbot-as-P1 against GoBot-as-P2, and P1 moves first on an empty board. The
+`arena` gauntlet cancels that by pairing; this harness structurally cannot.
+The counting handles both seat orders — free, and correct the day the server can
+alternate — and until then the script prints a loud warning whenever the split
+is lopsided. **Read a cross-play result as a plumbing check, not as strength.**
 
 `SEARCH=ALPHABETA` and `SEARCH=MCTS` are rejected by the `vsbot` binary until
 the engine wiring lands (`build_engine` in `crates/vsbot/src/main.rs`), so the
