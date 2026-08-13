@@ -4,11 +4,12 @@ Every number here came from `virus-arena`. Read the caveat column before quoting
 any of them.
 
 The house rule (CLAUDE.md, ARCHITECTURE.md invariant 7) is that only gauntlets
-count, and only at ≥400 games. **Nothing on this page is at 400 games yet.**
-Everything below is labelled `INFORMATIONAL ONLY` or `indicative` by the harness
-itself, and none of it may gate a promotion. They are here because they are the
-project's first real Rust-vs-Rust datapoints and because reproducing them is how
-you check the harness still works.
+count, and only at ≥400 games. Rows 1–3 are below that bar and are labelled
+`INFORMATIONAL ONLY` or `indicative` by the harness itself; none of them may
+gate a promotion. Row 4 (S1) *is* at 400 games, but its games are not 400
+independent samples — read its distinct-game count before quoting it. They are
+here because they are the project's first real datapoints and because
+reproducing them is how you check the harness still works.
 
 Reproduce any row by pasting its command. Node-budget rows reproduce exactly;
 fixed-time rows do not, by construction (see "Determinism" below).
@@ -157,30 +158,178 @@ The plumbing works. 53 vsbot-vs-GoBot games were recorded, all terminating
 3 were vsbot-vs-vsbot and never matched the name filter. The Go bots really
 searched: 2968 logged searches at depth 4–5, 5k–35k nodes each.
 
-**Do not read 98% as a strength result, and note that it disagrees with the
-arena.** Two independent reasons to distrust the magnitude:
+### 3a. Why that 98% was not a strength result (bd `vsbot-t3q.1`, resolved)
 
-1. **Every game was vsbot-as-P1.** The server seats the challenger at P1 and
-   only vsbot challenges, so the colour bias the `arena` cancels by pairing is
-   fully present here. The script warns about exactly this.
-2. **The arena says the opposite.** Colour-paired on the same 12×12 board,
-   `greedy` vs `ab-plain` (which *is* the byte-exact GoBot oracle) at `depth:4`
-   — the depth the Go bots were reaching under load — went **5-15-0 to the
-   alpha-beta**, a 25% score for greedy. First-mover advantage alone does not
-   turn 25% into 98%.
+**The 98% was a harness artifact. The live Go bot is fine.** It disagreed with
+the arena — which puts `greedy` at 25% against the byte-exact GoBot oracle — by
+far more than a colour bias can explain, so it got its own bead. The answer is
+two compounding defects in the cross-play harness, and neither is an engine
+problem.
 
-   ```bash
-   ./target/release/arena --a greedy --b ab-plain \
-       --a-budget nodes:1 --b-budget depth:4 --games 20 --seed 777 --threads 2
-   ```
+**First, the Go bot was searching properly**, which rules out the candidates the
+bead led with (a diverged binary, a differently-configured search, CPU
+starvation). A 12-game re-run logged 734 searches at **depth 3–7, median 4, mean
+15 317 nodes**. The arena's `ab-plain --b-budget depth:4` spends ~3.3 M nodes
+over ~110 plies — about 30 k nodes a move at the same depth. The deployed bot
+and the offline oracle are the same searcher doing the same work; the hoster
+calls `gamesearch.Choose` under the 1000 ms `ProductionBudget`, and
+`crossplay.py` already pins `BOT_EXPLORE_EPSILON=0` so nothing randomises it
+weaker. Row attribution in `games.db` was verified too, and is correct.
 
-So there is an unexplained gap between the offline oracle and the live Go bot.
-Candidates, none of them investigated here: the bot-hoster configures its search
-differently from `search.Choose` at fixed depth; CPU starvation (3 Go bots plus
-another gauntlet on 4 cores) degraded it further than the depth log suggests; or
-something in the live protocol path costs the Go bot games it should win. **This
-is a finding, not a result — it needs its own bead.** The one thing it does
-establish is that the harness runs end to end and records real, completed games.
+**Defect 1 — every game was played from one chair, and the chair is worth
+something.** The server seats the challenger at P1 (`hub.go`
+`handleAcceptChallenge`: `Player1: challenge.FromUser`) and only vsbot
+challenged. Quantified with a 200-game colour-paired control:
+
+```bash
+./target/release/arena --a greedy --b ab-plain \
+    --a-budget nodes:1 --b-budget depth:4 --games 200 --seed 777 --threads 1 \
+    --per-game
+```
+
+```
+greedy:n1 vs ab-plain:d4
+  W-L-D 65-135-0 over 200 games (indicative)
+  win rate 32.5% (draws not half-wins)  wilson95 [26.4%, 39.3%]
+```
+
+| Split | Result |
+|---|---|
+| greedy seated **P1** | 40 / 100 = **40.0%** |
+| greedy seated **P2** | 25 / 100 = **25.0%** |
+| P1 seat, either engine | 115 / 200 = **57.5%** of all games |
+
+So moving first is worth about **+7.5 points of win rate** (~52 Elo) on this
+board, and seating greedy exclusively at P1 lifts it from 25% to **40%**. Real,
+and worth cancelling — but it does not turn 25% into 98%.
+
+**Defect 2 — the 50 games were not 50 samples.** Nothing randomises a
+cross-play opening and both bots play argmax, so the run *replays the same
+game*. A 12-game re-run reproduced the anomaly exactly (12-0-0, 100%) and
+contained only **5 distinct games**, with the opening identical across all
+twelve. That is the whole gap: at a true one-chair rate of 40%, a genuine 12-0
+has probability 0.4¹² ≈ 1.7 × 10⁻⁵. The games were not independent, so the
+published Wilson interval `[89.5%, 99.6%]` — binomial over 50 assumed-
+independent games — was measuring a sample size that did not exist.
+
+**Why one opening returns ~100%.** Replay the pair with the opening noise off,
+so the identical opening is played from both chairs:
+
+```bash
+./target/release/arena --a greedy --b ab-plain \
+    --a-budget nodes:1 --b-budget depth:4 --games 2 --seed 777 --eps 0 \
+    --threads 1 --per-game
+```
+
+```
+game 0 seat_a=1 winner=1   greedy is P1 -> greedy wins
+game 1 seat_a=2 winner=1   ab-plain is P1 -> ab-plain wins
+```
+
+**P1 won both.** In that position the first move decides the game whichever
+engine holds it: the greedy floor beats the depth-4 oracle from the P1 chair,
+and the oracle beats greedy from it. Cross-play locked onto exactly one opening
+and always played it from the winning chair, so it returned that single game's
+outcome fifty times. The arena's 25% is the same matchup averaged over *diverse*
+openings with the colours paired — which is what makes it the trustworthy
+number.
+
+**What the harness does about it now.** `--direction alternate` splits a run
+into two phases so half the games are played from each chair (needs an opponent
+that can challenge back — see below); every report carries per-seat win rates
+and a **distinct-game count**, fingerprinted over the move sequence with the
+wall-clock `duration_cs` stripped; and a run whose games are mostly replays says
+so loudly instead of quoting a confident interval. `crossplay --self-test`
+covers that counting logic in CI.
+
+The original conclusion stands, narrowed: the harness runs end to end and
+records real, completed games. It was never measuring strength.
+
+## 4. S1 — Rust MCTS vs the Java gen-5 champion, same net, 1 s/move
+
+`superiority.md` S1: dethrone the Java champion at 1 s a move. Both sides run
+**the same artifact** — `mcts_champion.json`, md5 `748c9289…`, verified
+byte-identical in `artifacts/`, in the `nnue-trainer` checkout and baked into
+the image — so this isolates *implementation throughput*, not net quality. The
+Java bot has no JVM on this host and runs from
+`ghcr.io/korjavin/nnue-trainer:latest` with `SEARCH=MCTS MCTS_VALUE=net
+MCTS_MOVE_MILLIS=1000`; it logged `prior=mcts_champion.json+value cpuct=1.5`,
+confirming it played the champion's value head and not a fallback.
+
+Both bots connect to a **local** Go server booted by the harness — never
+production. Colour-balanced by `--direction alternate`: half the games with
+`vsbot` challenging (P1), half with the Java bot challenging (P2). Four
+independent shards, pooled.
+
+```bash
+docker pull ghcr.io/korjavin/nnue-trainer:latest
+cargo build --release -p vsbot
+python3 crates/virus-arena/crossplay/crossplay_pool.py \
+    --shards 4 --games 400 --opponent java --direction alternate \
+    --search MCTS --move-millis 1000 --vsbot-instances 1 \
+    --workdir /tmp/s1run
+```
+
+```json
+{ "wins": 235, "losses": 165, "draws": 0, "games": 400,
+  "as_p1": 200, "as_p2": 200,
+  "win_rate_as_p1": 100.0, "win_rate_as_p2": 17.5,
+  "pooled_score": 0.5875, "win_rate": 58.75,
+  "wilson95_low": 53.86, "wilson95_high": 63.47,
+  "distinct_games": 65, "red_flag_terminations": 0 }
+```
+
+| | |
+|---|---|
+| W-L-D | **235-165-0** over 400 games |
+| Pooled `(W+0.5D)/N` | **0.5875** |
+| Seats | 200 as P1, 200 as P2 — balanced |
+| vsbot as P1 | **200 / 200 = 100.0%** |
+| vsbot as P2 | 35 / 200 = 17.5% |
+| Wilson 95% over 400 | [53.9%, 63.5%] |
+| **Distinct games** | **65 of 400** |
+| Wilson 95% over the *effective* 65 | **[46.3%, 69.6%]** |
+| Forfeits (illegal move / timeout) | 0 |
+| Median game length | 23 turns |
+
+**Measured throughput: Rust runs ~23× the simulations of Java at the same
+budget on the same net.** Java logged a median **163 sims** per 1 s move
+(p10 149, p90 171, over 13 953 searches); `virus-mcts`'s microbench puts Rust
+at **3797 net-value sims/s**. The comparison is generous to Rust — its figure
+is a single-core microbench on a quiet box, Java's is in-game and carries JVM
+and protocol overhead — but the order of magnitude is not in doubt. (Both
+sides' raw sim counters spike into the millions in decided endgames, where a
+simulation reaching a known-terminal node returns a cached value; that is why
+the **median** is quoted, not the mean.)
+
+**Verdict: S1's stated bar is met on the letter and not on the substance, so
+this page does not crown a champion.**
+
+* The pooled score **0.5875 clears the ≥ 0.55 acceptance over ≥ 400 games**,
+  the run is seat-balanced, and there were zero forfeits.
+* But only **65 of the 400 games were distinct.** Cross-play has no opening
+  randomisation and both engines play argmax with no root noise, so the run
+  replays a small set of games — the same defect that produced the 49-1 in §3a,
+  caught this time by the harness's own diagnostic. Over the effective sample
+  the interval is **[46.3%, 69.6%]**, which straddles both 0.55 *and* 0.50.
+  Per CLAUDE.md (gauntlets only, ≥400 games) the game count is not the sample
+  size, so **this may not gate a promotion.**
+
+**What the seat split actually shows.** The P1 seat won **365 of 400 games
+(91.3%)**. With the same net on both sides the engines are close enough that
+moving first almost decides the game, and the entire margin is conversion of
+the first move: **Rust converted 200/200 (100%) of its P1 games, Java converted
+165/200 (82.5%)** of its. So the honest reading of the 23× sims advantage is
+that it buys Rust near-perfect conversion of a won seat, and very little else —
+it recovered only 17.5% of games from the losing seat. A throughput advantage
+of that size producing a pooled 0.5875 is a *negative* result for the "more
+sims wins" thesis, and is the loss analysis S1 asked for.
+
+**What would make this gate-eligible**: an opening-randomisation lever on at
+least one side, so 400 games are 400 samples. Neither engine exposes one in
+play mode today (`vsbot`'s `MCTS_SEED` does not perturb no-dirichlet argmax
+play; the Java live path hard-codes root noise off). Until then the
+distinct-game count is the number to read.
 
 ---
 
@@ -224,10 +373,8 @@ different numbers within the interval.
 
 | Gap | Why | Unblocked by |
 |---|---|---|
-| Anything at 400 games | Wall clock. Row 2 took 24 min for 100 games on 4 cores, so 400 is ~1.6 h; row 1 is ~33 min. Nothing blocks it but time. | A longer run |
-| Cross-play with a real engine | `vsbot`'s `build_engine` rejects `SEARCH=ALPHABETA` and `SEARCH=MCTS` until the engine wiring lands, so the cross-play arm ran `SEARCH=GREEDY` | the vsbot engine-wiring bead |
-| **Why live GoBot loses to greedy 49-1 when the offline oracle beats greedy 15-5** | Found by running row 3 against the arena and noticing they disagree. Filed as bd `vsbot-t3q.1`; it matters because `superiority.md` Gate B anchors the ladder to "never regress against the Go bot" | bd `vsbot-t3q.1` |
-| Cross-play with balanced colours | Structural: the server seats the challenger at P1 and only vsbot challenges | a server change, or a seat-swapping challenge mode |
-| Cross-play vs the Java bot | No JVM on this host; shipping an untested boot sequence would be worse than shipping none | a host with a JDK |
+| Anything at 400 games **in the arena** | Wall clock. Row 2 took 24 min for 100 games on 4 cores, so 400 is ~1.6 h; row 1 is ~33 min. Nothing blocks it but time. (Row 4 is at 400 games, but through cross-play, where the game count is not the sample size.) | A longer run |
+| Cross-play with balanced colours **against the Go bot** | Structural, and now confirmed by reading the code rather than assumed: the bot-hoster's challenger targets `Manager.IsAcceptor(userID)`, which is false for every id outside its own pool, so it cannot challenge `vsbot` and cannot seat it at P2. `--direction theirs` is refused for that opponent rather than quietly returning another one-chair number | a bot-hoster change |
+| A cross-play number that is a strength result | Even colour-balanced, cross-play has no opening randomisation, so its games are largely replays (§3a). The distinct-game count says how many samples a run really had; until a diversity knob exists, treat the count, not the game count, as `n` | an opening-randomisation lever on at least one side |
 | Two different net artifacts in one gauntlet | The harness shares one loaded net across all games and threads; a net-vs-net run needs a second one threaded through the sides. Refused with an error rather than silently playing one artifact against itself | a follow-up bead |
 | Rust:Java throughput ratio (superiority.md S0) | Needs criterion benches in `virus-mcts`, which are that bead's scope, not this one's | S0 |

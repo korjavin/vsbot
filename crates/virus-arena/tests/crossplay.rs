@@ -26,6 +26,33 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The counting logic, checked in CI.
+///
+/// The harness itself cannot run on a GitHub runner — it needs a Go toolchain,
+/// a checkout of the server and, for the Java arm, docker — so the test below
+/// is opt-in and never runs there. But what a cross-play run *means* is decided
+/// by pure functions over `games.db` rows: which seat we held, whether a
+/// `disconnect` is a result, and how many of the games were actually different
+/// games. Those need none of that infrastructure, and leaving them uncovered is
+/// how the harness came to report `49-1` over what were five distinct games
+/// (bd `vsbot-t3q.1`). `--self-test` exercises them against a synthetic
+/// database in about a second.
+#[test]
+fn the_crossplay_tally_is_correct() {
+    let script = repo_root().join("crates/virus-arena/crossplay/crossplay.py");
+    assert!(script.exists(), "missing {}", script.display());
+    let output = Command::new("python3")
+        .arg(&script)
+        .arg("--self-test")
+        .output()
+        .expect("python3 — is it on PATH? the harness needs it for sqlite3");
+    assert!(
+        output.status.success(),
+        "crossplay --self-test failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn vsbot_plays_the_go_bot_through_the_real_server() {
     if std::env::var("VSBOT_CROSSPLAY").as_deref() != Ok("1") {
