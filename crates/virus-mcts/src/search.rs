@@ -223,16 +223,24 @@ impl<'net> MctsSearcher<'net> {
     /// Builds a searcher and expands the root (plus root noise, if configured).
     ///
     /// # Panics
-    /// Panics when a net is supplied for a board that is not 12x12. The net's
-    /// input shape is fixed; catching the mismatch here rather than at the
-    /// first expansion keeps the "wrong shape fails before the search, never
-    /// during it" rule that [`PolicyValueNet::load`] starts.
+    /// Panics when a net is supplied for a position it cannot encode: the
+    /// artifacts are 12x12 two-player nets, and [`Encoded::from_state`] has no
+    /// representation for a wider board or a third seat. Checking here rather
+    /// than at the first expansion keeps the "a shape mismatch fails before the
+    /// search, never during it" rule that [`PolicyValueNet::load`] starts —
+    /// otherwise a four-player game would search happily on priors derived from
+    /// an encoding that silently collapsed three opponents into one.
+    ///
+    /// The hand-tuned value source has no such limit: with `net` set to `None`
+    /// the searcher runs on any board `virus-core` accepts.
     pub fn new(state: State, config: Config, net: Option<&'net PolicyValueNet>) -> Self {
         assert!(
-            net.is_none() || (state.rows() == BOARD && state.cols() == BOARD),
-            "policy net is {BOARD}x{BOARD} only, got {}x{}",
+            net.is_none()
+                || (state.rows() == BOARD && state.cols() == BOARD && state.players() == 2),
+            "policy net is {BOARD}x{BOARD} two-player only, got {}x{} with {} players",
             state.rows(),
-            state.cols()
+            state.cols(),
+            state.players()
         );
         let net_scratch = net.map(|net| net.scratch());
         let mut searcher = MctsSearcher {

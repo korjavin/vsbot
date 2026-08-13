@@ -338,6 +338,24 @@ fn a_mis_sized_head_is_rejected_at_load() {
     assert!(load(&json).is_err(), "1 head channel for a 2-channel trunk");
 }
 
+/// A head kernel wider than 1x1 is a different architecture. Reading only its
+/// top-left weight would run a model this crate does not implement, so the
+/// loader must reject it rather than quietly truncate.
+#[test]
+fn a_head_kernel_wider_than_1x1_is_rejected_at_load() {
+    let mut json = tiny_artifact();
+    json["move_head"]["w"] = serde_json::json!([[[0.5, 0.4]], [[0.25, 0.1]]]);
+    let error = load(&json).expect_err("a 1x2 head kernel must not load");
+    assert!(
+        format!("{error}").contains("1x1 kernel"),
+        "unhelpful error: {error}"
+    );
+
+    let mut json = tiny_artifact();
+    json["pair_head"]["w"] = serde_json::json!([[[0.2], [0.9]], [[0.3], [0.7]]]);
+    assert!(load(&json).is_err(), "a 2x1 head kernel must not load");
+}
+
 #[test]
 fn a_mis_sized_value_head_row_is_rejected_at_load() {
     let mut json = tiny_artifact();

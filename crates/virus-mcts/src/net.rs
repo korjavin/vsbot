@@ -117,23 +117,28 @@ pub struct Encoded {
 }
 
 impl Encoded {
-    /// Encodes a 12x12 position from the current mover's point of view.
+    /// Encodes a 12x12 two-player position from the current mover's point of
+    /// view.
     ///
-    /// The nets are two-player artifacts, so "the opponent" is the other of
-    /// seats 1 and 2 — the same `3 - mover` the trainer emitted. A mover in
-    /// seat 3 or 4 has no trained encoding; it reads seat 1's flag rather than
-    /// indexing out of range.
+    /// "The opponent" is the other of seats 1 and 2 — the trainer's
+    /// `3 - mover`. There is deliberately no three- or four-player fallback:
+    /// the symbol alphabet lumps every non-mover into one "opponent" class and
+    /// the neutral-used planes have room for exactly one other seat, so a
+    /// wider game has no representation here at all. Encoding one anyway would
+    /// hand the searcher confident-looking priors computed from a position the
+    /// net has never seen a shape of.
     ///
     /// # Panics
-    /// Panics unless the board is exactly `BOARD x BOARD`. The net's shape is
-    /// fixed at load time and the searcher checks the board once at
-    /// construction, so this can only fire on a direct misuse.
+    /// Panics unless the board is exactly `BOARD x BOARD` with two players.
+    /// [`crate::MctsSearcher::new`] makes the same check once, up front, so in
+    /// a search this can only fire on direct misuse.
     pub fn from_state(state: &State) -> Encoded {
         assert!(
-            state.rows() == BOARD && state.cols() == BOARD,
-            "policy net is {BOARD}x{BOARD} only, got {}x{}",
+            state.rows() == BOARD && state.cols() == BOARD && state.players() == 2,
+            "policy net is {BOARD}x{BOARD} two-player only, got {}x{} with {} players",
             state.rows(),
-            state.cols()
+            state.cols(),
+            state.players()
         );
         let mover = state.current_player();
         let opponent = if mover == 1 { 2 } else { 1 };
@@ -622,13 +627,18 @@ fn head_weights(head: &RawHead, channels: usize, what: &str) -> Result<Vec<f32>,
     }
     let mut out = Vec::with_capacity(channels);
     for (ch, outer) in head.w.iter().enumerate() {
-        // torch's trailing [1][1] spatial axes.
-        let value = outer
-            .first()
-            .and_then(|inner| inner.first())
-            .copied()
-            .ok_or_else(|| NetError::Shape(format!("{what}.w[{ch}] is not a 1x1 kernel")))?;
-        out.push(finite(value, &format!("{what}.w[{ch}]"))?);
+        // torch's trailing [1][1] spatial axes. Checked exactly rather than
+        // just indexed into: a head with a wider kernel is a different
+        // architecture, and silently using its top-left weight would run a
+        // model this crate does not implement.
+        if outer.len() != 1 || outer[0].len() != 1 {
+            return shape(format!(
+                "{what}.w[{ch}] must be a 1x1 kernel, got {}x{}",
+                outer.len(),
+                outer.first().map_or(0, Vec::len)
+            ));
+        }
+        out.push(finite(outer[0][0], &format!("{what}.w[{ch}]"))?);
     }
     Ok(out)
 }

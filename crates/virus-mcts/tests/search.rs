@@ -358,6 +358,56 @@ fn flat_action_ids_round_trip() {
     assert_eq!(action_from_id(CELLS + 5 * CELLS + 5), None);
 }
 
+/// Off-board coordinates must panic rather than wrap into a valid cell.
+///
+/// `(0, 12)` folds to row-major index 12, which is the perfectly valid cell
+/// `(1, 0)`. Checking only the folded index would let the two share one policy
+/// target — a mislabelled self-play row, not a crash.
+#[test]
+#[should_panic(expected = "off the 12x12 board")]
+fn a_column_past_the_edge_does_not_alias_the_next_row() {
+    action_id(Action::mv(0, 12));
+}
+
+#[test]
+#[should_panic(expected = "off the 12x12 board")]
+fn a_negative_coordinate_is_rejected() {
+    action_id(Action::mv(-1, 0));
+}
+
+#[test]
+#[should_panic(expected = "off the 12x12 board")]
+fn an_off_board_neutral_pair_is_rejected() {
+    action_id(virus_core::Action::neutrals(
+        virus_core::Pos::new(0, 0),
+        virus_core::Pos::new(12, 0),
+    ));
+}
+
+/// The nets are 12x12 two-player artifacts. A wider game has no encoding — the
+/// symbol alphabet has one "opponent" class and one opponent neutral-used
+/// plane — so it must be refused up front, not searched on nonsense priors.
+#[test]
+#[should_panic(expected = "two-player only")]
+fn a_four_player_state_is_refused_when_a_net_is_supplied() {
+    let net = champion();
+    let state = State::new(12, 12, 4).expect("12x12 four-player start");
+    let _ = MctsSearcher::new(state, Config::play(), Some(&net));
+}
+
+/// ...but the hand-tuned fallback has no such limit.
+#[test]
+fn a_four_player_state_searches_fine_without_a_net() {
+    let state = State::new(12, 12, 4).expect("12x12 four-player start");
+    let legal = state.legal_actions();
+    let searcher = run(state, Config::play(), None, 60);
+    let action = searcher.best_action().expect("a move");
+    assert!(
+        legal.contains(&action),
+        "illegal {action:?} in a 4-player game"
+    );
+}
+
 /// Ordering must not matter: the trainer keys pairs by `min`/`max`.
 #[test]
 fn pair_ids_are_order_independent() {

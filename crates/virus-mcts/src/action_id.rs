@@ -18,7 +18,20 @@ use crate::net::{BOARD, CELLS};
 pub const ACTION_ID_COUNT: usize = CELLS + CELLS * CELLS;
 
 /// Row-major cell index of a 12x12 position.
+///
+/// Both coordinates are bounds-checked *before* they are folded together.
+/// Checking only the folded index would admit `(0, 12)` as cell 12, aliasing
+/// `(1, 0)` — two different actions sharing one policy target, which in an
+/// emitted self-play row is a silently mislabelled training example rather than
+/// a crash. Negative coordinates alias just as badly once cast to `usize`.
+///
+/// # Panics
+/// Panics on any coordinate outside `0..12`.
 fn cell(pos: Pos) -> usize {
+    assert!(
+        (0..BOARD as i32).contains(&pos.row) && (0..BOARD as i32).contains(&pos.col),
+        "{pos:?} is off the {BOARD}x{BOARD} board"
+    );
     pos.row as usize * BOARD + pos.col as usize
 }
 
@@ -29,20 +42,9 @@ fn cell(pos: Pos) -> usize {
 /// two cells coincide — neither is producible by `virus-core`'s enumerator.
 pub fn action_id(action: Action) -> usize {
     match action {
-        Action::Move { target } => {
-            let index = cell(target);
-            assert!(
-                index < CELLS,
-                "move target {target:?} is off the 12x12 board"
-            );
-            index
-        }
+        Action::Move { target } => cell(target),
         Action::PlaceNeutrals { cells } => {
             let (a, b) = (cell(cells[0]), cell(cells[1]));
-            assert!(
-                a < CELLS && b < CELLS,
-                "neutral pair {cells:?} is off the 12x12 board"
-            );
             assert!(a != b, "neutral pair {cells:?} repeats a cell");
             CELLS + a.min(b) * CELLS + a.max(b)
         }
