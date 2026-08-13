@@ -74,7 +74,62 @@ gap that cost the Java harness its first step.
     --budget ms:1000 --games 100 --seed 20260813 --threads 4
 ```
 
-<!-- RUN2 -->
+```
+mcts[mcts_champion]:1000ms vs ab-enhanced:1000ms
+  W-L-D 93-7-0 over 100 games (indicative)
+  win rate 93.0% (draws not half-wins)  wilson95 [86.3%, 96.6%]
+  pooled score 0.9300 (W+0.5D)/N  margin +86
+  worst move deadline overrun: 11 ms
+  elapsed 1437.4s
+  NOTE: fewer than 400 games: a direction may be read off the interval, but
+        this cannot gate a promotion (CLAUDE.md: gauntlets only, >=400 games).
+```
+
+| | |
+|---|---|
+| W-L-D | **93-7-0** over 100 games |
+| Wilson 95% | **[86.3%, 96.6%]** |
+| Pooled `(W+0.5D)/N` | 0.9300 |
+| Worst deadline overrun | 11 ms of 1000 |
+| Verdict | `indicative` — may not gate |
+
+**The gen-5 MCTS champion dominates the hand-tuned enhanced alpha-beta bar at
+equal wall clock.** The interval is nowhere near 50%, so even at 100 games the
+direction is not in doubt — but it is still 100 games, not 400, so it labels
+`indicative` and cannot gate anything. Reproduce at `--games 400` for a
+gate-eligible number.
+
+This is consistent with the predecessor's history rather than surprising: the
+Java MCTS champion dethroned the Java hand-tuned enhanced searcher too
+(`superiority.md` §0). What is new is that both sides are now Rust, so the
+comparison is free of the cross-language confound.
+
+**Two things to know before quoting the margin.**
+
+*Alpha-beta does not spend its whole second.* `SearchOptions::soft_deadline_percent`
+is 55: past 55% of the budget it refuses to start an iteration it would almost
+certainly not finish. That is the engine's own production time management, not a
+handicap the harness imposed — it is how the bar actually plays — but it means
+"1 s/move" is a ceiling for that arm, not a spend.
+
+*The `work_a` column is not sims per second.* It counts simulations, and a
+simulation that selects down to an already-known terminal node returns a cached
+value without touching the net or the eval (`virus-mcts/src/search.rs:403`). In
+a decisively won endgame the tree saturates with those, so per-game sim totals
+run far above what sustained net-value throughput would suggest. The honest
+throughput figures come from `virus-mcts`'s own microbenchmark:
+
+```
+$ cargo run --release -p virus-mcts --example mctsbench
+net forward, avx2             0.249 ms/op    4014 ops/s
+net forward, portable         0.393 ms/op    2546 ops/s
+mcts sims, net value          0.263 ms/op    3799 sims/s
+mcts sims, hand-tuned value   0.011 ms/op   92062 sims/s
+```
+
+So ~3800 net-value sims per second per core, i.e. roughly 3800 sims in a 1 s
+move from a fresh opening tree. (Recorded here for convenience; establishing the
+Rust:Java throughput ratio is `superiority.md` S0's job, not this bead's.)
 
 ## 3. Cross-play: vsbot vs the Go bot, through the real server
 
@@ -169,7 +224,7 @@ different numbers within the interval.
 
 | Gap | Why | Unblocked by |
 |---|---|---|
-| Anything at 400 games | Wall clock. A 400-game fixed-time run is ~4 h on 4 cores. | A longer run, or more cores |
+| Anything at 400 games | Wall clock. Row 2 took 24 min for 100 games on 4 cores, so 400 is ~1.6 h; row 1 is ~33 min. Nothing blocks it but time. | A longer run |
 | Cross-play with a real engine | `vsbot`'s `build_engine` rejects `SEARCH=ALPHABETA` and `SEARCH=MCTS` until the engine wiring lands, so the cross-play arm ran `SEARCH=GREEDY` | the vsbot engine-wiring bead |
 | **Why live GoBot loses to greedy 49-1 when the offline oracle beats greedy 15-5** | Found by running row 3 against the arena and noticing they disagree. Filed as bd `vsbot-t3q.1`; it matters because `superiority.md` Gate B anchors the ladder to "never regress against the Go bot" | bd `vsbot-t3q.1` |
 | Cross-play with balanced colours | Structural: the server seats the challenger at P1 and only vsbot challenges | a server change, or a seat-swapping challenge mode |
