@@ -70,6 +70,30 @@ fn both_wire_dialects_decode_identically() {
     assert_eq!(go_style.moves_left(), 3);
 }
 
+/// The literal bytes the Go server produces, captured by marshalling
+/// `game.New(3, 3, 2).Snapshot()` with the real backend.
+///
+/// It is a *hybrid* dialect and that is easy to get wrong: `game.Snapshot` has
+/// explicit `json:"…"` tags, so its own keys are camelCase — but the nested
+/// `game.Cell` and `game.Pos` have no tags at all, so they fall back to Go
+/// field names and emit `Owner`/`Kind`/`Row`/`Col`, with `Kind` as a number.
+/// Pinning the exact bytes here means a protocol drift fails loudly instead of
+/// at the first live game.
+const GO_SERVER_SNAPSHOT: &str = r#"{"rows":3,"cols":3,"board":[[{"Owner":1,"Kind":2},{"Owner":0,"Kind":0},{"Owner":0,"Kind":0}],[{"Owner":0,"Kind":0},{"Owner":0,"Kind":0},{"Owner":0,"Kind":0}],[{"Owner":0,"Kind":0},{"Owner":0,"Kind":0},{"Owner":2,"Kind":2}]],"bases":[{"Row":0,"Col":0},{"Row":2,"Col":2}],"active":[true,true],"neutralUsed":[false,false],"currentPlayer":1,"movesLeft":3,"gameOver":false,"winner":0}"#;
+
+#[test]
+fn decodes_the_real_go_server_wire_format() {
+    let state = decode(GO_SERVER_SNAPSHOT).expect("the live server format decodes");
+    let expected = State::new(3, 3, 2).expect("valid board");
+    assert_eq!(state.snapshot(), expected.snapshot());
+    assert_eq!(state.hash(), expected.hash());
+    assert_eq!(state.at(Pos::new(0, 0)).kind(), CellKind::Base);
+    assert_eq!(state.at(Pos::new(2, 2)).owner(), 2);
+    assert_eq!(state.current_player(), 1);
+    assert_eq!(state.moves_left(), 3);
+    assert!(state.active(1) && state.active(2));
+}
+
 #[test]
 fn unknown_fields_are_ignored() {
     let json = r#"{"rows":4,"cols":4,
