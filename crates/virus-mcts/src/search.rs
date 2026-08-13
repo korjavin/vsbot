@@ -22,6 +22,12 @@
 //! * the mover enters only at selection, as `sign(node) * Q_abs + U` with
 //!   `sign(node) = +1` iff the node's mover is player 1.
 //!
+//! That single axis is also the searcher's hard domain limit: it is two-player
+//! zero-sum by construction, so [`MctsSearcher::new`] refuses three- and
+//! four-player positions outright rather than scoring a third seat's win as a
+//! draw. The same is true of the Java original, whose `GoState` is two-player
+//! throughout.
+//!
 //! The `tests` module at the bottom of this file pins the invariant on a
 //! hand-built tree whose movers do not alternate — the case a per-edge negation
 //! gets wrong — and on the mirrored-position identity for the leaf flip.
@@ -170,6 +176,11 @@ impl Node {
 
 /// Terminal value in the absolute frame, from the single labelling rule
 /// (including the territory tiebreak).
+///
+/// Two-player by construction: the frame is one axis, `+1` for player 1 and
+/// `-1` for player 2, so there is nowhere to put a win for a third seat. That
+/// is why [`MctsSearcher::new`] refuses anything but a two-player position
+/// rather than letting such a win score as a draw here.
 pub fn terminal_value_abs(state: &State) -> f64 {
     match state.outcome_winner() {
         1 => 1.0,
@@ -223,24 +234,31 @@ impl<'net> MctsSearcher<'net> {
     /// Builds a searcher and expands the root (plus root noise, if configured).
     ///
     /// # Panics
-    /// Panics when a net is supplied for a position it cannot encode: the
-    /// artifacts are 12x12 two-player nets, and [`Encoded::from_state`] has no
-    /// representation for a wider board or a third seat. Checking here rather
-    /// than at the first expansion keeps the "a shape mismatch fails before the
-    /// search, never during it" rule that [`PolicyValueNet::load`] starts —
-    /// otherwise a four-player game would search happily on priors derived from
-    /// an encoding that silently collapsed three opponents into one.
     ///
-    /// The hand-tuned value source has no such limit: with `net` set to `None`
-    /// the searcher runs on any board `virus-core` accepts.
+    /// Panics on a position outside this searcher's domain. Two separate
+    /// limits, both checked up front so a mismatch can never surface as a
+    /// quietly wrong move halfway through a search:
+    ///
+    /// * **Two players, always.** The absolute frame is a two-player zero-sum
+    ///   construct end to end — [`terminal_value_abs`] labels the outcome on a
+    ///   single `+1`/`-1` axis, and `select` reads any mover that is not
+    ///   player 1 as "the opponent of player 1". Under three or four seats that
+    ///   silently allies seats 2-4 and scores a win for seat 3 or 4 as a draw.
+    ///   Supporting them needs a per-seat value vector, which is a different
+    ///   design, not a relaxed assertion.
+    /// * **12x12, when a net is supplied.** [`Encoded::from_state`] has no
+    ///   representation for another board size.
     pub fn new(state: State, config: Config, net: Option<&'net PolicyValueNet>) -> Self {
+        assert_eq!(
+            state.players(),
+            2,
+            "the absolute-frame searcher is two-player only"
+        );
         assert!(
-            net.is_none()
-                || (state.rows() == BOARD && state.cols() == BOARD && state.players() == 2),
-            "policy net is {BOARD}x{BOARD} two-player only, got {}x{} with {} players",
+            net.is_none() || (state.rows() == BOARD && state.cols() == BOARD),
+            "policy net is {BOARD}x{BOARD} only, got {}x{}",
             state.rows(),
-            state.cols(),
-            state.players()
+            state.cols()
         );
         let net_scratch = net.map(|net| net.scratch());
         let mut searcher = MctsSearcher {

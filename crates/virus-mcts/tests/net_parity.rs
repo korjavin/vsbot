@@ -290,6 +290,34 @@ fn a_well_formed_tiny_artifact_loads() {
     assert!(net.has_value_head());
 }
 
+/// The architecture name carries semantics the shapes do not. A residual trunk
+/// or a different head factorisation could export identical dimensions and be
+/// run as a plain conv stack, which is the one wrong-net failure the shape
+/// checks cannot catch.
+#[test]
+fn an_unknown_architecture_is_rejected_at_load() {
+    let mut json = tiny_artifact();
+    json["meta"]["arch"] = serde_json::json!("conv-resnet-v9");
+    let error = load(&json).expect_err("an unknown arch must not load");
+    assert!(
+        format!("{error}").contains("arch"),
+        "unhelpful error: {error}"
+    );
+
+    let mut json = tiny_artifact();
+    json["meta"].as_object_mut().unwrap().remove("arch");
+    assert!(load(&json).is_err(), "a missing arch must not load");
+}
+
+/// Both shipped architectures stay loadable.
+#[test]
+fn the_policy_only_architecture_is_supported() {
+    let mut json = tiny_artifact();
+    json["meta"]["arch"] = serde_json::json!("conv-policy-v1");
+    json.as_object_mut().unwrap().remove("value_head");
+    assert!(load(&json).is_ok(), "conv-policy-v1 is a shipped arch");
+}
+
 #[test]
 fn a_wrong_board_is_rejected_at_load() {
     let mut json = tiny_artifact();

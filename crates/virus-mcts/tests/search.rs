@@ -384,28 +384,24 @@ fn an_off_board_neutral_pair_is_rejected() {
     ));
 }
 
-/// The nets are 12x12 two-player artifacts. A wider game has no encoding — the
-/// symbol alphabet has one "opponent" class and one opponent neutral-used
-/// plane — so it must be refused up front, not searched on nonsense priors.
+/// The absolute frame is one axis: `+1` for player 1, `-1` for player 2. Three
+/// and four seats have nowhere to live on it — `terminal_value_abs` would score
+/// a win for seat 3 as a draw, and `select` would read seats 2, 3 and 4 as one
+/// allied opponent. So the searcher refuses them outright rather than returning
+/// a confident wrong move, with or without a net.
 #[test]
 #[should_panic(expected = "two-player only")]
-fn a_four_player_state_is_refused_when_a_net_is_supplied() {
+fn a_four_player_state_is_refused_with_the_hand_tuned_value() {
+    let state = State::new(12, 12, 4).expect("12x12 four-player start");
+    let _ = MctsSearcher::new(state, Config::play(), None);
+}
+
+#[test]
+#[should_panic(expected = "two-player only")]
+fn a_four_player_state_is_refused_with_a_net() {
     let net = champion();
     let state = State::new(12, 12, 4).expect("12x12 four-player start");
     let _ = MctsSearcher::new(state, Config::play(), Some(&net));
-}
-
-/// ...but the hand-tuned fallback has no such limit.
-#[test]
-fn a_four_player_state_searches_fine_without_a_net() {
-    let state = State::new(12, 12, 4).expect("12x12 four-player start");
-    let legal = state.legal_actions();
-    let searcher = run(state, Config::play(), None, 60);
-    let action = searcher.best_action().expect("a move");
-    assert!(
-        legal.contains(&action),
-        "illegal {action:?} in a 4-player game"
-    );
 }
 
 /// Ordering must not matter: the trainer keys pairs by `min`/`max`.

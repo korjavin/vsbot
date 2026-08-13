@@ -67,6 +67,12 @@ const PADDED: usize = BOARD + 2;
 /// Number of distinct cell symbols the first eight planes one-hot encode.
 const SYMBOLS: usize = 8;
 
+/// Architectures this crate implements.
+///
+/// `conv-policy-v1` is the Phase 1 policy-only trunk; `conv-policy-value-v1`
+/// adds the value head and is what the gen-5 champion declares.
+const SUPPORTED_ARCH: [&str; 2] = ["conv-policy-v1", "conv-policy-value-v1"];
+
 // ---------------------------------------------------------------- encoding
 
 /// Cell symbol in the mover's frame, matching Java's `PatternContract`.
@@ -376,6 +382,17 @@ impl PolicyValueNet {
     }
 
     fn from_raw(raw: RawNet) -> Result<PolicyValueNet, NetError> {
+        // The architecture name, not just the tensor shapes. A future trunk
+        // (residual blocks, a different head factorisation) could export the
+        // same shapes with different semantics, and this loader would run it as
+        // if it were the plain conv stack — the one wrong-net failure the shape
+        // checks below cannot catch.
+        if !SUPPORTED_ARCH.contains(&raw.meta.arch.as_str()) {
+            return shape(format!(
+                "meta arch {:?} unsupported, expected one of {SUPPORTED_ARCH:?}",
+                raw.meta.arch
+            ));
+        }
         if raw.meta.board != BOARD as i64 || raw.meta.planes != PLANES as i64 {
             return shape(format!(
                 "meta board/planes {}/{} unsupported, expected {BOARD}/{PLANES}",
