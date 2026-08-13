@@ -193,7 +193,18 @@ impl SearchEngine for MctsEngine {
             // The control arm of the same trace: a cold search has nothing
             // inherited, so `inherited=0` here is the baseline the pondered
             // lines are read against.
-            trace_answer("choose", state, false, 0, Some(&searcher), Some(drove), budget, started);
+            trace_answer(
+                AnswerTrace {
+                    path: "choose",
+                    state,
+                    reused: false,
+                    inherited: 0,
+                    drove: Some(drove),
+                    budget,
+                    started,
+                },
+                Some(&searcher),
+            );
         }
         self.harvest(state, &searcher, budget)
     }
@@ -302,14 +313,16 @@ impl SearchEngine for MctsEngine {
                     .and_then(|(_, searcher)| self.harvest(&state, searcher, &budget));
                 if trace_enabled() {
                     trace_answer(
-                        "ponder",
-                        &state,
-                        reused,
-                        inherited,
+                        AnswerTrace {
+                            path: "ponder",
+                            state: &state,
+                            reused,
+                            inherited,
+                            drove,
+                            budget: &budget,
+                            started,
+                        },
                         tree.as_ref().map(|(_, searcher)| searcher),
-                        drove,
-                        &budget,
-                        started,
                     );
                 }
                 let _ = reply.send(outcome);
@@ -488,6 +501,22 @@ fn trace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("VSBOT_PONDER_TRACE").as_deref() == Ok("1"))
 }
 
+/// Everything one [`trace_answer`] line reports about, before it is formatted.
+#[derive(Clone, Copy, Debug)]
+struct AnswerTrace<'a> {
+    /// Which code path answered: `choose` for a cold search, `ponder` for a
+    /// session's reply.
+    path: &'static str,
+    state: &'a State,
+    /// Whether the session re-rooted an existing tree onto this position.
+    reused: bool,
+    /// Root visits the re-root carried in, before this action simulated.
+    inherited: u64,
+    drove: Option<DriveReport>,
+    budget: &'a SearchBudget,
+    started: Instant,
+}
+
 /// One line per answered action: what the tree brought to it, what this action
 /// added, and which rule ended it.
 ///
@@ -495,16 +524,16 @@ fn trace_enabled() -> bool {
 /// re-root carried in), `sims` (what this action actually simulated) and `stop`
 /// — together they say whether an answer was searched or merely read off a
 /// tree the opponent's turn had already settled.
-fn trace_answer(
-    path: &str,
-    state: &State,
-    reused: bool,
-    inherited: u64,
-    searcher: Option<&MctsSearcher<'_>>,
-    drove: Option<DriveReport>,
-    budget: &SearchBudget,
-    started: Instant,
-) {
+fn trace_answer(trace: AnswerTrace<'_>, searcher: Option<&MctsSearcher<'_>>) {
+    let AnswerTrace {
+        path,
+        state,
+        reused,
+        inherited,
+        drove,
+        budget,
+        started,
+    } = trace;
     let (leader, runner_up) = searcher.map_or((0, 0), |searcher| {
         let mut top = (0u32, 0u32);
         for &n in searcher.root_visits() {
@@ -1097,7 +1126,11 @@ mod tests {
             actions.len()
         );
 
-        for action in [actions[0], actions[actions.len() / 2], actions[actions.len() - 1]] {
+        for action in [
+            actions[0],
+            actions[actions.len() / 2],
+            actions[actions.len() - 1],
+        ] {
             let target = state.apply(action).expect("a legal action");
             let mut searcher = MctsSearcher::new(state.clone(), engine.config, Some(&engine.net));
             // Enough that every root edge has been expanded into a node, which

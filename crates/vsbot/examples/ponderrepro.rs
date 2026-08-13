@@ -103,7 +103,13 @@ fn main() {
 
     let mut tally = Tally::default();
     for game in 0..options.games {
-        play(&net, config, &options, mix64(options.seed ^ (game + 1)), &mut tally);
+        play(
+            &net,
+            config,
+            &options,
+            mix64(options.seed ^ (game + 1)),
+            &mut tally,
+        );
         eprintln!("game {} done: {tally}", game + 1);
     }
     println!("{tally}");
@@ -156,11 +162,7 @@ struct Tally {
 
 impl std::fmt::Display for Tally {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mean = if self.warm == 0 {
-            0
-        } else {
-            self.inherited_total / self.warm
-        };
+        let mean = self.inherited_total.checked_div(self.warm).unwrap_or(0);
         write!(
             f,
             "actions={} warm={} mean_inherited={mean} early_stop_immediately={} \
@@ -216,13 +218,7 @@ impl Tally {
 }
 
 /// One game, with seat 2 playing the part of the pondering deployment.
-fn play(
-    net: &PolicyValueNet,
-    config: Config,
-    options: &Options,
-    seed: u64,
-    tally: &mut Tally,
-) {
+fn play(net: &PolicyValueNet, config: Config, options: &Options, seed: u64, tally: &mut Tally) {
     const US: Player = 2;
     let mut rng = Rng::new(seed);
     let mut state = State::new(12, 12, 2).expect("a legal opening position");

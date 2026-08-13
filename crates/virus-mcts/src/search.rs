@@ -1339,10 +1339,18 @@ mod tests {
         let root = state_with(1, 3);
         let mut searcher = MctsSearcher::new(root.clone(), Config::play(), None);
         assert_eq!(searcher.root_state(), &root);
-        assert_eq!(searcher.root_visit_total(), 0, "an unsearched root is empty");
+        assert_eq!(
+            searcher.root_visit_total(),
+            0,
+            "an unsearched root is empty"
+        );
 
         searcher.run_sims(400);
-        assert_eq!(searcher.root_state(), &root, "searching does not move the root");
+        assert_eq!(
+            searcher.root_state(),
+            &root,
+            "searching does not move the root"
+        );
         assert_eq!(searcher.root_visit_total(), 400);
 
         let action = searcher.best_action().expect("a best action");
