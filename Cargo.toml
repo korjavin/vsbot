@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/virus-core",
+    "crates/virus-eval",
+    "crates/virus-search",
+    "crates/virus-mcts",
+    "crates/virus-proto",
+    "crates/virus-arena",
+    "crates/vsbot",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/korjavin/vsbot"
+
+[workspace.dependencies]
+virus-core = { path = "crates/virus-core" }
+virus-eval = { path = "crates/virus-eval" }
+virus-search = { path = "crates/virus-search" }
+virus-mcts = { path = "crates/virus-mcts" }
+virus-proto = { path = "crates/virus-proto" }
+virus-arena = { path = "crates/virus-arena" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

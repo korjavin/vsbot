@@ -1,0 +1,14 @@
+[package]
+name = "virus-core"
+description = "Virus game rules engine: state, movegen, apply, connectivity, elimination, Zobrist, snapshot decode."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+# Needed by `fixture`: every downstream crate replays the parity JSONL, so the
+# reader lives here rather than being duplicated in each crate's tests.
+serde_json = { workspace = true }
