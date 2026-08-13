@@ -87,19 +87,25 @@ pub const TEMPERATURE_PLIES: u32 = 21;
 
 /// Default leaves per batched net evaluation.
 ///
-/// Measured on this box with `examples/mctsbench`: throughput plateaus at
-/// **8**, where the batched trunk first fills its vector width, and 8 through
-/// 48 all land within measurement noise of each other at 2.1-2.5x the serial
-/// searcher. Below 8 the batch is a *loss* — [`crate::net::BATCH_LANES`] is the
-/// group size, so a round of 2 leaves pays for a group of 8 and measured 0.6x
-/// serial. Sixteen is the default because it is the smallest multiple of the
-/// lane width that keeps a round full even when a few of its descents land on
-/// terminal nodes or on a leaf another descent already claimed, and it holds
-/// the staleness a batch introduces to two lane groups' worth.
+/// **Eight, because that is where throughput plateaus and nothing above it buys
+/// anything.** Measured on this box with `examples/mctsbench`: 8 through 48 all
+/// land within measurement noise of each other at 2.1-2.5x the serial searcher,
+/// so the whole gain is already collected at 8 — which is no coincidence, it is
+/// [`crate::net::BATCH_LANES`], the width the batched trunk fills.
 ///
-/// Set it to `1` for the serial searcher; anything between 2 and 7 is strictly
-/// worse than either.
-pub const DEFAULT_BATCH_SIZE: u16 = 16;
+/// Below the lane width a batch is an outright *loss*: the net rounds a batch up
+/// to whole lane groups, so a round of 2 leaves pays for a group of 8 and
+/// measured **0.6x** serial. Anything from 2 to 7 is worse than both ends.
+///
+/// Above the lane width the extra size costs tree freshness — a round selects
+/// `batch_size` times against a tree that only virtual loss is perturbing — and
+/// buys no throughput. The 100-game fixed-time self-gauntlets against the serial
+/// searcher (see the S3-T1 PR) scored 0.55 pooled at 8 and 0.52 at 16; those two
+/// samples do not separate on their own, but they point the same way as the
+/// argument, so the smallest batch on the plateau is the default.
+///
+/// Set it to `1` for the serial searcher, bit for bit.
+pub const DEFAULT_BATCH_SIZE: u16 = 8;
 
 /// Default virtual-loss weight, in leaf-value units.
 ///
@@ -409,7 +415,7 @@ impl<'net> MctsSearcher<'net> {
     /// Simulates until `deadline`, always running at least one simulation.
     ///
     /// The deadline is checked between batches, so a budget can overshoot by up
-    /// to one batch — at the tuned [`DEFAULT_BATCH_SIZE`] a couple of
+    /// to one batch — at the tuned [`DEFAULT_BATCH_SIZE`] one to two
     /// milliseconds, against the hundreds a real move budget allows. Callers
     /// that slice a turn into deadlines (the `vsbot` bin does) still land
     /// inside their fallback discipline; a caller that needs the old
