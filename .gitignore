@@ -3,3 +3,4 @@
 Cargo.lock.orig
 *.log
 .env
+__pycache__/
