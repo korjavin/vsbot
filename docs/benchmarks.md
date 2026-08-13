@@ -4,11 +4,12 @@ Every number here came from `virus-arena`. Read the caveat column before quoting
 any of them.
 
 The house rule (CLAUDE.md, ARCHITECTURE.md invariant 7) is that only gauntlets
-count, and only at ≥400 games. **Nothing on this page is at 400 games yet.**
-Everything below is labelled `INFORMATIONAL ONLY` or `indicative` by the harness
-itself, and none of it may gate a promotion. They are here because they are the
-project's first real Rust-vs-Rust datapoints and because reproducing them is how
-you check the harness still works.
+count, and only at ≥400 games. Rows 1–3 are below that bar and are labelled
+`INFORMATIONAL ONLY` or `indicative` by the harness itself; none of them may
+gate a promotion. Row 4 (S1) *is* at 400 games, but its games are not 400
+independent samples — read its distinct-game count before quoting it. They are
+here because they are the project's first real datapoints and because
+reproducing them is how you check the harness still works.
 
 Reproduce any row by pasting its command. Node-budget rows reproduce exactly;
 fixed-time rows do not, by construction (see "Determinism" below).
@@ -244,6 +245,92 @@ covers that counting logic in CI.
 The original conclusion stands, narrowed: the harness runs end to end and
 records real, completed games. It was never measuring strength.
 
+## 4. S1 — Rust MCTS vs the Java gen-5 champion, same net, 1 s/move
+
+`superiority.md` S1: dethrone the Java champion at 1 s a move. Both sides run
+**the same artifact** — `mcts_champion.json`, md5 `748c9289…`, verified
+byte-identical in `artifacts/`, in the `nnue-trainer` checkout and baked into
+the image — so this isolates *implementation throughput*, not net quality. The
+Java bot has no JVM on this host and runs from
+`ghcr.io/korjavin/nnue-trainer:latest` with `SEARCH=MCTS MCTS_VALUE=net
+MCTS_MOVE_MILLIS=1000`; it logged `prior=mcts_champion.json+value cpuct=1.5`,
+confirming it played the champion's value head and not a fallback.
+
+Both bots connect to a **local** Go server booted by the harness — never
+production. Colour-balanced by `--direction alternate`: half the games with
+`vsbot` challenging (P1), half with the Java bot challenging (P2). Four
+independent shards, pooled.
+
+```bash
+docker pull ghcr.io/korjavin/nnue-trainer:latest
+cargo build --release -p vsbot
+python3 crates/virus-arena/crossplay/crossplay_pool.py \
+    --shards 4 --games 400 --opponent java --direction alternate \
+    --search MCTS --move-millis 1000 --vsbot-instances 1 \
+    --workdir /tmp/s1run
+```
+
+```json
+{ "wins": 235, "losses": 165, "draws": 0, "games": 400,
+  "as_p1": 200, "as_p2": 200,
+  "win_rate_as_p1": 100.0, "win_rate_as_p2": 17.5,
+  "pooled_score": 0.5875, "win_rate": 58.75,
+  "wilson95_low": 53.86, "wilson95_high": 63.47,
+  "distinct_games": 65, "red_flag_terminations": 0 }
+```
+
+| | |
+|---|---|
+| W-L-D | **235-165-0** over 400 games |
+| Pooled `(W+0.5D)/N` | **0.5875** |
+| Seats | 200 as P1, 200 as P2 — balanced |
+| vsbot as P1 | **200 / 200 = 100.0%** |
+| vsbot as P2 | 35 / 200 = 17.5% |
+| Wilson 95% over 400 | [53.9%, 63.5%] |
+| **Distinct games** | **65 of 400** |
+| Wilson 95% over the *effective* 65 | **[46.3%, 69.6%]** |
+| Forfeits (illegal move / timeout) | 0 |
+| Median game length | 23 turns |
+
+**Measured throughput: Rust runs ~23× the simulations of Java at the same
+budget on the same net.** Java logged a median **163 sims** per 1 s move
+(p10 149, p90 171, over 13 953 searches); `virus-mcts`'s microbench puts Rust
+at **3797 net-value sims/s**. The comparison is generous to Rust — its figure
+is a single-core microbench on a quiet box, Java's is in-game and carries JVM
+and protocol overhead — but the order of magnitude is not in doubt. (Both
+sides' raw sim counters spike into the millions in decided endgames, where a
+simulation reaching a known-terminal node returns a cached value; that is why
+the **median** is quoted, not the mean.)
+
+**Verdict: S1's stated bar is met on the letter and not on the substance, so
+this page does not crown a champion.**
+
+* The pooled score **0.5875 clears the ≥ 0.55 acceptance over ≥ 400 games**,
+  the run is seat-balanced, and there were zero forfeits.
+* But only **65 of the 400 games were distinct.** Cross-play has no opening
+  randomisation and both engines play argmax with no root noise, so the run
+  replays a small set of games — the same defect that produced the 49-1 in §3a,
+  caught this time by the harness's own diagnostic. Over the effective sample
+  the interval is **[46.3%, 69.6%]**, which straddles both 0.55 *and* 0.50.
+  Per CLAUDE.md (gauntlets only, ≥400 games) the game count is not the sample
+  size, so **this may not gate a promotion.**
+
+**What the seat split actually shows.** The P1 seat won **365 of 400 games
+(91.3%)**. With the same net on both sides the engines are close enough that
+moving first almost decides the game, and the entire margin is conversion of
+the first move: **Rust converted 200/200 (100%) of its P1 games, Java converted
+165/200 (82.5%)** of its. So the honest reading of the 23× sims advantage is
+that it buys Rust near-perfect conversion of a won seat, and very little else —
+it recovered only 17.5% of games from the losing seat. A throughput advantage
+of that size producing a pooled 0.5875 is a *negative* result for the "more
+sims wins" thesis, and is the loss analysis S1 asked for.
+
+**What would make this gate-eligible**: an opening-randomisation lever on at
+least one side, so 400 games are 400 samples. Neither engine exposes one in
+play mode today (`vsbot`'s `MCTS_SEED` does not perturb no-dirichlet argmax
+play; the Java live path hard-codes root noise off). Until then the
+distinct-game count is the number to read.
+
 ---
 
 ## Determinism
@@ -286,7 +373,7 @@ different numbers within the interval.
 
 | Gap | Why | Unblocked by |
 |---|---|---|
-| Anything at 400 games | Wall clock. Row 2 took 24 min for 100 games on 4 cores, so 400 is ~1.6 h; row 1 is ~33 min. Nothing blocks it but time. | A longer run |
+| Anything at 400 games **in the arena** | Wall clock. Row 2 took 24 min for 100 games on 4 cores, so 400 is ~1.6 h; row 1 is ~33 min. Nothing blocks it but time. (Row 4 is at 400 games, but through cross-play, where the game count is not the sample size.) | A longer run |
 | Cross-play with balanced colours **against the Go bot** | Structural, and now confirmed by reading the code rather than assumed: the bot-hoster's challenger targets `Manager.IsAcceptor(userID)`, which is false for every id outside its own pool, so it cannot challenge `vsbot` and cannot seat it at P2. `--direction theirs` is refused for that opponent rather than quietly returning another one-chair number | a bot-hoster change |
 | A cross-play number that is a strength result | Even colour-balanced, cross-play has no opening randomisation, so its games are largely replays (§3a). The distinct-game count says how many samples a run really had; until a diversity knob exists, treat the count, not the game count, as `n` | an opening-randomisation lever on at least one side |
 | Two different net artifacts in one gauntlet | The harness shares one loaded net across all games and threads; a net-vs-net run needs a second one threaded through the sides. Refused with an error rather than silently playing one artifact against itself | a follow-up bead |
