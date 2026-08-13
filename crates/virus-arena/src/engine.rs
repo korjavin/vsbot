@@ -196,15 +196,32 @@ impl SideSpec {
     }
 
     /// The provenance name, in Java's `gauntlet:<eval>:<budget>` shape.
+    ///
+    /// An MCTS side carries its artifact's file stem, because "mcts" alone
+    /// answers the wrong question: every generation of the ladder is "mcts",
+    /// and a benchmarks table that does not say *which* net played is a table
+    /// nobody can reproduce a year later.
     pub fn name(&self) -> String {
         let engine = match self.engine {
             Engine::Greedy => "greedy".to_owned(),
             Engine::AlphaBeta { enhanced: true } => "ab-enhanced".to_owned(),
             Engine::AlphaBeta { enhanced: false } => "ab-plain".to_owned(),
-            Engine::Mcts => "mcts".to_owned(),
+            Engine::Mcts => match self.net.as_deref().map(artifact_stem) {
+                Some(stem) => format!("mcts[{stem}]"),
+                None => "mcts".to_owned(),
+            },
         };
         format!("{engine}:{}", self.budget.tag())
     }
+}
+
+/// The file stem of an artifact path, for use in a side's name.
+///
+/// Hand-rolled rather than `Path::file_stem` so the result is always valid
+/// UTF-8 and never an `OsStr` dance; a name is display text.
+fn artifact_stem(path: &str) -> &str {
+    let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    file.strip_suffix(".json").unwrap_or(file)
 }
 
 /// Per-move telemetry a side reports back to the harness.
@@ -516,6 +533,23 @@ mod tests {
         assert_eq!(spec.name(), "ab-enhanced:n60000");
         let spec = SideSpec::parse("mcts", Budget::Millis(1000)).expect("spec");
         assert_eq!(spec.name(), "mcts:1000ms");
+    }
+
+    /// "mcts" alone does not identify a side: every generation of the ladder is
+    /// "mcts". A report has to name the artifact that actually played.
+    #[test]
+    fn an_mcts_side_names_its_artifact() {
+        let spec = SideSpec::parse("mcts:artifacts/mcts_champion.json", Budget::Millis(1000))
+            .expect("spec");
+        assert_eq!(spec.name(), "mcts[mcts_champion]:1000ms");
+
+        assert_eq!(
+            artifact_stem("artifacts/mcts_champion.json"),
+            "mcts_champion"
+        );
+        assert_eq!(artifact_stem("/a/b/gen7.json"), "gen7");
+        assert_eq!(artifact_stem("bare"), "bare");
+        assert_eq!(artifact_stem("net.json"), "net");
     }
 
     #[test]
