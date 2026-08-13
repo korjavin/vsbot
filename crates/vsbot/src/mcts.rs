@@ -142,6 +142,13 @@ impl MctsEngine {
 
 impl SearchEngine for MctsEngine {
     fn choose(&self, state: &State, budget: &SearchBudget) -> Option<SearchOutcome> {
+        if budget.is_cancelled() {
+            // Cancelled before any candidate was established — the documented
+            // `None` case. Worth checking first: building the searcher expands
+            // the root, which is a full net forward, and the client would throw
+            // the answer away at send time regardless.
+            return None;
+        }
         if !self.in_domain(state) {
             return GreedyEngine.choose(state, budget);
         }
@@ -330,18 +337,36 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_search_still_returns_a_legal_move() {
+    fn an_already_cancelled_search_does_no_work_at_all() {
+        // Cancellation means the position was superseded, so there is nothing
+        // worth computing — not even the root expansion.
         let engine = engine();
         let state = State::new(12, 12, 2).expect("a legal opening position");
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let outcome = engine
+        assert!(engine
             .choose(
                 &state,
                 &SearchBudget::new(Instant::now() + Duration::from_secs(30), cancel),
             )
+            .is_none());
+    }
+
+    #[test]
+    fn an_expired_but_live_budget_still_returns_a_searched_move() {
+        // Out of time is not the same as superseded. Returning `None` here
+        // would mean not moving at all, and the server's 120 s move timer
+        // forfeits a bot that does not move.
+        let engine = engine();
+        let state = State::new(12, 12, 2).expect("a legal opening position");
+        let outcome = engine
+            .choose(
+                &state,
+                &SearchBudget::new(Instant::now(), CancellationToken::new()),
+            )
             .expect("an action");
         assert!(state.legal_actions().contains(&outcome.action));
+        assert!(outcome.nodes > 0, "at least one simulation must have run");
     }
 
     #[test]
