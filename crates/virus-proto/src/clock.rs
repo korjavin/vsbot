@@ -31,7 +31,9 @@
 //! * **early stop** — when the runner-up cannot catch the leader even if it took
 //!   *every* remaining simulation, more thinking cannot change the move. Stop
 //!   and give the time back to the bank. Saves human-facing latency at zero
-//!   strength cost.
+//!   strength cost — but only for a lead **this search produced**. A lead a
+//!   re-root inherited from the opponent's turn is there from the first sample
+//!   and says nothing about whether this action has settled; see [`verdict`].
 //! * **extension** — when the target passes with an unstable root (a leader that
 //!   changed late, or a top-2 gap too small to trust), keep going toward
 //!   [`MoveAllocation::ceiling`]. The bank caps the ceiling, so an extension
