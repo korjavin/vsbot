@@ -616,6 +616,8 @@ dependencies = [
 name = "virus-mcts"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "virus-core",
  "virus-eval",
 ]

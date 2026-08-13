@@ -10,3 +10,8 @@ repository.workspace = true
 [dependencies]
 virus-core = { workspace = true }
 virus-eval = { workspace = true }
+# The trained net ships as the trainer's JSON export, so loading it needs a JSON
+# reader. Inference itself is hand-rolled f32 — no BLAS, no ONNX, same as the
+# Java port it is ported from.
+serde = { workspace = true }
+serde_json = { workspace = true }
