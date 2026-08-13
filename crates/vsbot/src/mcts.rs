@@ -147,15 +147,20 @@ impl SearchEngine for MctsEngine {
         }
 
         let mut searcher = MctsSearcher::new(state.clone(), self.config, Some(&self.net));
-        // Do-while: `run_until_deadline` always runs at least one simulation,
-        // so even an already-expired budget returns a searched move rather than
-        // the first enumerated one.
-        loop {
-            let now = Instant::now();
-            let slice = CANCEL_POLL_SLICE.min(budget.deadline.saturating_duration_since(now));
-            searcher.run_until_deadline(now + slice);
-            if budget.is_cancelled() || Instant::now() >= budget.deadline {
-                break;
+        // A terminal root is left unexpanded, and `run_until_deadline` returns
+        // immediately for one. Without this guard the loop below would spin hot
+        // for the whole move budget doing nothing.
+        if !searcher.root_actions().is_empty() {
+            // Do-while: `run_until_deadline` always runs at least one
+            // simulation, so even an already-expired budget returns a searched
+            // move rather than the first enumerated one.
+            loop {
+                let now = Instant::now();
+                let slice = CANCEL_POLL_SLICE.min(budget.deadline.saturating_duration_since(now));
+                searcher.run_until_deadline(now + slice);
+                if budget.is_cancelled() || Instant::now() >= budget.deadline {
+                    break;
+                }
             }
         }
 
@@ -260,15 +265,29 @@ mod tests {
     }
 
     #[test]
-    fn play_mode_is_deterministic_for_a_fixed_simulation_budget() {
-        // Play mode draws no random numbers at all, so two searches of the same
-        // position must agree. A regression that turns Dirichlet noise or visit
-        // sampling on in production would break exactly this.
+    fn play_mode_never_explores_and_is_reproducible() {
         let engine = engine();
+        // The two exploration switches, asserted directly. A regression that
+        // turned either on in production would make the bot's moves depend on
+        // the seed, which is the thing "play mode" exists to rule out.
+        assert!(!engine.config.root_noise, "Dirichlet noise in play mode");
+        assert!(!engine.config.visit_sampling, "visit sampling in play mode");
+
+        // With both off, the search is a pure function of the position and the
+        // simulation count. Counting simulations rather than milliseconds is
+        // the point: a wall-clock budget would let scheduler jitter change the
+        // tree and make this assertion a coin flip on a loaded runner.
         let state = State::new(12, 12, 2).expect("a legal opening position");
-        let first = engine.choose(&state, &budget(150)).expect("an action");
-        let second = engine.choose(&state, &budget(150)).expect("an action");
-        assert_eq!(first.action, second.action);
+        let mut first = MctsSearcher::new(state.clone(), engine.config, Some(&engine.net));
+        first.run_sims(64);
+        let mut second = MctsSearcher::new(state.clone(), engine.config, Some(&engine.net));
+        second.run_sims(64);
+        assert_eq!(first.best_action(), second.best_action());
+        assert_eq!(
+            first.root_value_abs().to_bits(),
+            second.root_value_abs().to_bits(),
+            "the root value must be bit-identical, not merely close"
+        );
     }
 
     #[test]
