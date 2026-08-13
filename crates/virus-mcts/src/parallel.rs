@@ -277,9 +277,11 @@ impl<'net> Worker<'net> {
             Stop::Collision => {
                 // Undo this descent's virtual loss and take no credit for it.
                 for (parent, edge) in self.path.drain(start..) {
-                    if let Some(edges) = parent.edges.get() {
-                        edges.vl[edge].fetch_sub(1, Ordering::Relaxed);
-                    }
+                    let edges = parent
+                        .edges
+                        .get()
+                        .expect("a node on a path was expanded before it was walked");
+                    edges.vl[edge].fetch_sub(1, Ordering::Relaxed);
                     parent.vl_visits.fetch_sub(1, Ordering::Relaxed);
                 }
                 self.collisions += 1;
@@ -332,7 +334,7 @@ impl<'net> Worker<'net> {
         let mut heads = std::mem::take(&mut self.heads);
         heads.clear();
         match (self.net, evaluate.len()) {
-            (Some(net), 1) | (Some(net), 0) => {
+            (Some(net), 1) => {
                 let encoded = Encoded::from_state(&self.leaves[evaluate[0].0].0.state);
                 let scratch = self
                     .net_scratch
@@ -603,6 +605,16 @@ impl<'net> ParallelMcts<'net> {
     }
 
     /// Spawns the workers, runs `body` on each, and folds the results back.
+    ///
+    /// A panicking worker is **re-raised on this thread**, not swallowed. It
+    /// would otherwise surface as a search that silently ran a fraction of its
+    /// budget and still handed back a move, which is the shape of bug that
+    /// invariant 3 (`ARCHITECTURE.md`) exists about: a searcher must never
+    /// quietly return something other than the result its budget bought.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any worker panic, after every worker has been joined.
     fn drive<F>(&mut self, body: F)
     where
         F: Fn(&mut Worker<'net>, &Arc<SharedNode>, u32) + Sync,
@@ -621,10 +633,20 @@ impl<'net> ParallelMcts<'net> {
                     worker.collisions
                 }));
             }
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap_or_default())
-                .sum()
+            // Join every worker before re-raising, so a panic cannot leave a
+            // sibling still walking the tree this searcher is about to read.
+            let mut collisions = 0u64;
+            let mut panic = None;
+            for handle in handles {
+                match handle.join() {
+                    Ok(count) => collisions += count,
+                    Err(payload) => panic = panic.or(Some(payload)),
+                }
+            }
+            if let Some(payload) = panic {
+                std::panic::resume_unwind(payload);
+            }
+            collisions
         });
         self.collisions += collisions;
         self.refresh_root();
