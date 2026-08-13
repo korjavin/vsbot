@@ -9,3 +9,9 @@ repository.workspace = true
 
 [dependencies]
 virus-core = { workspace = true }
+
+[dev-dependencies]
+# Only the parity fixtures need JSON; the evaluator itself has no dependency
+# beyond virus-core.
+serde = { workspace = true }
+serde_json = { workspace = true }
