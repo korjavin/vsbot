@@ -42,3 +42,11 @@ uuid = { version = "1", features = ["v4"] }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+# `cargo test` is the parity gate, and the search fixtures replay 570 complete
+# alpha-beta searches. Unoptimized that single test file runs for over 25
+# minutes — longer than CI's entire budget — against well under a minute here.
+# `debug-assertions` and `overflow-checks` stay on (that is what the tests are
+# for); only the codegen quality changes. `profile.test` inherits from this.
+[profile.dev]
+opt-level = 2

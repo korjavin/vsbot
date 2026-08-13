@@ -10,3 +10,9 @@ repository.workspace = true
 [dependencies]
 virus-core = { workspace = true }
 virus-eval = { workspace = true }
+
+[dev-dependencies]
+# Only the node-budget parity fixture needs its own record type; the search
+# fixture's lives in virus-core so every crate can replay the same records.
+serde = { workspace = true }
+serde_json = { workspace = true }
