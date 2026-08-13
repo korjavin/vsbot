@@ -39,6 +39,8 @@ services:
 
       # GREEDY is the only engine that starts today (see the note above).
       SEARCH: ${SEARCH:-MCTS}
+      # Absolute path: the image bakes artifacts under /opt/vsbot but runs from /home/vsbot.
+      MCTS_ARTIFACT: ${MCTS_ARTIFACT:-/opt/vsbot/artifacts/mcts_champion.json}
 
       # Wall-clock budget per action. The owner's UX bound is 10-15 s for a
       # 3-action turn (docs), so keep this comfortably under ~3 s.
