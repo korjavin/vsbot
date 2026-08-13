@@ -34,6 +34,9 @@ unparseable value **fails startup** instead of quietly falling back.
 | `SEARCH` | `MCTS` | `GREEDY` \| `ALPHABETA` \| `MCTS`. `MCTS` is the default (compose and image agree). `ALPHABETA` aborts startup — the crate is merged but not yet wired into the binary. |
 | `CHALLENGER` | `false` | Whether the bot initiates games on a timer. **Keep this `false` in production** (see below). |
 | `CHALLENGER_INTERVAL_SECS` | `300` | Challenger period; first tick is jittered. Irrelevant while `CHALLENGER=false`. |
+| `VSBOT_EXPLORE_EPS` | `0` *(off)* | **Measurement harness only — never set this in production.** Probability that an opening action is replaced by a uniformly random legal one, i.e. the bot playing *deliberately worse* so a cross-play run's games differ from each other (bd `vsbot-t3q.2`, `crates/vsbot/src/explore.rs`). At `0` no RNG is interposed at all. Refused together with `VSBOT_PONDER=true`. |
+| `VSBOT_EXPLORE_TURNS` | `8` | Length of that window, counted in the bot's **own** turns. Inert while `VSBOT_EXPLORE_EPS=0`. |
+| `VSBOT_EXPLORE_SEED` | `1` | Base seed for the per-game exploration stream. Inert while `VSBOT_EXPLORE_EPS=0`. |
 
 ### Budget profiles
 
