@@ -26,10 +26,30 @@ unparseable value **fails startup** instead of quietly falling back.
 | --- | --- | --- |
 | `BACKEND_URL` | `ws://localhost:8080/ws` | WebSocket endpoint. The binary appends `?bot=true` and `&namePrefix=…` itself — do not put them in the URL. |
 | `BOT_NAME_PREFIX` | *(empty)* | Prefixed onto the server-assigned name. Compose sets `SuperiorBot`, which the lobby shows as e.g. `SuperiorBot Bot 2127`. |
-| `MOVE_MILLIS` | `1000` | Wall-clock budget per action. The owner's UX bound is 10–15 s for a 3-action turn, so stay well under ~3000. |
-| `SEARCH` | `GREEDY` | `GREEDY` \| `ALPHABETA` \| `MCTS`. The latter two abort startup until their crates land. |
+| `VSBOT_TURN_MILLIS` | `12000` | Wall-clock budget for a whole **3-action turn**, split 50/30/20 across the turn's actions. This is the number the owner's 10–15 s UX bound is expressed in; the server's 120 s per-action timer is a failsafe, never a budget. |
+| `VSBOT_MOVE_MILLIS` | *(unset)* | Per-action override. Setting it **disables the intra-turn allocator** — every action gets exactly this, nothing is banked or released. Use it for gauntlets and A/Bs, not for live play. |
+| `MOVE_MILLIS` | *(unset)* | The pre-allocator spelling of `VSBOT_MOVE_MILLIS`, still honoured so an existing `.env` keeps meaning what it meant. If both are set, `VSBOT_MOVE_MILLIS` wins. |
+| `VSBOT_EARLY_STOP` | `true` | Stop as soon as the visit leader cannot be overtaken in what is left of the budget, and give the remainder to the next action. |
+| `VSBOT_EXTENSION` | `true` | Run past an action's target toward its ceiling while the root is unstable. The ceiling is capped by what remains of the turn, so extensions can never break the turn bound. |
+| `VSBOT_PONDER` | `false` | Search the opponent's positions during their turn, re-rooting into the matched child on each of their actions. **Canary-first**: a pondering bot is a behaviour change only the owner promotes (superiority.md Gate C). |
+| `VSBOT_PONDER_SECS` | `30` | Cap on one pondering step. Bounds CPU and tree memory on a host shared with the nightly trainer window. |
+| `SEARCH` | `GREEDY` | `GREEDY` \| `ALPHABETA` \| `MCTS`. `ALPHABETA` aborts startup until its crate is wired. |
 | `CHALLENGER` | `false` | Whether the bot initiates games on a timer. **Keep this `false` in production** (see below). |
 | `CHALLENGER_INTERVAL_SECS` | `300` | Challenger period; first tick is jittered. Irrelevant while `CHALLENGER=false`. |
+
+### Budget profiles
+
+| Profile | Environment | Why |
+| --- | --- | --- |
+| **Deployed default** | *(nothing)* | 12 s/turn ≈ 6 s / 3.6 s / 2.4 s. Inside the owner's UX bound with margin for WS round-trip and snapshot revalidation. |
+| **Owner canary** | `VSBOT_TURN_MILLIS=15000`, `VSBOT_PONDER=true` | Top of the bound plus pondering. One candidate per canary; the owner's verdict promotes it. |
+| **Bot gauntlets** | `VSBOT_MOVE_MILLIS=1000` | Gauntlets and the RL gate stay at fixed time per action so results stay comparable. |
+| **Pre-S2 parity** | `VSBOT_MOVE_MILLIS=1000`, `VSBOT_EARLY_STOP=false`, `VSBOT_EXTENSION=false` | Exactly what shipped before the time manager, for an A/B. |
+
+Two counters to watch in the logs (`Counters` in `virus-proto`): `fallback_actions`
+must stay **zero** — a non-zero value means an action blew through its ceiling
+and was answered with the pre-selected fallback instead of a searched move — and
+`illegal_moves` must stay zero, as always.
 
 Compose-only knobs (consumed by `docker-compose.yml`, not by the binary):
 
@@ -71,7 +91,9 @@ docker compose logs -f vsbot          # watch it register
 A healthy start looks like:
 
 ```
-vsbot 0.1.0 starting: url=wss://vs.wandergeek.org/ws search=GREEDY move_budget=1s challenger=false
+vsbot 0.1.0 starting: url=wss://vs.wandergeek.org/ws search=MCTS challenger=false
+vsbot: budget=12000ms/turn split 50/30/20 across up to 3 actions (early-stop=true, extension=true) ponder=off
+vsbot: engine=MCTS artifact=/opt/vsbot/artifacts/mcts_champion.json …
 [vsbot] connected to wss://vs.wandergeek.org/ws?bot=true&namePrefix=SuperiorBot
 [SuperiorBot Bot 2127] registered as SuperiorBot Bot 2127 (d6c2f97a-…)
 ```
@@ -86,7 +108,8 @@ Overrides go in a `.env` file next to `docker-compose.yml` (it is gitignored):
 
 ```
 BOT_NAME_PREFIX=SuperiorBot
-MOVE_MILLIS=1500
+VSBOT_TURN_MILLIS=12000
+VSBOT_PONDER=false
 VSBOT_TAG=latest
 ```
 

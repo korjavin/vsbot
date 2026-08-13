@@ -4,6 +4,7 @@
 //! in this crate reads `std::env` — CLAUDE.md keeps env parsing in exactly one
 //! place so a deployment can be reasoned about from a single function.
 
+use crate::clock::{StopPolicy, TurnAllocator};
 use std::time::Duration;
 
 /// Everything the client needs to run.
@@ -14,8 +15,33 @@ pub struct BotConfig {
     pub backend_url: String,
     /// Prefixed onto the server-assigned bot name. Empty means "no prefix".
     pub name_prefix: String,
-    /// Wall-clock budget per action.
-    pub move_budget: Duration,
+    /// Wall-clock budget for a whole three-action turn, split across its actions
+    /// by [`TurnAllocator`].
+    ///
+    /// This — not the per-action figure — is the number the owner's UX bound is
+    /// expressed in (10-15 s per turn, owner directive 2026-08-13). The server's
+    /// 120 s per-action timer is a failsafe, never a budget.
+    pub turn_budget: Duration,
+    /// Per-action override. `Some` **disables the allocator**: every action gets
+    /// exactly this, and nothing is banked or released.
+    ///
+    /// `None` is the deployed default and means "allocate [`BotConfig::turn_budget`]".
+    pub move_budget: Option<Duration>,
+    /// Which visit-based stop rules the engine applies inside its allocation.
+    pub stop_policy: StopPolicy,
+    /// Whether to think on the opponent's positions during their turn.
+    ///
+    /// Off by default: pondering is a behaviour change the owner judges, so it
+    /// ships canary-first (superiority.md Gate C).
+    pub ponder: bool,
+    /// How long one pondering step may run before the session parks.
+    ///
+    /// A cap on memory as much as on time: the tree grows with every simulation
+    /// and the production host shares CPU with the nightly trainer window.
+    pub ponder_budget: Duration,
+    /// Grace on top of an action's ceiling before the client stops waiting for
+    /// the engine and plays its pre-selected fallback.
+    pub fallback_grace: Duration,
     /// Whether this instance initiates games (challenger mode).
     pub challenger: bool,
     /// How often the challenger's timer fires. The timer is the *sole* send
@@ -47,7 +73,12 @@ impl Default for BotConfig {
         BotConfig {
             backend_url: "ws://localhost:8080/ws".to_owned(),
             name_prefix: String::new(),
-            move_budget: Duration::from_millis(1000),
+            turn_budget: Duration::from_millis(12_000),
+            move_budget: None,
+            stop_policy: StopPolicy::default(),
+            ponder: false,
+            ponder_budget: Duration::from_secs(30),
+            fallback_grace: Duration::from_millis(500),
             challenger: false,
             challenge_interval: Duration::from_secs(300),
             challenge_rows: 12,
@@ -57,6 +88,35 @@ impl Default for BotConfig {
             stable_session: Duration::from_secs(30),
             pending_game_grace: Duration::from_secs(15),
             rng_seed: None,
+        }
+    }
+}
+
+impl BotConfig {
+    /// The allocator this configuration implies: a per-action override when
+    /// [`BotConfig::move_budget`] is set, the turn splitter otherwise.
+    ///
+    /// One function so the override can never be half-applied.
+    pub fn allocator(&self) -> TurnAllocator {
+        match self.move_budget {
+            Some(budget) => TurnAllocator::fixed(budget),
+            None => TurnAllocator::new(self.turn_budget),
+        }
+    }
+
+    /// One line describing the time budget, for the startup banner.
+    pub fn budget_summary(&self) -> String {
+        match self.move_budget {
+            Some(budget) => format!(
+                "budget=fixed {}ms/action (allocator disabled by the per-action override)",
+                budget.as_millis()
+            ),
+            None => format!(
+                "budget={}ms/turn split 50/30/20 across up to 3 actions (early-stop={}, extension={})",
+                self.turn_budget.as_millis(),
+                self.stop_policy.early_stop,
+                self.stop_policy.extension,
+            ),
         }
     }
 }

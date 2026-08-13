@@ -56,10 +56,9 @@ COPY --from=builder /build/target/release/vsbot /usr/local/bin/vsbot
 
 # Trained artifacts, baked in so a future MCTS deployment does not have to
 # mount a volume. NOTE (2026-08-13): the `vsbot` binary has **no config surface
-# for these yet** — it reads BACKEND_URL / BOT_NAME_PREFIX / MOVE_MILLIS /
-# SEARCH / CHALLENGER / CHALLENGER_INTERVAL_SECS and nothing else. These files
-# are staged here for when `virus-mcts` lands and gains an artifact-path knob.
-# See DEPLOY.md; do not assume setting some env var activates them today.
+# `MCTS_ARTIFACT` points at them (docker-compose.yml sets the absolute path,
+# because the image bakes them under /opt/vsbot but runs from /home/vsbot).
+# DEPLOY.md carries the full knob table.
 COPY artifacts /opt/vsbot/artifacts
 
 USER vsbot
@@ -70,7 +69,8 @@ WORKDIR /home/vsbot
 # the production values.
 ENV BACKEND_URL=ws://localhost:8080/ws \
     SEARCH=GREEDY \
-    MOVE_MILLIS=1000 \
+    VSBOT_TURN_MILLIS=12000 \
+    VSBOT_PONDER=false \
     CHALLENGER=false
 
 ENTRYPOINT ["/usr/local/bin/vsbot"]

@@ -96,7 +96,7 @@ impl SearchEngine for FixedEngine {
 
 fn config() -> Arc<BotConfig> {
     Arc::new(BotConfig {
-        move_budget: Duration::from_millis(50),
+        move_budget: Some(Duration::from_millis(50)),
         ..BotConfig::default()
     })
 }

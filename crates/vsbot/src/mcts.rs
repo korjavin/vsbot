@@ -19,8 +19,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use virus_core::State;
+use virus_core::{Action, State};
 use virus_mcts::{Config, MctsSearcher, NetError, PolicyValueNet, ValueSource, BOARD};
+use virus_proto::clock::{verdict, MoveAllocation, RootProgress};
+use virus_proto::ponder::{PonderInbox, PonderStep};
 use virus_proto::{GreedyEngine, SearchBudget, SearchEngine, SearchOutcome};
 
 /// Longest uninterrupted stretch of simulations.
@@ -31,10 +33,35 @@ use virus_proto::{GreedyEngine, SearchBudget, SearchEngine, SearchOutcome};
 /// superseded position's answer is worthless the instant a newer snapshot
 /// lands). 20 ms is short enough to drop a stale search promptly and long
 /// enough that the polling itself costs nothing.
+///
+/// The slice is also where the intra-turn stop rules
+/// ([`virus_proto::clock::verdict`]) are evaluated, so it doubles as the
+/// resolution of the early-stop and extension decisions.
 const CANCEL_POLL_SLICE: Duration = Duration::from_millis(20);
 
 /// Sentinel for "no position shape has been logged yet".
 const NO_SHAPE: u64 = u64::MAX;
+
+/// Simulations one pondering session's tree may accumulate.
+///
+/// A node owns a whole `State`, so an uncapped ponder against an opponent who
+/// thinks for minutes would grow without bound on a host that shares CPU and
+/// memory with the nightly trainer window (superiority.md §2b). At roughly
+/// 1.5 KB a node this is ~75 MB of ceiling, and it is far more simulations than
+/// a 12 s turn can spend anyway.
+const PONDER_SIM_CAP: u64 = 50_000;
+
+/// How many of the opponent's actions a ponder tree will chase before giving up
+/// and rebuilding.
+///
+/// One turn. Beyond that the snapshots we missed are numerous enough that the
+/// tree is unlikely to hold the position, and the search for it stops being
+/// cheap.
+const MAX_REROOT_PLIES: usize = 3;
+
+/// Ceiling on `apply` calls spent looking for a re-root path, so a pathological
+/// position cannot turn tree reuse into a stall.
+const REROOT_APPLY_BUDGET: usize = 4_096;
 
 /// PUCT search over the policy/value artifact, with a greedy safety net for
 /// positions outside the searcher's domain.
@@ -153,24 +180,109 @@ impl SearchEngine for MctsEngine {
             return GreedyEngine.choose(state, budget);
         }
 
+        // The clock starts before the root expansion, because the root
+        // expansion is a net forward and the allocation has to cover it.
+        let started = Instant::now();
         let mut searcher = MctsSearcher::new(state.clone(), self.config, Some(&self.net));
-        // A terminal root is left unexpanded, and `run_until_deadline` returns
-        // immediately for one. Without this guard the loop below would spin hot
-        // for the whole move budget doing nothing.
-        if !searcher.root_actions().is_empty() {
-            // Do-while: `run_until_deadline` always runs at least one
-            // simulation, so even an already-expired budget returns a searched
-            // move rather than the first enumerated one.
-            loop {
-                let now = Instant::now();
-                let slice = CANCEL_POLL_SLICE.min(budget.deadline.saturating_duration_since(now));
-                searcher.run_until_deadline(now + slice);
-                if budget.is_cancelled() || Instant::now() >= budget.deadline {
-                    break;
-                }
-            }
-        }
+        drive(&mut searcher, budget, started, u64::MAX, || false);
+        self.harvest(state, &searcher, budget)
+    }
 
+    /// Prior argmax over the legal mask.
+    ///
+    /// The net's own first guess, restricted to the moves that exist — one
+    /// forward pass, no simulations. Held by the client *before* the long
+    /// search starts, so an overrun costs a policy move instead of a forfeit.
+    fn fallback(&self, state: &State) -> Option<Action> {
+        if !self.in_domain(state) {
+            return GreedyEngine.fallback(state);
+        }
+        let searcher = MctsSearcher::new(state.clone(), self.config, Some(&self.net));
+        prior_argmax(&searcher).or_else(|| state.legal_actions().first().copied())
+    }
+
+    fn can_ponder(&self) -> bool {
+        true
+    }
+
+    /// One tree, carried across the opponent's actions and into our own turn.
+    ///
+    /// The loop parks on [`PonderInbox::next`] between positions, so an idle
+    /// session costs a parked blocking thread and no CPU. It has no outbox: the
+    /// only value it can produce is the reply to a [`PonderStep::Answer`], which
+    /// the client only ever sends off the authoritative turn driver.
+    fn ponder(&self, inbox: &PonderInbox) {
+        // `(root position, tree rooted at it)`. The position is tracked
+        // alongside because re-rooting has to know which action of the current
+        // root leads to the new snapshot, and the searcher does not expose its
+        // root state.
+        let mut tree: Option<(State, MctsSearcher<'_>)> = None;
+        let mut pending = inbox.next();
+
+        while let Some(step) = pending.take() {
+            let started = Instant::now();
+            let (state, budget, reply) = match step {
+                PonderStep::Think { state, budget } => (state, budget, None),
+                PonderStep::Answer {
+                    state,
+                    budget,
+                    reply,
+                } => (state, budget, Some(reply)),
+            };
+
+            let reused = tree
+                .as_mut()
+                .is_some_and(|(root, searcher)| reroot(root, searcher, &state));
+            if !reused {
+                tree = self.in_domain(&state).then(|| {
+                    (
+                        state.clone(),
+                        MctsSearcher::new(state.clone(), self.config, Some(&self.net)),
+                    )
+                });
+            }
+
+            let mut interrupt = None;
+            if let Some((_, searcher)) = tree.as_mut() {
+                let cap = searcher.sims_run().saturating_add(PONDER_SIM_CAP);
+                drive(searcher, &budget, started, cap, || {
+                    if interrupt.is_none() {
+                        interrupt = inbox.try_next();
+                    }
+                    interrupt.is_some()
+                });
+            }
+
+            // Answer whatever the step asked for *before* moving on, even when
+            // a newer snapshot interrupted us: the client's version guard is
+            // what decides whether the answer is still usable, and leaving the
+            // reply channel dangling would make the client wait out its
+            // fallback timer for nothing.
+            if let Some(reply) = reply {
+                let outcome = tree
+                    .as_ref()
+                    .and_then(|(_, searcher)| self.harvest(&state, searcher, &budget));
+                let _ = reply.send(outcome);
+            }
+
+            pending = interrupt.or_else(|| inbox.next());
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "mcts"
+    }
+}
+
+impl MctsEngine {
+    /// Turns a finished search into an outcome, with the greedy engine as the
+    /// last line of defence.
+    fn harvest(
+        &self,
+        state: &State,
+        searcher: &MctsSearcher<'_>,
+        budget: &SearchBudget,
+    ) -> Option<SearchOutcome> {
         let Some(action) = searcher.best_action() else {
             // Terminal or stuck root. Greedy returns `None` for the same
             // reason, so agreement is silent; disagreement is not.
@@ -203,10 +315,158 @@ impl SearchEngine for MctsEngine {
             nodes: searcher.sims_run() as i64,
         })
     }
+}
 
-    fn name(&self) -> &'static str {
-        "mcts"
+/// Runs `searcher` under `budget`, applying the intra-turn stop rules between
+/// simulation slices.
+///
+/// The rules themselves live in `virus_proto::clock` as pure functions; this is
+/// only the plumbing that samples the root and acts on the verdict.
+/// `interrupted` lets a pondering session abandon a superseded position without
+/// waiting for its cancellation token, and `sim_cap` bounds the tree.
+fn drive(
+    searcher: &mut MctsSearcher<'_>,
+    budget: &SearchBudget,
+    started: Instant,
+    sim_cap: u64,
+    mut interrupted: impl FnMut() -> bool,
+) {
+    // A terminal root is left unexpanded, and `run_until_deadline` returns
+    // immediately for one. Without this guard the loop would spin hot for the
+    // whole budget doing nothing.
+    if searcher.root_actions().is_empty() {
+        return;
     }
+    let allocation = MoveAllocation {
+        target: budget.deadline.saturating_duration_since(started),
+        ceiling: budget.ceiling.saturating_duration_since(started),
+    };
+    let sims_before = searcher.sims_run();
+    let halfway = started + allocation.target / 2;
+    let mut leader_at_halfway: Option<usize> = None;
+    let mut leader_changed_late = false;
+
+    // Do-while: `run_until_deadline` always runs at least one simulation, so
+    // even an already-expired budget returns a searched move rather than the
+    // first enumerated one.
+    loop {
+        let now = Instant::now();
+        let slice = CANCEL_POLL_SLICE.min(budget.ceiling.saturating_duration_since(now));
+        searcher.run_until_deadline(now + slice);
+        if budget.is_cancelled() || interrupted() || searcher.sims_run() >= sim_cap {
+            return;
+        }
+
+        let now = Instant::now();
+        if now >= halfway {
+            let leader = leader_index(searcher.root_visits());
+            match leader_at_halfway {
+                None => leader_at_halfway = Some(leader),
+                Some(earlier) if earlier != leader => leader_changed_late = true,
+                Some(_) => {}
+            }
+        }
+        let progress = RootProgress::from_visits(
+            searcher.root_visits(),
+            searcher.sims_run() - sims_before,
+            leader_changed_late,
+        );
+        if verdict(
+            progress,
+            now.saturating_duration_since(started),
+            allocation,
+            &budget.policy,
+        )
+        .is_stop()
+        {
+            return;
+        }
+    }
+}
+
+/// Index of the most-visited root action, ties broken by enumeration order —
+/// the same rule [`MctsSearcher::best_action`] uses, so "the leader changed"
+/// means "the move would have changed".
+fn leader_index(visits: &[u32]) -> usize {
+    let mut best = 0;
+    for (index, count) in visits.iter().enumerate() {
+        if *count > visits[best] {
+            best = index;
+        }
+    }
+    best
+}
+
+/// The highest-prior legal root action, ties broken by enumeration order.
+fn prior_argmax(searcher: &MctsSearcher<'_>) -> Option<Action> {
+    let actions = searcher.root_actions();
+    let priors = searcher.root_priors();
+    let mut best: Option<usize> = None;
+    for index in 0..actions.len().min(priors.len()) {
+        if best.is_none_or(|current| priors[index] > priors[current]) {
+            best = Some(index);
+        }
+    }
+    best.map(|index| actions[index])
+}
+
+/// Re-roots `searcher` onto `target`, following the actions that lead there.
+///
+/// Returns `false` — leaving the tree at whatever root it reached — when
+/// `target` is not within [`MAX_REROOT_PLIES`] of the current root, or when one
+/// of the actions on the way was never expanded into a node. The caller then
+/// builds a fresh searcher, which is exactly what happened before pondering
+/// existed.
+fn reroot(root: &mut State, searcher: &mut MctsSearcher<'_>, target: &State) -> bool {
+    if root == target {
+        return true;
+    }
+    let mut spent = 0;
+    let Some(path) = path_to(root, target, MAX_REROOT_PLIES, &mut spent) else {
+        return false;
+    };
+    for action in path {
+        let Ok(next) = root.apply(action) else {
+            return false;
+        };
+        if !searcher.rebase(action) {
+            return false;
+        }
+        *root = next;
+    }
+    true
+}
+
+/// The shortest action sequence from `from` to `target`, at most `plies` long.
+///
+/// Depth-first with an `apply` budget: the branching factor is ~34, so an
+/// unbounded search would be a stall waiting to happen on a position the tree
+/// simply does not contain.
+fn path_to(from: &State, target: &State, plies: usize, spent: &mut usize) -> Option<Vec<Action>> {
+    if plies == 0 {
+        return None;
+    }
+    // The hash is a cheap reject; equality is the decision. `moves_left` and the
+    // mover are part of the hash, so a same-board different-turn position does
+    // not collide with the one we want.
+    for action in from.legal_actions() {
+        if *spent >= REROOT_APPLY_BUDGET {
+            return None;
+        }
+        *spent += 1;
+        let Ok(next) = from.apply(action) else {
+            continue;
+        };
+        if next.hash() == target.hash() && next == *target {
+            return Some(vec![action]);
+        }
+        if let Some(mut rest) = path_to(&next, target, plies - 1, spent) {
+            let mut path = vec![action];
+            path.append(&mut rest);
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Packs a position's domain-relevant shape into one comparable word.
@@ -219,6 +479,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+    use virus_proto::ponder::PonderInbox;
 
     /// The in-repo champion, resolved from the crate rather than the CWD so the
     /// test runs from anywhere.
@@ -375,5 +636,237 @@ mod tests {
         // move; this is the compile-time proof that the adapter fits.
         let engine: Arc<dyn SearchEngine> = Arc::new(engine());
         assert_eq!(engine.name(), "mcts");
+    }
+
+    // ------------------------------------------------------- fallback-first
+
+    /// The fallback is the net's own first guess restricted to the legal mask.
+    /// It has to be legal — it is played verbatim when the search overruns.
+    #[test]
+    fn the_fallback_is_the_prior_argmax_over_the_legal_mask() {
+        let engine = engine();
+        let state = State::new(12, 12, 2).expect("a legal opening position");
+        let chosen = engine
+            .fallback(&state)
+            .expect("the opening has legal moves");
+        assert!(state.legal_actions().contains(&chosen));
+
+        // Same thing, computed the long way: the highest-prior root action.
+        let searcher = MctsSearcher::new(state.clone(), engine.config, Some(&engine.net));
+        let priors = searcher.root_priors();
+        let best = priors.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let index = searcher
+            .root_actions()
+            .iter()
+            .position(|action| *action == chosen)
+            .expect("the fallback is a root action");
+        assert_eq!(priors[index], best, "the fallback must be the prior argmax");
+    }
+
+    /// The fallback must be cheap — the client holds it before the long search
+    /// starts, and a slow one would defeat the whole point.
+    #[test]
+    fn the_fallback_costs_about_one_forward_pass() {
+        let engine = engine();
+        let state = State::new(12, 12, 2).expect("a legal opening position");
+        let started = Instant::now();
+        assert!(engine.fallback(&state).is_some());
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "fallback selection took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Out of the searcher's domain the fallback still answers, and legally.
+    #[test]
+    fn the_fallback_survives_an_out_of_domain_position() {
+        let engine = engine();
+        for state in [
+            State::new(12, 12, 3).expect("3p"),
+            State::new(10, 10, 2).expect("10x10"),
+        ] {
+            let chosen = engine.fallback(&state).expect("a legal action exists");
+            assert!(state.legal_actions().contains(&chosen));
+        }
+    }
+
+    // ---------------------------------------------------------- stop rules
+
+    /// The ceiling is the last word. An engine that ran past it would eat the
+    /// rest of the turn's bank and, three actions running, the owner's UX bound.
+    #[test]
+    fn a_search_never_runs_past_its_ceiling() {
+        let engine = engine();
+        let state = State::new(12, 12, 2).expect("a legal opening position");
+        let started = Instant::now();
+        let budget = SearchBudget {
+            deadline: started + Duration::from_millis(60),
+            ceiling: started + Duration::from_millis(150),
+            policy: virus_proto::StopPolicy::default(),
+            cancel: CancellationToken::new(),
+        };
+        let outcome = engine.choose(&state, &budget).expect("an action");
+        let elapsed = started.elapsed();
+        assert!(state.legal_actions().contains(&outcome.action));
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "the search ran {elapsed:?} against a 150ms ceiling"
+        );
+    }
+
+    /// The rules are opt-in through the budget: a `SearchBudget::new` budget
+    /// carries `StopPolicy::off()` and no extension room, which is exactly the
+    /// pre-allocator behaviour every existing caller depends on.
+    #[test]
+    fn a_plain_budget_keeps_the_pre_allocator_behaviour() {
+        let budget = SearchBudget::new(
+            Instant::now() + Duration::from_millis(80),
+            CancellationToken::new(),
+        );
+        assert_eq!(budget.ceiling, budget.deadline);
+        assert!(!budget.policy.early_stop);
+        assert!(!budget.policy.extension);
+
+        let engine = engine();
+        let state = State::new(12, 12, 2).expect("a legal opening position");
+        let outcome = engine.choose(&state, &budget).expect("an action");
+        assert!(state.legal_actions().contains(&outcome.action));
+        assert!(outcome.nodes > 0);
+    }
+
+    // ------------------------------------------------------------- pondering
+
+    /// The reason pondering is worth anything: the tree built during the
+    /// opponent's turn is *the same tree* that answers our turn.
+    ///
+    /// `nodes` reports `sims_run`, which a fresh searcher starts at zero. So an
+    /// answer carrying far more simulations than its own budget could have run
+    /// is direct evidence that the opponent's turn was not thrown away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ponder_session_carries_its_tree_into_our_turn() {
+        let engine = Arc::new(engine());
+        assert!(engine.can_ponder());
+
+        // We are seat 2. Seat 1 spends a turn; we think through all of it.
+        let mut state = State::new(12, 12, 2).expect("a legal opening position");
+        let (steps, inbox) = PonderInbox::channel();
+        let session = {
+            let engine = Arc::clone(&engine);
+            tokio::task::spawn_blocking(move || engine.ponder(&inbox))
+        };
+
+        let think = |state: &State| PonderStep::Think {
+            state: state.clone(),
+            budget: SearchBudget::new(
+                Instant::now() + Duration::from_millis(120),
+                CancellationToken::new(),
+            ),
+        };
+
+        steps.send(think(&state)).expect("the session is alive");
+        while state.current_player() == 1 {
+            let action = state
+                .legal_actions()
+                .first()
+                .copied()
+                .expect("seat 1 has a move");
+            state = state.apply(action).expect("legal");
+            tokio::time::sleep(Duration::from_millis(140)).await;
+            steps.send(think(&state)).expect("the session is alive");
+        }
+        assert_eq!(state.current_player(), 2, "it is our turn now");
+        tokio::time::sleep(Duration::from_millis(140)).await;
+
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        steps
+            .send(PonderStep::Answer {
+                state: state.clone(),
+                budget: SearchBudget::new(
+                    Instant::now() + Duration::from_millis(40),
+                    CancellationToken::new(),
+                ),
+                reply,
+            })
+            .expect("the session is alive");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("the session answers")
+            .expect("the reply channel is open")
+            .expect("the position has legal moves");
+
+        assert!(
+            state.legal_actions().contains(&outcome.action),
+            "a pondered answer must still be legal in the position it answers"
+        );
+
+        // A cold search under the same 40 ms budget, for comparison.
+        let cold = engine
+            .choose(
+                &state,
+                &SearchBudget::new(
+                    Instant::now() + Duration::from_millis(40),
+                    CancellationToken::new(),
+                ),
+            )
+            .expect("an action");
+        assert!(
+            outcome.nodes > cold.nodes,
+            "the pondered answer ran {} simulations against a cold {} — the tree was \
+             rebuilt, not re-rooted",
+            outcome.nodes,
+            cold.nodes
+        );
+
+        drop(steps);
+        session.await.expect("the session exits when its steps end");
+    }
+
+    /// Dropping the client's end ends the session. Without this a finished game
+    /// would leak a parked blocking worker per game, for the life of the bot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ponder_session_exits_when_its_channel_closes() {
+        let engine = Arc::new(engine());
+        let (steps, inbox) = PonderInbox::channel();
+        let session = tokio::task::spawn_blocking(move || engine.ponder(&inbox));
+        drop(steps);
+        tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .expect("the session must exit promptly")
+            .expect("and without panicking");
+    }
+
+    /// A ponder step for a position outside the searcher's domain must not reach
+    /// the searcher's asserts — a panicking session would take a blocking worker
+    /// down mid-game.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ponder_session_declines_an_out_of_domain_position() {
+        let engine = Arc::new(engine());
+        let (steps, inbox) = PonderInbox::channel();
+        let session = tokio::task::spawn_blocking(move || engine.ponder(&inbox));
+
+        let state = State::new(12, 12, 3).expect("a legal three-player position");
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        steps
+            .send(PonderStep::Answer {
+                state,
+                budget: SearchBudget::new(
+                    Instant::now() + Duration::from_millis(20),
+                    CancellationToken::new(),
+                ),
+                reply,
+            })
+            .expect("the session is alive");
+        let answered = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("the session answers rather than panicking")
+            .expect("the reply channel is open");
+        assert!(
+            answered.is_none(),
+            "an out-of-domain position has no pondered answer; the client falls back"
+        );
+
+        drop(steps);
+        session.await.expect("the session survived");
     }
 }

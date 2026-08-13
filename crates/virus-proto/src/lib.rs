@@ -10,6 +10,10 @@
 //! * [`engine`] — the [`SearchEngine`] seam. Everything strength-related plugs
 //!   in here; this crate ships only [`GreedyEngine`], deliberately weak, so the
 //!   protocol can be exercised end-to-end before the real engines land.
+//! * [`clock`] — the intra-turn time allocator and the visit-based stop rules.
+//!   Pure functions, so the time manager is testable without a wall clock.
+//! * [`ponder`] — the seam for thinking on the opponent's positions. A session
+//!   has no outbox and cannot emit an action; see the module docs.
 //! * [`bot`] — the state machine. Transport-free, and where every invariant is
 //!   enforced and tested.
 //! * [`client`] — tokio-tungstenite transport: read loop, guarded writer,
@@ -48,14 +52,18 @@
 
 pub mod bot;
 pub mod client;
+pub mod clock;
 pub mod config;
 pub mod engine;
 pub mod message;
+pub mod ponder;
 
 pub use bot::{ActionGuard, Bot, BotCore, Counters, Driver, Outbound, Phase};
 pub use client::{run_forever, run_session, ProtoError};
+pub use clock::{MoveAllocation, RootProgress, StopPolicy, TurnAllocator, Verdict};
 pub use config::{connect_url, BotConfig, Rng};
 pub use engine::{
     EngineKind, GreedyEngine, SearchBudget, SearchEngine, SearchOutcome, UnknownEngine,
 };
 pub use message::{CellPos, Diagnostics, Inbound, Outgoing, UserInfo};
+pub use ponder::{PonderInbox, PonderStep};
