@@ -50,11 +50,17 @@
 //! consecutive seeds safely.
 //!
 //! Given a seed, the *exploration schedule* — which of our plies are overridden,
-//! and by which legal action — is a pure function of `(seed, game index, ply)`
-//! and consults no clock. The games themselves are not reproducible, and cannot
-//! be: a fixed-time MCTS run against a live opponent is a wall-clock
-//! measurement. Reproducible noise on an unreproducible run is exactly what the
-//! arena has too.
+//! and by which legal action — is a pure function of
+//! `(seed, game index, position)` and consults no clock. Deriving the coin from
+//! the position rather than from a running stream is what makes that true in a
+//! client: `choose` runs on blocking workers, a superseded search can still be
+//! in flight when its replacement starts, and a sequential stream would make the
+//! schedule depend on which of them finished first. It also means a position
+//! asked about twice always answers the same way.
+//!
+//! The games themselves are not reproducible, and cannot be: a fixed-time MCTS
+//! run against a live opponent is a wall-clock measurement. Reproducible noise
+//! on an unreproducible run is exactly what the arena's `ms:` mode has too.
 
 use std::sync::{Arc, Mutex};
 
@@ -117,9 +123,14 @@ pub fn derive_game_seed(seed: u64, game: u64) -> u64 {
 /// Everything that resets at `game_start`, plus the last position's verdict.
 #[derive(Debug)]
 struct GameState {
-    /// Index of the game being played, for the seed derivation.
+    /// Index of the game being played. Doubles as the **epoch**: a search
+    /// dispatched in one game can still be running when the next one starts, and
+    /// its late answer must not touch the new game's window.
     index: u64,
-    rng: Rng,
+    /// This game's stream seed. The coin for a position is drawn from a stream
+    /// seeded off `(seed, position)`, never from a running stream — see
+    /// [`ExploringEngine::verdict`].
+    seed: u64,
     /// How many of our turns have opened, 1-based. `0` before our first.
     turn: u32,
     /// `moves_left` of the last position we answered, to spot a turn boundary.
@@ -127,12 +138,10 @@ struct GameState {
     /// The last position's Zobrist key and what we decided for it.
     ///
     /// The server sends `move_made` and then `game_state` for the same mid-turn
-    /// position, and a resync can repeat one verbatim. `Bot::maybe_search`'s
-    /// `searched_version` gate stops most of that, but nothing guarantees the
-    /// engine is asked exactly once per position — and a coin re-flipped for a
-    /// position already decided would both advance the stream twice and let the
-    /// same position answer differently on a retry. Memoising the last verdict
-    /// makes the decorator idempotent per position.
+    /// position, and a resync can repeat one verbatim. The verdict for a
+    /// position is a pure function of it, so this is not what makes a repeat
+    /// answer consistently — it is what keeps a repeat from being counted twice
+    /// and from advancing the turn counter.
     decided: Option<(u64, Option<Action>)>,
 }
 
@@ -140,7 +149,7 @@ impl GameState {
     fn opening(index: u64, seed: u64) -> GameState {
         GameState {
             index,
-            rng: Rng::new(derive_game_seed(seed, index)),
+            seed: derive_game_seed(seed, index),
             turn: 0,
             last_moves_left: None,
             decided: None,
@@ -173,10 +182,10 @@ pub struct ExploreCounters {
 pub struct ExploringEngine {
     inner: Arc<dyn SearchEngine>,
     settings: ExploreSettings,
-    /// One mutex for both, because a verdict and the stream it came from must
-    /// not be observed apart. `choose` may be called concurrently for different
-    /// positions (the trait says so), and the lock is held only across a few
-    /// arithmetic operations — never across the inner search.
+    /// One mutex for both, because a verdict and the counters that describe it
+    /// must not be observed apart. `choose` may be called concurrently for
+    /// different positions (the trait says so), and the lock is held only across
+    /// a few arithmetic operations — never across the inner search.
     state: Mutex<(GameState, ExploreCounters)>,
 }
 
@@ -196,9 +205,9 @@ impl ExploringEngine {
         ExploringEngine {
             inner,
             settings,
-            // Game 0's stream is live before any `game_start` arrives, so a
-            // client that somehow searched first would still draw from a seeded
-            // stream rather than from nothing.
+            // Game 0's seed is live before any `game_start` arrives, so a client
+            // that somehow searched first would still draw from a derived seed
+            // rather than from nothing.
             state: Mutex::new((
                 GameState::opening(0, settings.seed),
                 ExploreCounters::default(),
@@ -225,14 +234,39 @@ impl ExploringEngine {
         )
     }
 
+    /// The game index a search starting now belongs to.
+    ///
+    /// Read *before* the inner search and handed back to [`Self::verdict`], so a
+    /// search that was still running when the next game began cannot advance the
+    /// new game's window.
+    fn epoch(&self) -> u64 {
+        self.state.lock().expect("explore state").0.index
+    }
+
     /// The exploration verdict for `state`: `Some(action)` to override with,
     /// `None` to keep the engine's answer.
     ///
     /// Split out from [`SearchEngine::choose`] so the decision is testable
     /// without a budget, a clock or an engine.
-    fn verdict(&self, state: &State) -> Option<Action> {
+    ///
+    /// **The coin is drawn from the position, not from a running stream.** A
+    /// sequential stream would make the schedule depend on the order in which
+    /// concurrent searches happen to finish — `choose` runs on blocking workers
+    /// and a superseded search can still be in flight when its replacement
+    /// starts — and "reproducible given the seed" would then be a claim about
+    /// thread scheduling. Seeding a throwaway stream from
+    /// `mix64(game_seed ^ position)` instead makes the verdict for a position a
+    /// pure function of `(base seed, game index, position)`: order-independent,
+    /// idempotent, and unaffected by a search that was cancelled before it
+    /// answered.
+    fn verdict(&self, state: &State, epoch: u64) -> Option<Action> {
         let mut guard = self.state.lock().expect("explore state");
         let (game, counters) = &mut *guard;
+        if game.index != epoch {
+            // A straggler from a finished game. Its answer is about to be
+            // dropped by the client's own guard; it must not count here either.
+            return None;
+        }
         let key = state.hash();
         if let Some((seen, decision)) = game.decided {
             if seen == key {
@@ -255,18 +289,14 @@ impl ExploringEngine {
         game.last_moves_left = Some(state.moves_left());
 
         let decision = if game.turn > self.settings.turns {
-            // The window is shut. No draw is taken here, so the stream position
-            // stays a function of the window alone.
             counters.past_window += 1;
             None
         } else {
             counters.coins_flipped += 1;
-            if game.rng.next_f64() < self.settings.epsilon {
+            let mut rng = Rng::new(mix64(game.seed ^ key));
+            if rng.next_f64() < self.settings.epsilon {
                 let legal = state.legal_actions();
-                // One draw whether or not it is used, so a position with no
-                // legal action cannot desynchronise the stream.
-                let pick = game.rng.below(legal.len());
-                match pick {
+                match rng.below(legal.len()) {
                     Some(index) => {
                         counters.explored += 1;
                         Some(legal[index])
@@ -284,15 +314,24 @@ impl ExploringEngine {
 
 impl SearchEngine for ExploringEngine {
     fn choose(&self, state: &State, budget: &SearchBudget) -> Option<SearchOutcome> {
+        // Read before the search: it may take a whole turn budget, and the next
+        // game can start inside it.
+        let epoch = self.epoch();
         let searched = self.inner.choose(state, budget);
-        let Some(action) = self.verdict(state) else {
-            return searched;
-        };
-        // Only override an answer the engine actually produced. `None` means
-        // the position was superseded or has no legal move, and inventing an
-        // action for a superseded position would change the client's
-        // cancellation semantics for the sake of a coin flip.
+        // Consult the window only for a ply we are actually going to answer.
+        // `None` means no legal move or a search superseded before it had a
+        // candidate; a cancelled budget means the client has already moved on
+        // and will drop whatever comes back — the overrun path has fired the
+        // token too, and the fallback it plays is deliberately not explored.
+        // Counting either against the window would make the window's length
+        // depend on how often searches were interrupted.
         let searched = searched?;
+        if budget.is_cancelled() {
+            return Some(searched);
+        }
+        let Some(action) = self.verdict(state, epoch) else {
+            return Some(searched);
+        };
         eprintln!(
             "vsbot: exploring — playing a random legal action instead of the searched one \
              (eps={}, window={} of our turns)",
@@ -382,17 +421,22 @@ mod tests {
     }
 
     /// Plays `plies` of our own actions, always taking the engine's answer, and
-    /// returns which of them were explored.
-    fn play(engine: &ExploringEngine, plies: usize) -> Vec<bool> {
+    /// returns `(was it explored, what was played)` for each.
+    ///
+    /// The flag comes from the counter, not from comparing against the inner
+    /// engine's move: at `eps = 1` the uniform draw can legitimately land on the
+    /// very action `Last` would have chosen, and a comparison would score that
+    /// as "not explored".
+    fn play(engine: &ExploringEngine, plies: usize) -> Vec<(bool, Action)> {
         let mut state = board();
         let mut explored = Vec::new();
         for _ in 0..plies {
             if state.game_over() || state.legal_actions().is_empty() {
                 break;
             }
-            let expected = *state.legal_actions().last().expect("legal actions");
+            let before = engine.counters().explored;
             let outcome = engine.choose(&state, &budget()).expect("an action");
-            explored.push(outcome.action != expected);
+            explored.push((engine.counters().explored > before, outcome.action));
             state = state.apply(outcome.action).expect("a legal action");
             // Skip the opponent: this fixture only exercises our own turns, and
             // the decorator only ever sees ours.
@@ -450,11 +494,11 @@ mod tests {
         );
         let boundary = counters.coins_flipped as usize;
         assert!(
-            explored[..boundary].iter().all(|hit| *hit),
+            explored[..boundary].iter().all(|(hit, _)| *hit),
             "every ply inside the window must be random: {explored:?}"
         );
         assert!(
-            explored[boundary..].iter().all(|hit| !*hit),
+            explored[boundary..].iter().all(|(hit, _)| !*hit),
             "no exploration may leak past the window: {explored:?}"
         );
     }
@@ -544,6 +588,80 @@ mod tests {
             counters.coins_flipped,
             "a repeat must not advance the stream"
         );
+    }
+
+    /// A search the client has already given up on must not consume the window.
+    ///
+    /// `choose` runs on a blocking worker; a superseded search and its
+    /// replacement can be in flight together, and the overrun path cancels the
+    /// token before playing an unexplored fallback. If a cancelled ply counted,
+    /// the window's length would depend on how often searches were interrupted.
+    #[test]
+    fn a_cancelled_search_never_consumes_the_window() {
+        let engine = wrapped(ExploreSettings {
+            epsilon: 1.0,
+            turns: 8,
+            seed: 13,
+        });
+        engine.on_game_start();
+        let cancelled = SearchBudget::new(Instant::now() + Duration::from_secs(60), {
+            let token = CancellationToken::new();
+            token.cancel();
+            token
+        });
+        let state = board();
+        let outcome = engine
+            .choose(&state, &cancelled)
+            .expect("the inner engine answered");
+        assert_eq!(
+            outcome.action,
+            *state.legal_actions().last().expect("legal actions"),
+            "a cancelled search must return the engine's own answer untouched"
+        );
+        assert_eq!(
+            engine.counters(),
+            ExploreCounters {
+                games: 1,
+                ..ExploreCounters::default()
+            }
+        );
+
+        // The window is intact: the very next live search still explores.
+        assert_ne!(
+            engine.choose(&state, &budget()).expect("an action").action,
+            *state.legal_actions().last().expect("legal actions")
+        );
+    }
+
+    /// A search still running when the next game starts must not touch the new
+    /// game's window. `epoch` is read before the search and checked after it.
+    #[test]
+    fn a_straggler_from_the_previous_game_cannot_move_the_new_ones_window() {
+        let engine = wrapped(ExploreSettings {
+            epsilon: 1.0,
+            turns: 1,
+            seed: 21,
+        });
+        engine.on_game_start();
+        let state = board();
+        // Stand in for the straggler: a verdict asked for under a stale epoch.
+        let stale = engine.epoch();
+        engine.on_game_start();
+        assert!(
+            engine.verdict(&state, stale).is_none(),
+            "a stale-epoch verdict must decline"
+        );
+        assert_eq!(
+            engine.counters(),
+            ExploreCounters {
+                games: 2,
+                ..ExploreCounters::default()
+            },
+            "and must leave the new game's window untouched"
+        );
+        // The new game still has its whole one-turn window.
+        let explored = play(&engine, 6);
+        assert!(explored[0].0, "the new game's first ply must still explore");
     }
 
     #[test]
