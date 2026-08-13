@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Run several independent ``crossplay`` shards at once and pool the result.
+
+Why shards rather than one big run with more bots
+-------------------------------------------------
+
+``crossplay.py --vsbot-instances N`` buys concurrency badly.  ``vsbot``'s
+challenger picks *any* idle peer (``challenge_tick`` filters on
+``peer.is_idle()`` and nothing else), so with several vsbots in one lobby a
+large share of the games are vsbot-vs-vsbot.  Those are dropped by the name
+filter rather than miscounted, but they are wasted compute — and at 1 s/move
+the compute *is* the run.
+
+A shard is instead a whole private stack: its own server on its own port, one
+``vsbot``, one opponent.  Nothing else is idle in that lobby, so every game
+started is a game that counts, and N shards use N cores with no waste.
+
+Pooling is not just addition
+----------------------------
+
+Games are summed, but **distinct games are unioned**, not summed.  Nothing
+randomises a cross-play opening (bd ``vsbot-t3q.1``), so two shards running the
+identical configuration can easily play the identical games; adding their
+distinct counts would report twice the diversity the run actually has.  The
+pooled report therefore counts unique move-sequence digests across every shard.
+
+Usage::
+
+    python3 crates/virus-arena/crossplay/crossplay_pool.py \\
+        --shards 4 --games 400 --opponent java --direction alternate \\
+        --search MCTS --workdir /tmp/s1
+
+Run it from the repository root.  Any flag it does not recognise is passed
+through to ``crossplay.py`` unchanged, so the shard configuration is exactly the
+single-run configuration.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import crossplay  # noqa: E402
+
+
+def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+    parser = argparse.ArgumentParser(
+        description="run N crossplay shards in parallel and pool the tally",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--shards", type=int, default=4, help="parallel shards")
+    parser.add_argument("--games", type=int, default=400, help="TOTAL games to collect")
+    parser.add_argument(
+        "--workdir", required=True, help="root for the shard workdirs; kept, not cleaned"
+    )
+    parser.add_argument(
+        "--opponent", choices=("go", "java"), default="java", help="rival bot"
+    )
+    parser.add_argument(
+        "--poll-secs", type=int, default=30, help="how often to print pooled progress"
+    )
+    return parser.parse_known_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args, passthrough = parse_args(argv)
+    if args.shards < 1:
+        raise crossplay.Failure("--shards must be at least 1")
+
+    root = Path(args.workdir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    script = Path(__file__).resolve().parent / "crossplay.py"
+
+    # The remainder goes to the first shards, so the pooled total is exactly
+    # --games rather than a multiple of --shards.
+    base, extra = divmod(args.games, args.shards)
+    per_shard = [base + (1 if i < extra else 0) for i in range(args.shards)]
+
+    ours = "RustBot"
+    theirs = "GoBot" if args.opponent == "go" else "JavaBot"
+
+    processes = []
+    workdirs = []
+    for index, games in enumerate(per_shard):
+        if games == 0:
+            continue
+        shard = root / f"shard-{index}"
+        shard.mkdir(parents=True, exist_ok=True)
+        workdirs.append(shard)
+        command = [
+            sys.executable, str(script),
+            "--games", str(games),
+            "--opponent", args.opponent,
+            "--workdir", str(shard),
+            *passthrough,
+        ]
+        log = (shard / "shard.log").open("w")
+        print(f"pool: shard {index} -> {games} game(s) in {shard}", file=sys.stderr)
+        processes.append(subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT))
+        # `crossplay.free_port` binds :0, reads the port and closes again, so two
+        # shards starting in the same instant can be handed the same number and
+        # the second server dies on bind. Staggering costs seconds and removes
+        # the race.
+        time.sleep(3)
+
+    try:
+        while True:
+            pooled = pool(workdirs, ours, theirs)
+            alive = [p for p in processes if p.poll() is None]
+            print(
+                f"  pooled {pooled['total']}/{args.games} | "
+                f"vsbot {pooled['wins']}-{pooled['losses']}-{pooled['draws']} {theirs} | "
+                f"{pooled['distinct']} distinct | {len(alive)} shard(s) running",
+                file=sys.stderr,
+            )
+            if not alive:
+                break
+            time.sleep(args.poll_secs)
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+
+    pooled = pool(workdirs, ours, theirs)
+    report = render(pooled, args, theirs)
+    print(json.dumps(report, indent=2))
+    return 0 if pooled["total"] >= args.games else 1
+
+
+def pool(workdirs: list[Path], ours: str, theirs: str) -> dict:
+    """Sums every shard's tally, unioning the game fingerprints."""
+    total = {
+        key: 0
+        for key in (
+            "wins", "losses", "draws", "as_p1", "as_p2",
+            "wins_p1", "wins_p2", "draws_p1", "draws_p2",
+            "total", "discarded", "red_flags",
+        )
+    }
+    fingerprints: set[str] = set()
+    for shard in workdirs:
+        one = crossplay.tally(shard / "data" / "games.db", 0, ours, theirs)
+        for key in total:
+            total[key] += one[key]
+        fingerprints |= one["fingerprints"]
+    total["distinct"] = len(fingerprints)
+    return total
+
+
+def render(pooled: dict, args, theirs: str) -> dict:
+    games = pooled["total"]
+    low, high = crossplay.wilson95(pooled["wins"], games)
+
+    def rate(wins: int, n: int) -> float:
+        return (100.0 * wins / n) if n else 0.0
+
+    report = {
+        "shards": args.shards,
+        "opponent": theirs,
+        "wins": pooled["wins"],
+        "losses": pooled["losses"],
+        "draws": pooled["draws"],
+        "games": games,
+        "as_p1": pooled["as_p1"],
+        "as_p2": pooled["as_p2"],
+        "win_rate_as_p1": rate(pooled["wins_p1"], pooled["as_p1"]),
+        "win_rate_as_p2": rate(pooled["wins_p2"], pooled["as_p2"]),
+        # The gate quantity: superiority.md S1 wants >= 0.55 here.
+        "pooled_score": (
+            (pooled["wins"] + 0.5 * pooled["draws"]) / games if games else 0.0
+        ),
+        "win_rate": rate(pooled["wins"], games),
+        "wilson95_low": low,
+        "wilson95_high": high,
+        "distinct_games": pooled["distinct"],
+        "discarded_disconnects": pooled["discarded"],
+        "red_flag_terminations": pooled["red_flags"],
+        "verdict": (
+            "INFORMATIONAL ONLY"
+            if games < 100
+            else ("indicative" if games < 400 else "gate-eligible")
+        ),
+    }
+    crossplay.warn_about_seat_imbalance(report)
+    crossplay.warn_about_low_diversity(report)
+    return report
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except crossplay.Failure as error:
+        print(f"pool: {error}", file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        sys.exit(130)

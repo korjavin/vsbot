@@ -207,6 +207,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--json", action="store_true", help="print the result as JSON on stdout"
     )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="check the counting logic against a synthetic db and exit; needs "
+        "no server, no bots and no docker, so CI can run it",
+    )
     return parser.parse_args(argv)
 
 
@@ -466,6 +472,10 @@ def tally(db: Path, baseline: int, ours: str, theirs: str) -> dict:
         # engines play deterministically, so this can be far below `total`; see
         # `warn_about_low_diversity`.
         "distinct": 0,
+        # The digests behind `distinct`. Carried so a multi-shard run can union
+        # them: two shards that each played three distinct games may well have
+        # played the *same* three, and summing `distinct` would hide that.
+        "fingerprints": set(),
     }
     if not db.exists():
         return empty
@@ -484,6 +494,7 @@ def tally(db: Path, baseline: int, ours: str, theirs: str) -> dict:
 
     out = dict(empty)
     fingerprints: set[str] = set()
+    out["fingerprints"] = fingerprints
     for player1, player2, result, termination, pgn in rows:
         our_seat = 1 if (player1 or "").startswith(ours) else 2
         # A bot named with both prefixes would be ambiguous; the prefixes are
@@ -735,11 +746,120 @@ def run_phase(
     return result
 
 
+# ------------------------------------------------------------------ self-test
+
+
+def self_test() -> int:
+    """Exercises the counting logic against a synthetic games.db.
+
+    CI is Rust-only and the real harness needs a Go toolchain, a server
+    checkout and (for the Java arm) docker, so none of it can run there. The
+    parts that decide what a number *means* — seat folding, the disconnect
+    discard, and the distinct-game fingerprint — are pure functions over rows,
+    so they can be checked hermetically in a second. `tests/crossplay.rs` runs
+    this, which is why the tally is covered even though the harness is not.
+    """
+    failures: list[str] = []
+
+    def check(name: str, got, want) -> None:
+        if got != want:
+            failures.append(f"{name}: got {got!r}, want {want!r}")
+
+    def pgn(moves: list[tuple[int, int]], duration: int) -> str:
+        return json.dumps(
+            [
+                {
+                    "turn": 1,
+                    "player": 1,
+                    "moves": [
+                        {"type": "place", "row": r, "col": c, "duration_cs": duration}
+                        for r, c in moves
+                    ],
+                }
+            ]
+        )
+
+    # A replay differs only in how long each move took, and must not be counted
+    # as a different game -- the bug that made 50 replays look like 50 samples.
+    check(
+        "fingerprint ignores duration",
+        game_fingerprint(pgn([(0, 1), (0, 2)], 0)),
+        game_fingerprint(pgn([(0, 1), (0, 2)], 99)),
+    )
+    if game_fingerprint(pgn([(0, 1)], 0)) == game_fingerprint(pgn([(0, 2)], 0)):
+        failures.append("fingerprint: different moves collided")
+    check("fingerprint tolerates junk", game_fingerprint("not json"), "")
+
+    with tempfile.TemporaryDirectory(prefix="crossplay-selftest-") as directory:
+        db = Path(directory) / "games.db"
+        connection = sqlite3.connect(db)
+        connection.execute(
+            "CREATE TABLE games (player1_name TEXT, player2_name TEXT, "
+            "result INTEGER, termination TEXT, pgn_content TEXT)"
+        )
+        replay = pgn([(0, 1)], 0)
+        other = pgn([(5, 5)], 0)
+        connection.executemany(
+            "INSERT INTO games VALUES (?, ?, ?, ?, ?)",
+            [
+                # We are P1 and win.
+                ("RustBot Bot 1", "GoBot Bot 2", 1, "no_moves", replay),
+                # Same game replayed: still a win, but not a second sample.
+                ("RustBot Bot 1", "GoBot Bot 2", 1, "no_moves", replay),
+                # We are P2 and win -- the seat order the Python original dropped.
+                ("GoBot Bot 2", "RustBot Bot 1", 2, "no_moves", other),
+                # We are P2 and lose.
+                ("GoBot Bot 2", "RustBot Bot 1", 1, "no_moves", other),
+                # A draw.
+                ("RustBot Bot 1", "GoBot Bot 2", 0, "no_moves", other),
+                # A forfeit: a real loss, but flagged.
+                ("RustBot Bot 1", "GoBot Bot 2", 2, "timeout", other),
+                # A harness shutdown artifact: discarded, not a result.
+                ("RustBot Bot 1", "GoBot Bot 2", 2, "disconnect", other),
+                # Someone else's game entirely.
+                ("GoBot Bot 2", "GoBot Bot 3", 1, "no_moves", other),
+            ],
+        )
+        connection.commit()
+        connection.close()
+
+        counted = tally(db, 0, "RustBot", "GoBot")
+        check("total", counted["total"], 6)
+        check("wins", counted["wins"], 3)
+        check("losses", counted["losses"], 2)
+        check("draws", counted["draws"], 1)
+        check("as_p1", counted["as_p1"], 4)
+        check("as_p2", counted["as_p2"], 2)
+        check("wins_p1", counted["wins_p1"], 2)
+        check("wins_p2", counted["wins_p2"], 1)
+        check("discarded", counted["discarded"], 1)
+        check("red_flags", counted["red_flags"], 1)
+        # Two `replay` rows plus four `other` rows counted = 2 distinct.
+        check("distinct", counted["distinct"], 2)
+
+        # The rowid baseline must exclude everything already in the table.
+        check("baseline excludes old rows", tally(db, 8, "RustBot", "GoBot")["total"], 0)
+
+    check("wilson95 of nothing", wilson95(0, 0), (0.0, 0.0))
+    low, high = wilson95(5, 10)
+    if not (low < 50.0 < high):
+        failures.append(f"wilson95(5,10) should straddle 50%, got [{low}, {high}]")
+
+    for failure in failures:
+        print(f"self-test FAIL {failure}", file=sys.stderr)
+    if failures:
+        return 1
+    print("crossplay self-test: ok", file=sys.stderr)
+    return 0
+
+
 # ----------------------------------------------------------------------- main
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.self_test:
+        return self_test()
     backend = Path(args.backend).expanduser().resolve()
     vsbot = Path(args.vsbot).resolve()
     if not vsbot.exists():
