@@ -293,8 +293,9 @@ python3 crates/virus-arena/crossplay/crossplay.py --games 50 --search GREEDY --j
 ```json
 { "vsbot_search": "GREEDY", "explore_eps": 0.15, "explore_turns": 8,
   "explore_seed": 20260813, "opponent_explore_eps": 0.0,
-  "wins": 14, "losses": 36, "draws": 0, "games": 50,
-  "as_p1": 50, "as_p2": 0, "win_rate": 28.0,
+  "wins": 11, "losses": 39, "draws": 0, "games": 50,
+  "as_p1": 50, "as_p2": 0, "win_rate": 22.0,
+  "wilson95_low": 12.8, "wilson95_high": 35.2,
   "distinct_games": 50, "red_flag_terminations": 0 }
 ```
 
@@ -302,28 +303,40 @@ python3 crates/virus-arena/crossplay/crossplay.py --games 50 --search GREEDY --j
 |---|---|---|
 | Distinct games | **5 / 50** | **50 / 50** |
 | Low-diversity warning | fired | silent |
-| W-L-D | 49-1-0 | 14-36-0 |
+| W-L-D | 49-1-0 (98.0%) | 11-39-0 (22.0%) |
+| Forfeits | 0 | 0 |
 
 **50 of 50 games distinct**, and the harness's low-diversity warning stops
-firing. The two vsbot instances logged 79 and 84 exploration moves over 25 and
-27 games — ~3.2 a game against the ~3.6 the window's ~24 flips at eps 0.15
-predict, the shortfall being games that ended inside the window.
+firing. The two vsbot instances logged 61 and 79 exploration moves over 24 and
+28 games — ~2.7 a game, under the ~3.6 the window's ~24 flips at eps 0.15
+predict, because games that end inside the window and plies whose search was
+superseded do not consume it.
 
-The second row of that table is the real headline. **§3's 98% collapses to 28%
+The second row of that table is the real headline. **§3's 98% collapses to 22%
 once the opening is not a single replayed game** — right beside the arena's 25%
-for `greedy` against the byte-exact GoBot oracle, and below the 40% the arena
-measures for `greedy` seated exclusively at P1, which is what the exploration
-handicap costs. Two independent harnesses now agree on the greedy floor, which
-is the strongest evidence yet that §3a's diagnosis was right and that this
-harness measures what it claims to.
+for `greedy` against the byte-exact GoBot oracle, and well below the 40% the
+arena measures for `greedy` seated exclusively at P1, which is roughly what the
+one-sided exploration handicap should cost. Two independent harnesses now agree
+on the greedy floor, which is the strongest evidence yet that §3a's diagnosis
+was right and that this harness measures what it claims to. (Run on a loaded box
+— load average ~8 with a T2 curve run and a ponder gauntlet in flight — which
+affects a `ms:`-budgeted arm's absolute numbers but not the diversity count.)
+
+**What a seed pins, and what it cannot.** Two 10-game runs at the same
+`--explore-seed 424242`, one vsbot and one Go bot each, reproduced **8 of their
+10 games byte-identically and in the same order** (both 10/10 distinct). The two
+that diverged account for the whole difference in tally, 1-9-0 against 0-10-0.
+That is the honest ceiling: the Go bot
+searches on a wall clock, so a cross-play *game* is no more reproducible than
+the arena's `ms:` mode. What the seed does pin is the **exploration schedule** —
+which of our plies are overridden and by which legal action — as a pure function
+of `(seed, game index, position)`, asserted in `crates/vsbot/src/explore.rs`'s
+tests and in `crossplay --self-test`. Deriving the coin from the position rather
+than from a running stream is what makes that true in a client, where a
+superseded search can still be in flight when its replacement starts.
 
 What is still missing is unchanged and structural: colours cannot be balanced
-against the Go bot (its challenger only targets its own pool), and a
-*reproducible* cross-play **game** remains impossible — a fixed-time engine
-against a live opponent is a wall-clock measurement. What a seed now pins is the
-**exploration schedule**: which of our plies are overridden and by which legal
-action, as a pure function of `(seed, game index, ply)`, asserted in
-`crates/vsbot/src/explore.rs`'s tests and in `crossplay --self-test`.
+against the Go bot, because its challenger only targets its own pool.
 
 ## 4. S1 — Rust MCTS vs the Java gen-5 champion, same net, 1 s/move
 

@@ -149,7 +149,8 @@ far too narrow.
 `--explore-turns` (default `8`) drive `VSBOT_EXPLORE_EPS` /
 `VSBOT_EXPLORE_TURNS`, and inside that window it plays a uniformly random legal
 action instead of the searched one. **50 of 50 games are now distinct** on the
-Go-bot smoke, against 5 before.
+Go-bot smoke, against 5 before — and the `49-1` that smoke used to return is
+`11-39` once the opening stops being one replayed game.
 
 Three details are load-bearing:
 
