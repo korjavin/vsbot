@@ -27,7 +27,7 @@
 
 use std::time::{Duration, Instant};
 use virus_core::{Action, CellKind, Player, State};
-use virus_mcts::{Config as MctsConfig, MctsSearcher, PolicyValueNet};
+use virus_mcts::{Config as MctsConfig, MctsSearcher, PolicyValueNet, ValueSource};
 use virus_search::{SearchOptions, Searcher};
 
 /// How much a side may spend on one action.
@@ -390,7 +390,21 @@ impl Side for MctsSide<'_> {
         // Play mode: no Dirichlet noise, no visit sampling, no RNG draws at
         // all. The seed is inert here and the searcher is a pure function of
         // the position — which is what lets a node-mode gauntlet reproduce.
-        let mut searcher = MctsSearcher::new(state.clone(), MctsConfig::play(), Some(self.net));
+        //
+        // `ValueSource::Net` is not a tuning knob. `Config::play()` defaults the
+        // leaf value to the hand-tuned eval, which would leave the artifact
+        // supplying only the priors — an engine that is neither the champion nor
+        // the hand-tuned bar, reported under the champion's name. It is also
+        // several times cheaper per simulation, so the mistake surfaces as a
+        // *flattering* sims/s figure rather than an obviously broken one.
+        // `virus-mcts`'s own crate-level example loads the gen-5 champion
+        // exactly this way, and `ValueSource::Net` falls back to the hand-tuned
+        // value by itself when an artifact has no value head.
+        let config = MctsConfig {
+            value_source: ValueSource::Net,
+            ..MctsConfig::play()
+        };
+        let mut searcher = MctsSearcher::new(state.clone(), config, Some(self.net));
         match self.budget {
             Budget::Nodes(sims) => searcher.run_sims(sims.min(u64::from(u32::MAX)) as u32),
             Budget::Millis(ms) => {
