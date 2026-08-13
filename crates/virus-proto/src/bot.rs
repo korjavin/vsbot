@@ -31,9 +31,12 @@
 //!    task, so server pings are answered while thinking. The Java predecessor
 //!    searched inline and starved its pong deadline.
 
+use crate::clock::{MoveAllocation, TurnAllocator};
 use crate::config::BotConfig;
-use crate::engine::{SearchBudget, SearchEngine};
+use crate::engine::{SearchBudget, SearchEngine, SearchOutcome};
 use crate::message::{Diagnostics, Inbound, Outgoing, UserInfo};
+use crate::ponder::{PonderInbox, PonderStep};
+use std::sync::mpsc as blocking_mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -44,6 +47,10 @@ use virus_core::{Action, CellKind, Player, Pos, State};
 /// Minimum gap between `resync` requests, so a burst of server errors cannot
 /// turn into a request storm.
 const RESYNC_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// How long the client waits for its pre-selected fallback before giving up on
+/// it too. A `fallback` implementation is contractually one net forward.
+const FALLBACK_SELECTION_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Where the bot is in its lifecycle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,6 +129,15 @@ pub struct Counters {
     pub games_finished: u64,
     /// Challenges we initiated.
     pub challenges_sent: u64,
+    /// Actions answered with the pre-selected fallback because the engine
+    /// overran its ceiling. Must stay at zero in a healthy deployment; a
+    /// non-zero value means the time manager is not holding.
+    pub fallback_actions: u64,
+    /// Ponder steps handed to a live session.
+    pub ponder_steps: u64,
+    /// Turns answered out of a pondering session's tree rather than a fresh
+    /// search.
+    pub ponder_answers: u64,
 }
 
 /// The mutable client state. Guarded by one mutex; no `await` is ever held
@@ -156,12 +172,32 @@ pub struct BotCore {
     position_key: Option<(u64, bool, Player)>,
     /// The version a search has already been started for.
     searched_version: u64,
+    /// The version a ponder step has already been queued for. The mirror of
+    /// [`BotCore::searched_version`], and needed for the same reason: the
+    /// server sends `move_made` and then `game_state` for one position, and a
+    /// resync can repeat a frame verbatim. One snapshot, one step.
+    pondered_version: u64,
     /// Cancels the in-flight search.
     cancel: Option<CancellationToken>,
     /// When the optimistic challenger busy-flag was set.
     pending_game_since: Option<Instant>,
     /// Last resync request, for the cooldown.
     last_resync: Option<Instant>,
+    /// Splits the turn budget across the turn's actions.
+    allocator: TurnAllocator,
+    /// The live pondering session, if any.
+    ponder: Option<PonderSlot>,
+}
+
+/// The client's end of a pondering session.
+#[derive(Debug)]
+struct PonderSlot {
+    /// The game the session is thinking about. A session never outlives it.
+    game_id: String,
+    /// Steps go in here; dropping it ends the session.
+    steps: blocking_mpsc::Sender<PonderStep>,
+    /// Cancels the step currently in flight.
+    cancel: CancellationToken,
 }
 
 impl Default for BotCore {
@@ -180,9 +216,12 @@ impl Default for BotCore {
             last_error: None,
             position_key: None,
             searched_version: 0,
+            pondered_version: 0,
             cancel: None,
             pending_game_since: None,
             last_resync: None,
+            allocator: TurnAllocator::default(),
+            ponder: None,
         }
     }
 }
@@ -192,6 +231,20 @@ impl BotCore {
     fn cancel_search(&mut self) {
         if let Some(token) = self.cancel.take() {
             token.cancel();
+        }
+        // ARCHITECTURE.md invariant 5, extended to the pondering session: no
+        // simulation may continue past a snapshot without a fresh, explicitly
+        // re-tokened instruction from the client.
+        if let Some(slot) = self.ponder.as_ref() {
+            slot.cancel.cancel();
+        }
+    }
+
+    /// Ends the pondering session outright. The engine's `next()` returns
+    /// `None` as soon as the sender is dropped.
+    fn stop_ponder(&mut self) {
+        if let Some(slot) = self.ponder.take() {
+            slot.cancel.cancel();
         }
     }
 
@@ -218,6 +271,12 @@ impl BotCore {
             return false;
         }
         self.invalidate();
+        // The one boundary `movesLeft` cannot show on its own: a turn spent on
+        // `PlaceNeutrals` ends at `movesLeft == 3`, so two of our turns in a row
+        // can both open at 3. Any position that is not ours ends the turn.
+        if state.game_over() || state.current_player() != self.seat {
+            self.allocator.end_turn();
+        }
         self.position_key = Some(key);
         self.position = Some(state);
         true
@@ -226,6 +285,7 @@ impl BotCore {
     /// Returns to the idle pool.
     fn go_idle(&mut self) {
         self.invalidate();
+        self.stop_ponder();
         self.phase = Phase::Idle;
         self.current_game = None;
         self.current_lobby = None;
@@ -273,6 +333,43 @@ impl BotCore {
     /// The version a search has already been dispatched for.
     pub fn searched_version(&self) -> u64 {
         self.searched_version
+    }
+
+    /// The intra-turn time allocator, for diagnostics and tests.
+    pub fn allocator(&self) -> &TurnAllocator {
+        &self.allocator
+    }
+
+    /// Whether a pondering session may be given this position.
+    ///
+    /// The mirror image of [`BotCore::may_act`]: the same four conditions with
+    /// the seat test inverted. We ponder only positions where somebody else is
+    /// the mover, and only ones that actually have a move to make.
+    ///
+    /// The `moves_left > 0` clause is not decoration. `movesLeft == 0` with a
+    /// live mover is a real transient the server publishes — the `move_made`
+    /// echo of an opponent's third action arrives before the `turn_change` that
+    /// rotates the turn — and `State::legal_actions` does not filter on
+    /// `movesLeft`, so such a position enumerates moves that `apply` then
+    /// decrements to `0 - 1`. That underflow indexes the Zobrist `movesLeft`
+    /// table at 255 and panics the search worker. `may_act` has always excluded
+    /// it, which is why nothing before pondering could reach it; a ≥20-game live
+    /// soak found it within one game. See the note in `virus-core`'s
+    /// `legal_actions_with` — the underlying enumeration is worth hardening too,
+    /// but the client must not be relying on that.
+    pub fn may_ponder(&self) -> bool {
+        self.phase == Phase::InGame
+            && self.current_game.is_some()
+            && self.position.as_ref().is_some_and(|position| {
+                !position.game_over()
+                    && position.current_player() != self.seat
+                    && position.moves_left() > 0
+            })
+    }
+
+    /// Whether a pondering session is live.
+    pub fn is_pondering(&self) -> bool {
+        self.ponder.is_some()
     }
 }
 
@@ -327,8 +424,12 @@ impl Bot {
         engine: Arc<dyn SearchEngine>,
     ) -> (Bot, mpsc::UnboundedReceiver<Outbound>) {
         let (outbox, inbox) = mpsc::unbounded_channel();
+        let core = BotCore {
+            allocator: config.allocator(),
+            ..BotCore::default()
+        };
         let bot = Bot {
-            core: Arc::new(Mutex::new(BotCore::default())),
+            core: Arc::new(Mutex::new(core)),
             outbox,
             engine,
             config,
@@ -381,14 +482,21 @@ impl Bot {
                 };
                 if self.absorb(&message) {
                     self.maybe_search(driver);
+                    self.maybe_ponder();
                 }
             }
 
             // Refresh only. `move_made` is echoed to every participant and is
             // always followed by `game_state` (mid-turn) or `turn_change` (turn
             // over); acting here would double up on that.
+            //
+            // It *is* the moment a pondering session re-roots, though: this is
+            // the opponent's action arriving, and the child it leads to is
+            // already in the tree.
             "move_made" | "player_eliminated" => {
-                self.absorb(&message);
+                if self.absorb(&message) {
+                    self.maybe_ponder();
+                }
             }
 
             // ARCHITECTURE.md invariant 2. The snapshot on our OWN ack still
@@ -396,14 +504,23 @@ impl Bot {
             // live games on 2026-08-08. An opponent's placement ends their turn
             // server-side, so the `turn_change` that follows is what wakes us.
             // Either way: absorb, never search.
+            //
+            // `maybe_ponder` is safe to reach from here precisely because it can
+            // only ever produce a `PonderStep`, never an action, and only for a
+            // position somebody else is the mover in — which our own ack, still
+            // showing us as mover, is not.
             "neutrals_placed" => {
-                self.absorb(&message);
+                if self.absorb(&message) {
+                    self.maybe_ponder();
+                }
             }
 
             // Our own idempotent-replay acknowledgement. Same hazard class as
             // `neutrals_placed`: it is our message coming back, not a turn.
             "action_ack" => {
-                self.absorb(&message);
+                if self.absorb(&message) {
+                    self.maybe_ponder();
+                }
             }
 
             "game_end" => self.on_game_end(&message),
@@ -418,6 +535,7 @@ impl Bot {
     pub fn on_disconnected(&self) {
         let mut core = self.core();
         core.invalidate();
+        core.stop_ponder();
         core.phase = Phase::Disconnected;
         core.position = None;
         core.position_key = None;
@@ -535,11 +653,15 @@ impl Bot {
         {
             let mut core = self.core();
             core.cancel_search();
+            // A session belongs to one game: its tree is that game's positions.
+            core.stop_ponder();
             core.phase = Phase::InGame;
             core.current_game = Some(message.game_id.clone());
             core.seat = message.your_player as Player;
             core.searched_version = 0;
+            core.pondered_version = 0;
             core.pending_game_since = None;
+            core.allocator = self.config.allocator();
             // Clearing the key forces the install even when a rematch happens
             // to open on a position identical to the last game's opening.
             core.position_key = None;
@@ -550,6 +672,7 @@ impl Bot {
             message.game_id, message.your_player
         ));
         self.maybe_search(Driver::GameStart);
+        self.maybe_ponder();
     }
 
     fn on_game_end(&self, message: &Inbound) {
@@ -691,38 +814,157 @@ impl Bot {
             let cancel = CancellationToken::new();
             core.cancel = Some(cancel.clone());
             core.searched_version = core.position_version;
+            // The allocator is the only thing that decides how long an action
+            // may take. `movesLeft` is what tells it which action of the turn
+            // this is.
+            let allocation = core.allocator.allocate(position.moves_left());
             Dispatch {
                 position,
                 game_id,
                 version: core.position_version,
                 seat: core.seat,
                 cancel,
+                allocation,
             }
         };
         let bot = self.clone();
         tokio::spawn(async move { bot.run_search(dispatch, driver).await });
     }
 
+    /// Starts, or feeds, the pondering session.
+    ///
+    /// **This function cannot emit an action and must never learn how to.** It
+    /// is reachable from message types the turn-driver whitelist deliberately
+    /// excludes (`move_made`, `neutrals_placed`, `action_ack`), and the only
+    /// reason that is safe is that a [`PonderStep::Think`] has no reply channel.
+    fn maybe_ponder(&self) {
+        if !self.config.ponder || !self.engine.can_ponder() {
+            return;
+        }
+        let step = {
+            let mut core = self.core();
+            if !core.may_ponder() || core.pondered_version == core.position_version {
+                return;
+            }
+            let (Some(game_id), Some(position)) =
+                (core.current_game.clone(), core.position.clone())
+            else {
+                return;
+            };
+            self.ensure_ponder_session(&mut core, &game_id);
+            let cancel = CancellationToken::new();
+            core.pondered_version = core.position_version;
+            let Some(slot) = core.ponder.as_mut() else {
+                return;
+            };
+            slot.cancel = cancel.clone();
+            core.counters.ponder_steps += 1;
+            PonderStep::Think {
+                state: position,
+                budget: SearchBudget::new(Instant::now() + self.config.ponder_budget, cancel),
+            }
+        };
+        self.send_ponder_step(step);
+    }
+
+    /// Ensures a session exists for `game_id`, spawning one if needed.
+    fn ensure_ponder_session(&self, core: &mut BotCore, game_id: &str) {
+        if core
+            .ponder
+            .as_ref()
+            .is_some_and(|slot| slot.game_id == game_id)
+        {
+            return;
+        }
+        core.stop_ponder();
+        let (steps, inbox) = PonderInbox::channel();
+        let engine = Arc::clone(&self.engine);
+        // A blocking worker, exactly like the search: the read loop must stay
+        // free to answer the server's pings while the session thinks.
+        tokio::task::spawn_blocking(move || engine.ponder(&inbox));
+        core.ponder = Some(PonderSlot {
+            game_id: game_id.to_owned(),
+            steps,
+            cancel: CancellationToken::new(),
+        });
+    }
+
+    /// Queues a step for the session, tearing it down if it has gone away.
+    ///
+    /// Non-blocking: `std::sync::mpsc` is unbounded, so this never parks the
+    /// read loop no matter how far behind the session is.
+    fn send_ponder_step(&self, step: PonderStep) {
+        let mut core = self.core();
+        let Some(slot) = core.ponder.as_ref() else {
+            return;
+        };
+        if slot.steps.send(step).is_err() {
+            core.ponder = None;
+            drop(core);
+            self.log("the pondering session ended; continuing without it");
+        }
+    }
+
     /// The search task: off the read loop, cancellable, and revalidated before
     /// anything is queued.
     async fn run_search(self, dispatch: Dispatch, driver: Driver) {
         let started = Instant::now();
-        let budget = SearchBudget::new(started + self.config.move_budget, dispatch.cancel.clone());
-        let engine = Arc::clone(&self.engine);
-        let position = dispatch.position;
-        let moves_left = position.moves_left();
-        let joined = tokio::task::spawn_blocking(move || engine.choose(&position, &budget)).await;
+        let budget = SearchBudget::allocated(
+            started,
+            dispatch.allocation,
+            self.config.stop_policy,
+            dispatch.cancel.clone(),
+        );
+        let moves_left = dispatch.position.moves_left();
 
-        let outcome = match joined {
-            Ok(Some(outcome)) => outcome,
-            Ok(None) => {
-                self.log(&format!("{driver:?}: engine offered no action"));
-                return;
+        // Fallback-first (superiority.md §2b): a legal answer is in hand
+        // *before* the long search starts, so a search that overruns costs a
+        // weaker move rather than a forfeit.
+        let fallback = self.select_fallback(&dispatch.position).await;
+
+        let hard_wait = dispatch.allocation.ceiling + self.config.fallback_grace;
+        let searched = self.run_engine(&dispatch, &budget, hard_wait).await;
+        self.core().allocator.spent(started.elapsed());
+
+        let (outcome, from_fallback) = match searched {
+            EngineAnswer::Chose(outcome) => (outcome, false),
+            EngineAnswer::Overran => {
+                // Stop the runaway search: cancelling the token does not move
+                // the version, so the fallback still passes the guard below.
+                dispatch.cancel.cancel();
+                let Some(action) = fallback else {
+                    self.log(&format!(
+                        "{driver:?}: the engine overran {hard_wait:?} and no fallback was \
+                         available — not moving"
+                    ));
+                    return;
+                };
+                self.core().counters.fallback_actions += 1;
+                self.log(&format!(
+                    "{driver:?}: the engine overran {hard_wait:?} — PLAYING THE PRE-SELECTED \
+                     FALLBACK. The time manager is not holding; this must not happen in a \
+                     healthy deployment."
+                ));
+                (SearchOutcome::new(action), true)
             }
-            Err(error) => {
-                self.log(&format!("search task failed: {error}"));
-                return;
+            EngineAnswer::Nothing => {
+                if dispatch.cancel.is_cancelled() {
+                    // The documented `None` case: superseded before a candidate
+                    // was established. The next snapshot drives.
+                    return;
+                }
+                let Some(action) = fallback else {
+                    self.log(&format!("{driver:?}: engine offered no action"));
+                    return;
+                };
+                self.core().counters.fallback_actions += 1;
+                self.log(&format!(
+                    "{driver:?}: the engine offered no action in a position that has legal \
+                     moves — PLAYING THE PRE-SELECTED FALLBACK."
+                ));
+                (SearchOutcome::new(action), true)
             }
+            EngineAnswer::Failed => return,
         };
 
         let guard = ActionGuard {
@@ -746,7 +988,9 @@ impl Bot {
         let diagnostics = Diagnostics {
             score: outcome.score,
             depth: outcome.depth,
-            nodes_evaluated: outcome.nodes,
+            // A fallback move is not a searched move, and the spectator view
+            // should not claim it is.
+            nodes_evaluated: if from_fallback { 0 } else { outcome.nodes },
             time_ms: started.elapsed().as_millis() as i64,
         };
         // A fresh UUID per action: the server keys idempotent replay on it, and
@@ -754,6 +998,107 @@ impl Bot {
         let request_id = Uuid::new_v4().to_string();
         let message = Outgoing::action(&dispatch.game_id, &request_id, outcome.action, diagnostics);
         self.enqueue(message, Some(guard));
+    }
+
+    /// Asks the engine for its overrun answer, before any long search runs.
+    ///
+    /// Bounded, because a `fallback` that blocked would defeat the whole point
+    /// of having one. The first legal action is the backstop for the backstop.
+    async fn select_fallback(&self, position: &State) -> Option<Action> {
+        let engine = Arc::clone(&self.engine);
+        let state = position.clone();
+        let chosen = tokio::time::timeout(
+            FALLBACK_SELECTION_TIMEOUT,
+            tokio::task::spawn_blocking(move || engine.fallback(&state)),
+        )
+        .await;
+        match chosen {
+            Ok(Ok(Some(action))) => Some(action),
+            Ok(Ok(None)) => None,
+            _ => {
+                self.log(
+                    "the engine's fallback selection did not answer in time; using the first \
+                     legal action",
+                );
+                position.legal_actions().first().copied()
+            }
+        }
+    }
+
+    /// Runs the search — through the pondering session when one is live for
+    /// this game, otherwise as a fresh blocking search.
+    async fn run_engine(
+        &self,
+        dispatch: &Dispatch,
+        budget: &SearchBudget,
+        hard_wait: Duration,
+    ) -> EngineAnswer {
+        if let Some(reply) = self.hand_to_ponder(dispatch, budget) {
+            return match tokio::time::timeout(hard_wait, reply).await {
+                Ok(Ok(Some(outcome))) => EngineAnswer::Chose(outcome),
+                Ok(Ok(None)) => EngineAnswer::Nothing,
+                // The session died mid-answer. Not fatal: the fallback covers
+                // it, and the next turn opens a fresh session.
+                Ok(Err(_)) => {
+                    self.core().ponder = None;
+                    EngineAnswer::Nothing
+                }
+                Err(_) => EngineAnswer::Overran,
+            };
+        }
+
+        let engine = Arc::clone(&self.engine);
+        let position = dispatch.position.clone();
+        let budget = budget.clone();
+        let joined = tokio::task::spawn_blocking(move || engine.choose(&position, &budget));
+        match tokio::time::timeout(hard_wait, joined).await {
+            Ok(Ok(Some(outcome))) => EngineAnswer::Chose(outcome),
+            Ok(Ok(None)) => EngineAnswer::Nothing,
+            Ok(Err(error)) => {
+                self.log(&format!("search task failed: {error}"));
+                EngineAnswer::Failed
+            }
+            Err(_) => EngineAnswer::Overran,
+        }
+    }
+
+    /// Hands this turn to the live pondering session, so the tree it built
+    /// during the opponent's turn is continued rather than thrown away.
+    ///
+    /// **The only place a `PonderStep::Answer` is ever created.** Its caller is
+    /// [`Bot::run_search`], which only ever runs off a [`Driver`] message with
+    /// [`BotCore::may_act`] true — that is the whole of ARCHITECTURE.md
+    /// invariant 2 as it applies to pondering.
+    fn hand_to_ponder(
+        &self,
+        dispatch: &Dispatch,
+        budget: &SearchBudget,
+    ) -> Option<tokio::sync::oneshot::Receiver<Option<SearchOutcome>>> {
+        let mut core = self.core();
+        let slot = core.ponder.as_ref()?;
+        if slot.game_id != dispatch.game_id {
+            return None;
+        }
+        // Belt and braces around the invariant this whole path turns on. The
+        // caller has already checked it; checking again here costs nothing and
+        // makes the guarantee local to the function that could break it.
+        if !core.may_act() || core.position_version != dispatch.version {
+            return None;
+        }
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        let step = PonderStep::Answer {
+            state: dispatch.position.clone(),
+            budget: budget.clone(),
+            reply,
+        };
+        let slot = core.ponder.as_mut()?;
+        slot.cancel = budget.cancel.clone();
+        if slot.steps.send(step).is_err() {
+            core.ponder = None;
+            return None;
+        }
+        core.counters.ponder_answers += 1;
+        Some(receiver)
     }
 
     /// Queues a non-game message (no send-time guard).
@@ -831,6 +1176,21 @@ struct Dispatch {
     version: u64,
     seat: Player,
     cancel: CancellationToken,
+    allocation: MoveAllocation,
+}
+
+/// What came back from the engine for one action.
+#[derive(Debug)]
+enum EngineAnswer {
+    /// A searched action.
+    Chose(SearchOutcome),
+    /// The engine declined: a terminal root, or cancellation before a candidate
+    /// existed.
+    Nothing,
+    /// The engine blew through its ceiling plus grace. The fallback answers.
+    Overran,
+    /// The blocking task itself failed (panic). Nothing to send.
+    Failed,
 }
 
 /// Mirrors Go's `decodeSnapshot` seat validation for `multiplayer_game_start`.

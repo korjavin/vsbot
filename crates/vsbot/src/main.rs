@@ -33,12 +33,23 @@ fn main() -> ExitCode {
     // and the artifact from the log alone — inferring them from move quality is
     // exactly the mistake the Java post-mortem records.
     eprintln!(
-        "vsbot {} starting: url={} search={} move_budget={}ms challenger={}",
+        "vsbot {} starting: url={} search={} challenger={}",
         env!("CARGO_PKG_VERSION"),
         settings.bot.backend_url,
         settings.engine.as_str(),
-        settings.bot.move_budget.as_millis(),
         settings.bot.challenger,
+    );
+    // The time budget is the thing the owner's UX bound is expressed in, and
+    // pondering is a behaviour change that ships canary-first — both belong in
+    // the banner so a deployment can be checked rather than trusted.
+    eprintln!(
+        "vsbot: {} ponder={}",
+        settings.bot.budget_summary(),
+        if settings.bot.ponder {
+            "on (CANARY: search runs during the opponent's turn)"
+        } else {
+            "off"
+        }
     );
     eprintln!("vsbot: {}", setup.description);
 

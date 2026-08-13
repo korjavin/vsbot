@@ -521,6 +521,75 @@ impl<'net> MctsSearcher<'net> {
         Some(root.actions[root.actions.len() - 1])
     }
 
+    /// Re-roots the tree at the child reached by `action`, keeping its subtree
+    /// and discarding everything else.
+    ///
+    /// This is what makes pondering worth anything (superiority.md §2b): the
+    /// client searches the opponent-to-move position while they think, and when
+    /// they act, the position they moved into is *already in the tree* with its
+    /// visit counts intact. Per-action nodes make that a pure book-keeping
+    /// operation — an edge is one action, so the opponent's action is exactly
+    /// one re-root, and our own turn arrives after three of them.
+    ///
+    /// Returns `false` and leaves the tree untouched when `action` is not a root
+    /// action or has never been expanded into a node; the caller then builds a
+    /// fresh searcher. Never partially applies.
+    pub fn rebase(&mut self, action: Action) -> bool {
+        if self.nodes[0].terminal {
+            return false;
+        }
+        let Some(edge) = self.nodes[0].actions.iter().position(|a| *a == action) else {
+            return false;
+        };
+        let child = self.nodes[0].children[edge];
+        if child == NO_NODE {
+            return false;
+        }
+
+        // Breadth-first over the reachable subtree, assigning each node its new
+        // index as it is discovered. `order[i]` is the old index of what will
+        // become node `i`, so the mapping and the ordering are the same fact.
+        let mut mapping = vec![NO_NODE; self.nodes.len()];
+        let mut order: Vec<u32> = vec![child];
+        mapping[child as usize] = 0;
+        let mut head = 0;
+        while head < order.len() {
+            let id = order[head] as usize;
+            head += 1;
+            for slot in 0..self.nodes[id].children.len() {
+                let next = self.nodes[id].children[slot];
+                if next != NO_NODE && mapping[next as usize] == NO_NODE {
+                    mapping[next as usize] = order.len() as u32;
+                    order.push(next);
+                }
+            }
+        }
+
+        // Move the survivors into a fresh arena rather than copying them: a
+        // node owns a whole `State` and two vectors, and this runs on every
+        // opponent action.
+        let mut slots: Vec<Option<Node>> = std::mem::take(&mut self.nodes)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut kept = Vec::with_capacity(order.len());
+        for old in &order {
+            let mut node = slots[*old as usize]
+                .take()
+                .expect("breadth-first order visits every reachable node exactly once");
+            for slot in node.children.iter_mut() {
+                if *slot != NO_NODE {
+                    // Every child of a reachable node is itself reachable, so
+                    // the mapping is always assigned here.
+                    *slot = mapping[*slot as usize];
+                }
+            }
+            kept.push(node);
+        }
+        self.nodes = kept;
+        true
+    }
+
     // ---------------------------------------------------------------- core
 
     /// Collects up to `target` descents, evaluates their leaves in one batched
@@ -1096,5 +1165,109 @@ mod tests {
             (v1 + v2).abs() < 1e-12,
             "mirror image must invert the absolute value: {v1} vs {v2}"
         );
+    }
+
+    // ------------------------------------------------------------- re-rooting
+
+    #[test]
+    fn rebasing_keeps_the_subtree_and_its_statistics() {
+        let mut searcher = MctsSearcher::new(state_with(1, 3), Config::play(), None);
+        searcher.run_sims(400);
+        let before = searcher.nodes.len();
+
+        let action = searcher
+            .best_action()
+            .expect("a searched root has a best action");
+        let edge = searcher.nodes[0]
+            .actions
+            .iter()
+            .position(|a| *a == action)
+            .expect("the best action is a root action");
+        let child = searcher.nodes[0].children[edge] as usize;
+        let expected_state = searcher.nodes[child].state.clone();
+        let expected_visits = searcher.nodes[child].visits;
+        let expected_n = searcher.nodes[child].n.clone();
+        let expected_w = searcher.nodes[child].w.clone();
+        assert!(expected_visits > 0, "the leader must have been searched");
+
+        assert!(searcher.rebase(action));
+
+        assert_eq!(searcher.nodes[0].state, expected_state);
+        assert_eq!(
+            searcher.nodes[0].visits, expected_visits,
+            "the whole point is that the work already done survives"
+        );
+        assert_eq!(searcher.nodes[0].n, expected_n);
+        assert_eq!(searcher.nodes[0].w, expected_w);
+        assert!(
+            searcher.nodes.len() < before,
+            "the discarded siblings must be freed, not merely orphaned"
+        );
+    }
+
+    /// Every child index has to be rewritten into the compacted arena. A stale
+    /// index would make the next simulation read a sibling's statistics.
+    #[test]
+    fn rebasing_rewrites_every_child_index() {
+        let mut searcher = MctsSearcher::new(state_with(1, 3), Config::play(), None);
+        searcher.run_sims(600);
+        let action = searcher.best_action().expect("a best action");
+        assert!(searcher.rebase(action));
+
+        let count = searcher.nodes.len() as u32;
+        for (id, node) in searcher.nodes.iter().enumerate() {
+            for child in &node.children {
+                if *child != NO_NODE {
+                    assert!(
+                        *child < count && *child as usize != id,
+                        "node {id} points at {child}, outside a {count}-node arena"
+                    );
+                }
+            }
+        }
+        // And the tree is still usable: more simulations must not panic and
+        // must keep accumulating.
+        let before = searcher.sims_run();
+        searcher.run_sims(200);
+        assert_eq!(searcher.sims_run(), before + 200);
+        assert!(searcher.best_action().is_some());
+    }
+
+    /// A re-rooted tree must reach the same conclusion as one grown from the
+    /// same position: re-rooting is book-keeping, not a different search.
+    #[test]
+    fn rebasing_reaches_the_same_position_as_applying_the_action() {
+        let root = state_with(1, 3);
+        let mut searcher = MctsSearcher::new(root.clone(), Config::play(), None);
+        searcher.run_sims(300);
+        let action = searcher.best_action().expect("a best action");
+        let applied = root.apply(action).expect("the searched action is legal");
+
+        assert!(searcher.rebase(action));
+        assert_eq!(searcher.nodes[0].state, applied);
+        assert_eq!(searcher.nodes[0].mover, applied.current_player());
+    }
+
+    #[test]
+    fn rebasing_refuses_an_unreachable_action_without_touching_the_tree() {
+        let mut searcher = MctsSearcher::new(state_with(1, 3), Config::play(), None);
+        searcher.run_sims(50);
+        let before = searcher.nodes.len();
+
+        // Not a root action at all.
+        assert!(!searcher.rebase(Action::mv(11, 5)));
+        assert_eq!(searcher.nodes.len(), before);
+
+        // A root action that 50 simulations never expanded into a node.
+        let unvisited = searcher.nodes[0]
+            .actions
+            .iter()
+            .zip(&searcher.nodes[0].children)
+            .find(|(_, child)| **child == NO_NODE)
+            .map(|(action, _)| *action);
+        if let Some(action) = unvisited {
+            assert!(!searcher.rebase(action));
+            assert_eq!(searcher.nodes.len(), before);
+        }
     }
 }

@@ -15,7 +15,13 @@
 //! |-----------------------------|--------------------------------|---------|
 //! | `BACKEND_URL`               | `ws://localhost:8080/ws`       | WebSocket endpoint; `?bot=true` is appended. |
 //! | `BOT_NAME_PREFIX`           | *(empty)*                      | Prefixes the server-assigned bot name. |
-//! | `MOVE_MILLIS`               | `1000`                         | Wall-clock budget per action. |
+//! | `VSBOT_TURN_MILLIS`         | `12000`                        | Budget for a whole 3-action turn, split by the allocator. |
+//! | `VSBOT_MOVE_MILLIS`         | *(unset)*                      | Per-action override. **Disables the allocator.** |
+//! | `MOVE_MILLIS`               | *(unset)*                      | Legacy spelling of `VSBOT_MOVE_MILLIS`. |
+//! | `VSBOT_EARLY_STOP`          | `true`                         | Stop once the visit leader is uncatchable. |
+//! | `VSBOT_EXTENSION`           | `true`                         | Run past the target toward the ceiling on an unstable root. |
+//! | `VSBOT_PONDER`              | `false`                        | Think on the opponent's positions during their turn. |
+//! | `VSBOT_PONDER_SECS`         | `30`                           | Cap on one pondering step. |
 //! | `SEARCH`                    | `MCTS`                         | `MCTS` \| `GREEDY` \| `ALPHABETA`. |
 //! | `MCTS_ARTIFACT`             | `artifacts/mcts_champion.json` | Policy/value net for `SEARCH=MCTS`. |
 //! | `MCTS_SEED`                 | `1`                            | Seed for the searcher's RNG. |
@@ -25,6 +31,16 @@
 //! Unset and empty are the same thing. An unparseable value is a startup
 //! failure, never a silent fallback: a typo that quietly downgrades the engine
 //! is how the Java harness ended up reporting the wrong engine's results.
+//!
+//! # Budget profiles
+//!
+//! | Profile              | Environment                                      | Why |
+//! |----------------------|--------------------------------------------------|-----|
+//! | **Deployed default** | *(nothing)*                                      | 12 s/turn — 6 s / 3.6 s / 2.4 s, inside the owner's 10-15 s UX bound. |
+//! | **Owner canary**     | `VSBOT_TURN_MILLIS=15000 VSBOT_PONDER=true`      | The top of the bound plus ponder; a behaviour change the owner judges (superiority.md Gate C). |
+//! | **Bot gauntlets**    | `VSBOT_MOVE_MILLIS=1000`                         | Fixed per action: gauntlets and the RL gate stay at fixed time (§4). |
+//! | **Predecessor parity** | `VSBOT_MOVE_MILLIS=1000 VSBOT_EARLY_STOP=false VSBOT_EXTENSION=false` | Exactly what shipped before S2, for an A/B. |
+//! | **Integration tests** | `VSBOT_MOVE_MILLIS=50`                          | Fast and deterministic in wall-clock terms. |
 
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
@@ -36,7 +52,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use virus_proto::{BotConfig, EngineKind, GreedyEngine, SearchEngine};
+use virus_proto::{BotConfig, EngineKind, GreedyEngine, SearchEngine, StopPolicy};
 
 pub use mcts::MctsEngine;
 
@@ -89,21 +105,48 @@ impl Settings {
         let defaults = BotConfig::default();
         let mcts_defaults = MctsSettings::default();
 
-        let move_millis = parse_field(read("MOVE_MILLIS").as_deref(), "MOVE_MILLIS", |raw| {
-            raw.trim().parse::<u64>().ok().filter(|millis| *millis > 0)
-        })?
-        .unwrap_or(defaults.move_budget.as_millis() as u64);
-
-        let challenger = parse_field(read("CHALLENGER").as_deref(), "CHALLENGER", |raw| match raw
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
+        let millis = |raw: &str| raw.trim().parse::<u64>().ok().filter(|value| *value > 0);
+        let flag = |raw: &str| match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Some(true),
             "0" | "false" | "no" | "off" => Some(false),
             _ => None,
-        })?
-        .unwrap_or(defaults.challenger);
+        };
+
+        let turn_millis = parse_field(
+            read("VSBOT_TURN_MILLIS").as_deref(),
+            "VSBOT_TURN_MILLIS",
+            millis,
+        )?
+        .unwrap_or(defaults.turn_budget.as_millis() as u64);
+
+        // `VSBOT_MOVE_MILLIS` is the documented spelling; `MOVE_MILLIS` is what
+        // shipped before the allocator and is still honoured so an existing
+        // deployment's compose file keeps meaning what it meant. Setting either
+        // one disables the allocator — that *is* what a per-action override is.
+        let move_millis = match read("VSBOT_MOVE_MILLIS") {
+            Some(raw) => parse_field(Some(raw.as_str()), "VSBOT_MOVE_MILLIS", millis)?,
+            None => parse_field(read("MOVE_MILLIS").as_deref(), "MOVE_MILLIS", millis)?,
+        };
+
+        let early_stop = parse_field(
+            read("VSBOT_EARLY_STOP").as_deref(),
+            "VSBOT_EARLY_STOP",
+            flag,
+        )?
+        .unwrap_or(defaults.stop_policy.early_stop);
+        let extension = parse_field(read("VSBOT_EXTENSION").as_deref(), "VSBOT_EXTENSION", flag)?
+            .unwrap_or(defaults.stop_policy.extension);
+        let ponder = parse_field(read("VSBOT_PONDER").as_deref(), "VSBOT_PONDER", flag)?
+            .unwrap_or(defaults.ponder);
+        let ponder_secs = parse_field(
+            read("VSBOT_PONDER_SECS").as_deref(),
+            "VSBOT_PONDER_SECS",
+            |raw| raw.trim().parse::<u64>().ok().filter(|secs| *secs > 0),
+        )?
+        .unwrap_or(defaults.ponder_budget.as_secs());
+
+        let challenger = parse_field(read("CHALLENGER").as_deref(), "CHALLENGER", flag)?
+            .unwrap_or(defaults.challenger);
 
         let interval_secs = parse_field(
             read("CHALLENGER_INTERVAL_SECS").as_deref(),
@@ -128,7 +171,15 @@ impl Settings {
             bot: BotConfig {
                 backend_url: read("BACKEND_URL").unwrap_or(defaults.backend_url),
                 name_prefix: read("BOT_NAME_PREFIX").unwrap_or_default(),
-                move_budget: Duration::from_millis(move_millis),
+                turn_budget: Duration::from_millis(turn_millis),
+                move_budget: move_millis.map(Duration::from_millis),
+                stop_policy: StopPolicy {
+                    early_stop,
+                    extension,
+                    ..StopPolicy::default()
+                },
+                ponder,
+                ponder_budget: Duration::from_secs(ponder_secs),
                 challenger,
                 challenge_interval: Duration::from_secs(interval_secs),
                 ..BotConfig::default()
@@ -261,11 +312,69 @@ mod tests {
         let settings = settings(&[]).expect("defaults are valid");
         assert_eq!(settings.bot.backend_url, "ws://localhost:8080/ws");
         assert_eq!(settings.bot.name_prefix, "");
-        assert_eq!(settings.bot.move_budget, Duration::from_millis(1000));
+        assert_eq!(settings.bot.turn_budget, Duration::from_millis(12_000));
+        assert_eq!(
+            settings.bot.move_budget, None,
+            "no override means the allocator runs; that is the S2 default"
+        );
         assert_eq!(settings.bot.challenge_interval, Duration::from_secs(300));
         assert!(!settings.bot.challenger);
         assert_eq!(settings.mcts.artifact, Path::new(DEFAULT_MCTS_ARTIFACT));
         assert_eq!(settings.mcts.seed, 1);
+    }
+
+    /// Pondering is a behaviour change the owner judges, so it must be off
+    /// until a canary deployment turns it on (superiority.md Gate C).
+    #[test]
+    fn pondering_is_off_unless_asked_for() {
+        assert!(!settings(&[]).expect("defaults").bot.ponder);
+        assert!(
+            !settings(&[("VSBOT_PONDER", "false")])
+                .expect("explicit off")
+                .bot
+                .ponder
+        );
+        assert!(
+            settings(&[("VSBOT_PONDER", "true")])
+                .expect("explicit on")
+                .bot
+                .ponder
+        );
+    }
+
+    #[test]
+    fn the_turn_allocator_is_on_by_default_and_the_override_switches_it_off() {
+        let allocated = settings(&[("VSBOT_TURN_MILLIS", "15000")]).expect("valid");
+        let clock = allocated.bot.allocator();
+        assert!(!clock.is_fixed());
+        assert_eq!(clock.turn_budget(), Duration::from_millis(15_000));
+
+        for key in ["VSBOT_MOVE_MILLIS", "MOVE_MILLIS"] {
+            let overridden = settings(&[(key, "800"), ("VSBOT_TURN_MILLIS", "15000")])
+                .unwrap_or_else(|error| panic!("{key} should be valid: {error}"));
+            assert_eq!(overridden.bot.move_budget, Some(Duration::from_millis(800)));
+            let mut clock = overridden.bot.allocator();
+            assert!(clock.is_fixed(), "{key} must disable the allocator");
+            assert_eq!(clock.allocate(3).target, Duration::from_millis(800));
+        }
+
+        // The documented spelling wins when both are set, rather than the two
+        // silently disagreeing.
+        let both = settings(&[("VSBOT_MOVE_MILLIS", "800"), ("MOVE_MILLIS", "50")])
+            .expect("both spellings are valid");
+        assert_eq!(both.bot.move_budget, Some(Duration::from_millis(800)));
+    }
+
+    #[test]
+    fn the_stop_rules_are_on_by_default_and_individually_switchable() {
+        let defaults = settings(&[]).expect("defaults");
+        assert!(defaults.bot.stop_policy.early_stop);
+        assert!(defaults.bot.stop_policy.extension);
+
+        let off = settings(&[("VSBOT_EARLY_STOP", "no"), ("VSBOT_EXTENSION", "off")])
+            .expect("both switch off");
+        assert!(!off.bot.stop_policy.early_stop);
+        assert!(!off.bot.stop_policy.extension);
     }
 
     #[test]
@@ -285,7 +394,12 @@ mod tests {
         let settings = settings(&[
             ("BACKEND_URL", "wss://vs.wandergeek.org/ws"),
             ("BOT_NAME_PREFIX", "Canary"),
-            ("MOVE_MILLIS", "250"),
+            ("VSBOT_TURN_MILLIS", "15000"),
+            ("VSBOT_MOVE_MILLIS", "250"),
+            ("VSBOT_EARLY_STOP", "false"),
+            ("VSBOT_EXTENSION", "0"),
+            ("VSBOT_PONDER", "yes"),
+            ("VSBOT_PONDER_SECS", "90"),
             ("SEARCH", "greedy"),
             ("MCTS_ARTIFACT", "/opt/nets/gen7.json"),
             ("MCTS_SEED", "424242"),
@@ -295,7 +409,12 @@ mod tests {
         .expect("all values are valid");
         assert_eq!(settings.bot.backend_url, "wss://vs.wandergeek.org/ws");
         assert_eq!(settings.bot.name_prefix, "Canary");
-        assert_eq!(settings.bot.move_budget, Duration::from_millis(250));
+        assert_eq!(settings.bot.turn_budget, Duration::from_millis(15_000));
+        assert_eq!(settings.bot.move_budget, Some(Duration::from_millis(250)));
+        assert!(!settings.bot.stop_policy.early_stop);
+        assert!(!settings.bot.stop_policy.extension);
+        assert!(settings.bot.ponder);
+        assert_eq!(settings.bot.ponder_budget, Duration::from_secs(90));
         assert_eq!(settings.bot.challenge_interval, Duration::from_secs(45));
         assert!(settings.bot.challenger);
         assert_eq!(settings.engine, EngineKind::Greedy);
@@ -308,13 +427,21 @@ mod tests {
         let settings = settings(&[
             ("BACKEND_URL", "   "),
             ("SEARCH", ""),
+            ("VSBOT_TURN_MILLIS", ""),
+            ("VSBOT_MOVE_MILLIS", " "),
             ("MOVE_MILLIS", ""),
+            ("VSBOT_PONDER", "  "),
             ("MCTS_ARTIFACT", " "),
         ])
         .expect("blank values fall back to defaults");
         assert_eq!(settings.bot.backend_url, "ws://localhost:8080/ws");
         assert_eq!(settings.engine, EngineKind::Mcts);
-        assert_eq!(settings.bot.move_budget, Duration::from_millis(1000));
+        assert_eq!(settings.bot.turn_budget, Duration::from_millis(12_000));
+        assert_eq!(
+            settings.bot.move_budget, None,
+            "a blank override is no override, not a zero one"
+        );
+        assert!(!settings.bot.ponder);
         assert_eq!(settings.mcts.artifact, Path::new(DEFAULT_MCTS_ARTIFACT));
     }
 
@@ -324,6 +451,14 @@ mod tests {
             ("SEARCH", "gobot"),
             ("MOVE_MILLIS", "0"),
             ("MOVE_MILLIS", "soon"),
+            ("VSBOT_MOVE_MILLIS", "0"),
+            ("VSBOT_MOVE_MILLIS", "later"),
+            ("VSBOT_TURN_MILLIS", "0"),
+            ("VSBOT_TURN_MILLIS", "twelve"),
+            ("VSBOT_PONDER", "sometimes"),
+            ("VSBOT_PONDER_SECS", "0"),
+            ("VSBOT_EARLY_STOP", "occasionally"),
+            ("VSBOT_EXTENSION", "-1"),
             ("MCTS_SEED", "-1"),
             ("MCTS_SEED", "lucky"),
             ("CHALLENGER", "maybe"),

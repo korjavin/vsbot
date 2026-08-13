@@ -16,19 +16,31 @@
 //!
 //! Knobs:
 //!
-//! | Variable                | Default                            |
-//! |-------------------------|------------------------------------|
-//! | `VSBOT_ITEST`           | unset — the tests skip             |
-//! | `VSBOT_ITEST_BACKEND`   | `$HOME/Project/virusgame/backend`  |
-//! | `VSBOT_ITEST_GAMES`     | `3` (protocol run), `1` (MCTS run) |
-//! | `VSBOT_ITEST_MCTS_MS`   | `150` — MCTS move budget           |
+//! | Variable                 | Default                                     |
+//! |--------------------------|---------------------------------------------|
+//! | `VSBOT_ITEST`            | unset — the tests skip                      |
+//! | `VSBOT_ITEST_BACKEND`    | `$HOME/Project/virusgame/backend`           |
+//! | `VSBOT_ITEST_GAMES`      | `3` (protocol run), `1` (MCTS run)          |
+//! | `VSBOT_ITEST_MCTS_MS`    | `150` — MCTS move budget                    |
+//! | `VSBOT_ITEST_SOAK`       | unset — the ponder soak skips               |
+//! | `VSBOT_ITEST_SOAK_GAMES` | `20`                                        |
+//! | `VSBOT_ITEST_SOAK_TURN_MS` | `240` — turn budget for the soak          |
+//! | `VSBOT_ITEST_SOAK_OPPONENT` | `greedy` \| `mcts`                         |
 //!
-//! Two scenarios live here. The protocol run pits two instant engines against
+//! Three scenarios live here. The protocol run pits two instant engines against
 //! each other and is about *ordering*; the MCTS run puts the real champion on
 //! one side and is about the engine adapter — that a searched move survives the
 //! round trip and that the domain guard never lets an out-of-domain position
-//! reach the searcher's asserts. They each start their own server, so
-//! [`SERIAL`] keeps them from racing for a port.
+//! reach the searcher's asserts. The **ponder soak** is the acceptance gate for
+//! S2's T3: twenty-plus games with `VSBOT_PONDER=true` on one side, asserting
+//! zero forfeits, zero illegal moves, and — the point of the exercise — zero
+//! out-of-turn emissions. They each start their own server, so [`SERIAL`] keeps
+//! them from racing for a port.
+//!
+//! ```text
+//! VSBOT_ITEST=1 VSBOT_ITEST_SOAK=1 cargo test -p vsbot --test live_games \
+//!   --release ponder_soak -- --nocapture
+//! ```
 //!
 //! The server hard-codes `:8080` in `main.go`, which is no good for a test that
 //! must not fight whatever else the developer has running. It is therefore
@@ -110,7 +122,9 @@ async fn two_bots_play_full_games_without_a_single_illegal_move() {
     let report = run_scenario(Scenario {
         label: "protocol",
         target_games,
-        move_budget: Duration::from_millis(50),
+        budget: Budget::PerAction(Duration::from_millis(50)),
+        ponder: false,
+        timeout: OVERALL_TIMEOUT,
         challenger: Arc::new(GreedyEngine),
         acceptor: neutral_engine.clone(),
     })
@@ -172,7 +186,9 @@ async fn the_mcts_champion_plays_a_full_game_without_a_single_illegal_move() {
     let report = run_scenario(Scenario {
         label: "mcts",
         target_games,
-        move_budget: Duration::from_millis(move_millis),
+        budget: Budget::PerAction(Duration::from_millis(move_millis)),
+        ponder: false,
+        timeout: OVERALL_TIMEOUT,
         challenger: setup.engine,
         acceptor: Arc::new(GreedyEngine),
     })
@@ -184,6 +200,120 @@ async fn the_mcts_champion_plays_a_full_game_without_a_single_illegal_move() {
          greedy acceptor sent {} actions, 0 illegal moves, 0 server errors",
         report.challenger.games_finished,
         report.challenger.actions_sent,
+        report.acceptor.actions_sent,
+    );
+}
+
+/// The acceptance gate for pondering (bd `vsbot-dgv` T3).
+///
+/// Twenty-plus complete games with the challenger pondering through every
+/// opponent turn, against the real Go server. Pondering means a search is
+/// running on positions the bot may not act in, driven off message types the
+/// turn-driver whitelist excludes — so the failure it risks is precisely the one
+/// that forfeited two live games on 2026-08-08 (ARCHITECTURE.md invariant 2),
+/// and only a live server produces the message *ordering* that would trigger it.
+///
+/// Three things are asserted, and each has a distinct evidence source:
+///
+/// * **zero illegal moves** — the hub logs `made illegal move` before it
+///   forfeits (`hub.go:210`); the server log is grepped for it;
+/// * **zero out-of-turn emissions** — `handleMove` answers an off-turn action
+///   with a bare `error` frame and *no* log line (`hub.go:1016`), so the
+///   client's `errors` counter is the only place it can appear. Zero there is
+///   the proof;
+/// * **zero forfeits** — every game reaches `game_end` on both sides.
+///
+/// The opponent is the **instant** reference engine by default, which is the
+/// harsher choice and not the lazier one: a fast opponent packs `move_made`,
+/// `game_state` and `turn_change` into the tightest possible window, which is
+/// exactly the ordering that would race a pondering session into emitting off
+/// its own turn. `VSBOT_ITEST_SOAK_OPPONENT=mcts` puts the champion on both
+/// sides instead — a slower, more realistic opponent that gives the ponder tree
+/// real thinking time, at the cost of a second search burning CPU. (Strength
+/// under ponder is not this test's job; that is the deferred 400-game arena.)
+///
+/// The turn budget is scaled down so the run finishes in minutes; the allocator
+/// is proportional, so the code paths are the deployed ones.
+#[allow(clippy::await_holding_lock)] // see the note on the scenario above
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn ponder_soak_plays_twenty_games_without_a_forfeit_or_an_out_of_turn_action() {
+    if std::env::var("VSBOT_ITEST_SOAK").as_deref() != Ok("1") {
+        eprintln!("skipping the ponder soak: set VSBOT_ITEST_SOAK=1 (it takes minutes)");
+        return;
+    }
+    let Some(_guard) = enabled("ponder-soak") else {
+        return;
+    };
+    let target_games: u64 = std::env::var("VSBOT_ITEST_SOAK_GAMES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
+    let turn_millis: u64 = std::env::var("VSBOT_ITEST_SOAK_TURN_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(240);
+
+    let artifact = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../artifacts/mcts_champion.json");
+    let engine = |seed: u64| {
+        build_engine(
+            EngineKind::Mcts,
+            &MctsSettings {
+                artifact: artifact.clone(),
+                seed,
+            },
+        )
+        .expect("the in-repo champion loads and validates")
+        .engine
+    };
+
+    let slow_opponent = std::env::var("VSBOT_ITEST_SOAK_OPPONENT").as_deref() == Ok("mcts");
+    let acceptor: Arc<dyn SearchEngine> = if slow_opponent {
+        engine(2)
+    } else {
+        Arc::new(GreedyEngine)
+    };
+
+    let report = run_scenario(Scenario {
+        label: "ponder-soak",
+        target_games,
+        budget: Budget::PerTurn(Duration::from_millis(turn_millis)),
+        ponder: true,
+        timeout: Duration::from_secs(1800),
+        challenger: engine(1),
+        acceptor,
+    })
+    .await;
+
+    report.assert_clean(target_games);
+    assert!(
+        report.challenger.ponder_steps > 0,
+        "the pondering side never received a ponder step; the soak proved nothing"
+    );
+    assert!(
+        report.challenger.ponder_answers > 0,
+        "no turn was ever answered out of the ponder tree"
+    );
+    assert_eq!(
+        report.acceptor.ponder_steps, 0,
+        "the control side must not have pondered"
+    );
+    assert_eq!(
+        report.challenger.fallback_actions, 0,
+        "the pondering side had to answer with its fallback {} times — the time manager \
+         did not hold under ponder",
+        report.challenger.fallback_actions
+    );
+
+    eprintln!(
+        "OK (ponder soak): {} games at {turn_millis}ms/turn vs {}, ponderer sent {} actions \
+         ({} ponder steps, {} pondered answers, {} fallbacks), control sent {} actions, \
+         0 illegal moves, 0 server errors, 0 out-of-turn actions",
+        report.challenger.games_finished,
+        if slow_opponent { "mcts" } else { "greedy" },
+        report.challenger.actions_sent,
+        report.challenger.ponder_steps,
+        report.challenger.ponder_answers,
+        report.challenger.fallback_actions,
         report.acceptor.actions_sent,
     );
 }
@@ -203,14 +333,40 @@ fn enabled(label: &str) -> Option<std::sync::MutexGuard<'static, ()>> {
     )
 }
 
+/// How a scenario pays for its thinking.
+#[derive(Clone, Copy, Debug)]
+enum Budget {
+    /// A fixed per-action budget; the intra-turn allocator is off.
+    PerAction(Duration),
+    /// A whole-turn budget the allocator splits — what the deployment runs.
+    PerTurn(Duration),
+}
+
 /// One end-to-end run: which engines, for how many games, at what budget.
 struct Scenario {
     /// Names the scenario's workdir, so concurrent runs never share a server.
     label: &'static str,
     target_games: u64,
-    move_budget: Duration,
+    budget: Budget,
+    /// Whether the *challenger* side ponders. The acceptor never does, so one
+    /// run covers both the new behaviour and the control.
+    ponder: bool,
+    /// How long the whole run may take.
+    timeout: Duration,
     challenger: Arc<dyn SearchEngine>,
     acceptor: Arc<dyn SearchEngine>,
+}
+
+impl Budget {
+    fn apply(self, config: &mut BotConfig) {
+        match self {
+            Budget::PerAction(budget) => config.move_budget = Some(budget),
+            Budget::PerTurn(budget) => {
+                config.move_budget = None;
+                config.turn_budget = budget;
+            }
+        }
+    }
 }
 
 struct Side {
@@ -219,6 +375,9 @@ struct Side {
     illegal_moves: u64,
     actions_sent: u64,
     games_finished: u64,
+    fallback_actions: u64,
+    ponder_steps: u64,
+    ponder_answers: u64,
     last_error: Option<String>,
 }
 
@@ -246,6 +405,11 @@ impl Report {
                 "{} was forfeited for an illegal move: {:?}",
                 side.name, side.last_error
             );
+            // An out-of-turn action is *not* an illegal move server-side: the
+            // hub answers `handleMove`'s "It is not this player's turn" with a
+            // plain `error` frame and no log line (hub.go:1016, :344-349). So
+            // the client's error counter is the only place it can show up, and
+            // a zero here is what proves no action was emitted off-turn.
             assert_eq!(
                 side.errors, 0,
                 "{} received {} server errors, last: {:?}",
@@ -296,14 +460,15 @@ async fn run_scenario(scenario: Scenario) -> Report {
         .unwrap_or_else(|error| panic!("could not start {}: {error}", server.binary.display()));
 
     let target_games = scenario.target_games;
-    let outcome = tokio::time::timeout(OVERALL_TIMEOUT, play(port, scenario)).await;
+    let timeout = scenario.timeout;
+    let outcome = tokio::time::timeout(timeout, play(port, scenario)).await;
 
     let _ = child.kill().await;
     let server_output = std::fs::read_to_string(&server_log).unwrap_or_default();
 
     let Ok((challenger, acceptor)) = outcome else {
         panic!(
-            "the run did not finish {target_games} games within {OVERALL_TIMEOUT:?}\n\
+            "the run did not finish {target_games} games within {timeout:?}\n\
              --- server log tail ---\n{}",
             tail(&server_output)
         );
@@ -320,30 +485,42 @@ async fn play(port: u16, scenario: Scenario) -> (Side, Side) {
 
     let url = format!("ws://127.0.0.1:{port}/ws");
 
+    // These runs are scaled down to hundreds of milliseconds a turn and the
+    // developer box is shared, so a scheduler hiccup can be a large fraction of
+    // an action's ceiling. A generous grace keeps that from reading as an engine
+    // overrun; the fallback's *timing* is pinned precisely by
+    // `virus-proto/tests/time_manager.rs`, where nothing else is competing.
+    const ITEST_FALLBACK_GRACE: Duration = Duration::from_secs(2);
+
     // The challenger's timer is the sole send driver; a short interval only
     // makes the run quick, it does not change the mechanism.
-    let (challenger, mut challenger_inbox) = Bot::new(
-        Arc::new(BotConfig {
-            backend_url: url.clone(),
-            name_prefix: "ITestChallenger".to_owned(),
-            move_budget: scenario.move_budget,
-            challenger: true,
-            challenge_interval: Duration::from_secs(2),
-            rng_seed: Some(0x5EED),
-            ..BotConfig::default()
-        }),
-        scenario.challenger,
-    );
-    let (acceptor, mut acceptor_inbox) = Bot::new(
-        Arc::new(BotConfig {
-            backend_url: url,
-            name_prefix: "ITestAcceptor".to_owned(),
-            move_budget: scenario.move_budget,
-            ..BotConfig::default()
-        }),
-        scenario.acceptor,
-    );
+    let mut challenger_config = BotConfig {
+        backend_url: url.clone(),
+        name_prefix: "ITestChallenger".to_owned(),
+        challenger: true,
+        challenge_interval: Duration::from_secs(2),
+        rng_seed: Some(0x5EED),
+        // Only the challenger ponders, so one run carries both the new
+        // behaviour and its control.
+        ponder: scenario.ponder,
+        ponder_budget: Duration::from_secs(5),
+        fallback_grace: ITEST_FALLBACK_GRACE,
+        ..BotConfig::default()
+    };
+    scenario.budget.apply(&mut challenger_config);
+    let (challenger, mut challenger_inbox) =
+        Bot::new(Arc::new(challenger_config), scenario.challenger);
+
+    let mut acceptor_config = BotConfig {
+        backend_url: url,
+        name_prefix: "ITestAcceptor".to_owned(),
+        fallback_grace: ITEST_FALLBACK_GRACE,
+        ..BotConfig::default()
+    };
+    scenario.budget.apply(&mut acceptor_config);
+    let (acceptor, mut acceptor_inbox) = Bot::new(Arc::new(acceptor_config), scenario.acceptor);
     let target_games = scenario.target_games;
+    let timeout = scenario.timeout;
 
     let acceptor_task = {
         let bot = acceptor.clone();
@@ -365,7 +542,7 @@ async fn play(port: u16, scenario: Scenario) -> (Side, Side) {
         if done || broken {
             break;
         }
-        if started.elapsed() > OVERALL_TIMEOUT {
+        if started.elapsed() > timeout {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -385,6 +562,9 @@ fn side(name: &'static str, bot: &Bot) -> Side {
         illegal_moves: core.counters.illegal_moves,
         actions_sent: core.counters.actions_sent,
         games_finished: core.counters.games_finished,
+        fallback_actions: core.counters.fallback_actions,
+        ponder_steps: core.counters.ponder_steps,
+        ponder_answers: core.counters.ponder_answers,
         last_error: core.last_error.clone(),
     }
 }

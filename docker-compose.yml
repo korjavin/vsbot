@@ -37,14 +37,37 @@ services:
       # e.g. "SuperiorBot Bot 2127".
       BOT_NAME_PREFIX: ${BOT_NAME_PREFIX:-SuperiorBot}
 
-      # GREEDY is the only engine that starts today (see the note above).
+      # MCTS is the production engine; ALPHABETA still aborts startup.
       SEARCH: ${SEARCH:-MCTS}
       # Absolute path: the image bakes artifacts under /opt/vsbot but runs from /home/vsbot.
       MCTS_ARTIFACT: ${MCTS_ARTIFACT:-/opt/vsbot/artifacts/mcts_champion.json}
 
-      # Wall-clock budget per action. The owner's UX bound is 10-15 s for a
-      # 3-action turn (docs), so keep this comfortably under ~3 s.
-      MOVE_MILLIS: ${MOVE_MILLIS:-1000}
+      # Wall-clock budget for a whole 3-action turn, split 50/30/20 across the
+      # turn's actions by the intra-turn allocator. The owner's UX bound is
+      # 10-15 s per turn (owner directive 2026-08-13); the server's 120 s
+      # per-action timer is a failsafe, not a budget.
+      VSBOT_TURN_MILLIS: ${VSBOT_TURN_MILLIS:-12000}
+
+      # Per-action override. Setting either of these DISABLES the allocator and
+      # gives every action a fixed budget — that is for gauntlets and A/Bs, not
+      # live play. Both are forwarded unset (empty reads as unset in the binary)
+      # so an existing .env keeps working: before the allocator landed the image
+      # hard-coded MOVE_MILLIS=1000, and an operator who set it must still get
+      # what they asked for rather than a silent switch to the turn budget.
+      # VSBOT_MOVE_MILLIS wins if both are set.
+      VSBOT_MOVE_MILLIS: ${VSBOT_MOVE_MILLIS:-}
+      MOVE_MILLIS: ${MOVE_MILLIS:-}
+
+      # The two visit-based stop rules, on by default. Unset here so the
+      # binary's defaults are the single source of truth.
+      VSBOT_EARLY_STOP: ${VSBOT_EARLY_STOP:-}
+      VSBOT_EXTENSION: ${VSBOT_EXTENSION:-}
+
+      # Pondering searches the opponent's positions during their turn. It is a
+      # behaviour change the owner judges, so it ships canary-first: an explicit
+      # documented "off" here rather than an omission someone mistakes for one.
+      VSBOT_PONDER: ${VSBOT_PONDER:-false}
+      VSBOT_PONDER_SECS: ${VSBOT_PONDER_SECS:-}
 
       # ACCEPT-ONLY. Challenger mode makes the bot initiate games on a timer;
       # against the *public* server that means pestering real humans with a
