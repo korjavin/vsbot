@@ -1,0 +1,89 @@
+# Builds and publishes the deployment image to GHCR.
+#
+# Kept separate from ci.yml on purpose: ci.yml is the correctness gate (fmt,
+# clippy, test, parity fixtures) and must stay fast and reviewable on every PR.
+# This workflow only produces an artifact, and only from master.
+#
+# On a pull request it builds but does **not** push, so a broken Dockerfile is
+# caught in review rather than on master.
+name: Docker image
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "docker-compose.yml"
+      - ".github/workflows/docker.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: build and push ghcr.io image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Skipped on pull_request: a fork PR's GITHUB_TOKEN cannot write packages,
+      # and there is nothing to log in for when push is false.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # Pushing only from master keeps the registry free of per-PR images;
+          # the build itself still runs on PRs as the Dockerfile's test.
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The dependency layer (ring, rustls, tokio) is the slow part and is
+          # keyed on the manifests alone, so it survives ordinary source edits.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report what was published
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Published image"
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

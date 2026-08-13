@@ -1,0 +1,38 @@
+# Keep the build context small and the layer cache stable. Only the workspace
+# manifests, crates/ and artifacts/ actually reach the builder.
+
+# Build output — by far the biggest thing in the tree, and useless in the image
+# (the container's toolchain is not the host's).
+target
+**/target
+
+# VCS, tracking and agent scaffolding.
+.git
+.gitignore
+.github
+.beads
+.beads.gate.lock
+.claude
+.codex
+.cursor
+.agents
+
+# Parity fixtures are test-only inputs (nothing is `include_str!`d from them),
+# so they stay out of the context. artifacts/ is NOT ignored: it is baked in.
+fixtures
+
+# Docs.
+*.md
+docs
+LICENSE
+
+# Deployment files themselves — changing a compose comment should not bust the
+# image cache.
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Local secrets and noise.
+.env
+*.log
+Cargo.lock.orig

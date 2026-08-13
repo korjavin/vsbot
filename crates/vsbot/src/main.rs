@@ -27,6 +27,8 @@ use std::time::Duration;
 use virus_proto::{Bot, BotConfig, EngineKind, GreedyEngine, SearchEngine};
 
 fn main() -> ExitCode {
+    install_crypto_provider();
+
     let settings = match Settings::from(|key| std::env::var(key).ok()) {
         Ok(settings) => settings,
         Err(error) => {
@@ -65,6 +67,22 @@ fn main() -> ExitCode {
         let (bot, mut inbox) = Bot::new(Arc::new(settings.bot), engine);
         virus_proto::run_forever(&bot, &mut inbox).await
     })
+}
+
+/// Selects rustls' crypto provider before any TLS is attempted.
+///
+/// `tokio-tungstenite`'s `rustls-tls-webpki-roots` feature brings in rustls but
+/// picks no provider, so rustls 0.23 cannot infer a process-level default and
+/// **panics inside the connect future** the first time a `wss://` URL is
+/// dialled. That panic is invisible until the bot is pointed at production —
+/// exactly how it was found: the container came up, printed its banner, and
+/// died on the first handshake against `wss://vs.wandergeek.org/ws`.
+///
+/// Doing it here, eagerly, converts a first-connection crash into a startup
+/// crash. `install_default` returns `Err` only if a provider is already
+/// installed, which cannot happen this early but is harmless either way.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 /// Everything the process needs, resolved from the environment exactly once.

@@ -19,6 +19,9 @@ virus-mcts = { workspace = true }
 virus-proto = { workspace = true }
 virus-arena = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+# Not used for its API — only to select rustls' crypto provider for the whole
+# build (see `main`). Without it a `wss://` connection panics on first dial.
+rustls = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

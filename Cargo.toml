@@ -35,6 +35,12 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "handshake",
     "rustls-tls-webpki-roots",
 ] }
+# tokio-tungstenite 0.30 pulls rustls but deliberately picks **no** crypto
+# provider, so a `wss://` dial panics at handshake time unless the application
+# selects one. `default-features = false` matters: rustls' defaults would turn
+# on `aws-lc-rs` *as well as* our `ring`, and two providers are as fatal as
+# zero. Only the `vsbot` bin depends on this — see its `main`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 uuid = { version = "1", features = ["v4"] }
 

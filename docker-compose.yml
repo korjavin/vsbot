@@ -1,0 +1,78 @@
+# vsbot — live deployment against the public virusgame server.
+#
+# Runbook, env knobs and the promote/rollback procedure: see DEPLOY.md.
+#
+# WHAT THIS IS, HONESTLY: a **protocol soak test**, not a strength claim. The
+# only engine wired into the binary today is `GREEDY` — the deliberately weak
+# reference engine that exists so the wire protocol can be exercised end to end.
+# `virus-search` (alpha-beta) and `virus-mcts` (PUCT) are still stubs and are a
+# hard startup failure if selected, precisely so a deployment can never *think*
+# it is running the champion while playing at random. Flip SEARCH once they
+# merge; until then this stack proves connectivity, reconnection, turn handling
+# and legality — nothing about playing well.
+
+# Pin the compose project name instead of inheriting the directory name, so the
+# stack is the same object whether it is brought up from the repo root, a git
+# worktree, or a Portainer stack directory.
+name: vsbot
+
+services:
+  vsbot:
+    # Pinning: :latest tracks master (pushed by .github/workflows/docker.yml).
+    # Set VSBOT_TAG to a commit SHA to freeze or to roll back — see DEPLOY.md.
+    image: ghcr.io/korjavin/vsbot:${VSBOT_TAG:-latest}
+    # Lets the same file serve a from-source deploy: `docker compose up -d
+    # --build`. Ignored when the image is pulled.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vsbot
+    restart: unless-stopped
+
+    environment:
+      # Production endpoint. The route is /ws (virusgame backend main.go);
+      # a plain GET returns 400 because it is WebSocket-only. The binary
+      # appends ?bot=true (and &namePrefix=…) itself — do not add them here.
+      BACKEND_URL: wss://vs.wandergeek.org/ws
+
+      # The lobby name. The server appends its own suffix, so this shows up as
+      # e.g. "SuperiorBot Bot 2127".
+      BOT_NAME_PREFIX: ${BOT_NAME_PREFIX:-SuperiorBot}
+
+      # GREEDY is the only engine that starts today (see the note above).
+      SEARCH: ${SEARCH:-GREEDY}
+
+      # Wall-clock budget per action. The owner's UX bound is 10-15 s for a
+      # 3-action turn (docs), so keep this comfortably under ~3 s.
+      MOVE_MILLIS: ${MOVE_MILLIS:-1000}
+
+      # ACCEPT-ONLY. Challenger mode makes the bot initiate games on a timer;
+      # against the *public* server that means pestering real humans with a
+      # greedy bot. Leave this false in production. It is here as an explicit,
+      # documented "off" rather than an omission someone later mistakes for an
+      # oversight.
+      CHALLENGER: "false"
+
+    # The host is 4 vCPU / 8 GB and runs other stacks (traefik, portainer,
+    # omnigent, postgres). GREEDY barely registers; the headroom is sized for
+    # MCTS later, when the search actually uses its budget.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+        reservations:
+          memory: 128M
+
+    # Without rotation a restart-looping bot fills the disk with reconnect
+    # noise. 3 x 10 MB is plenty to debug a bad night.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # No ports: the bot dials out and never listens. No volumes: the trained
+    # artifacts are baked into the image.
+    security_opt:
+      - no-new-privileges:true
