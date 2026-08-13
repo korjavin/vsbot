@@ -69,7 +69,7 @@ WORKDIR /home/vsbot
 # the production values.
 ENV BACKEND_URL=ws://localhost:8080/ws \
     SEARCH=GREEDY \
-    VSBOT_TURN_MILLIS=12000 \
+    VSBOT_TURN_MILLIS=10000 \
     VSBOT_PONDER=false \
     CHALLENGER=false
 
