@@ -51,6 +51,20 @@ must stay **zero** — a non-zero value means an action blew through its ceiling
 and was answered with the pre-selected fallback instead of a searched move — and
 `illegal_moves` must stay zero, as always.
 
+### Upgrading past the time manager
+
+Before the allocator, the image hard-coded `MOVE_MILLIS=1000` and every action
+got a second. Now the image sets `VSBOT_TURN_MILLIS=12000` and no per-action
+override, so a plain `docker compose pull && up -d` **changes the bot's pace**:
+one 12 s turn instead of three 1 s actions. That is the intended S2 behaviour and
+it is inside the owner's UX bound — but it is a behaviour change, so canary it
+rather than rolling it straight onto the default identity.
+
+An operator who had `MOVE_MILLIS=…` in their `.env` keeps exactly what they had:
+compose still forwards `MOVE_MILLIS` and `VSBOT_MOVE_MILLIS`, and either one
+disables the allocator. To go back to the old pace deliberately, put
+`VSBOT_MOVE_MILLIS=1000` in `.env`.
+
 Compose-only knobs (consumed by `docker-compose.yml`, not by the binary):
 
 | Variable | Default | Meaning |

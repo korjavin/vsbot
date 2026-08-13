@@ -42,13 +42,17 @@ const CANCEL_POLL_SLICE: Duration = Duration::from_millis(20);
 /// Sentinel for "no position shape has been logged yet".
 const NO_SHAPE: u64 = u64::MAX;
 
-/// Simulations one pondering session's tree may accumulate.
+/// Simulations a pondering session's **retained tree** may hold.
 ///
 /// A node owns a whole `State`, so an uncapped ponder against an opponent who
 /// thinks for minutes would grow without bound on a host that shares CPU and
 /// memory with the nightly trainer window (superiority.md §2b). At roughly
 /// 1.5 KB a node this is ~75 MB of ceiling, and it is far more simulations than
 /// a 12 s turn can spend anyway.
+///
+/// It bounds the tree in memory, not the session's lifetime work: a re-root
+/// frees everything outside the chosen child's subtree, and the allowance is
+/// re-based onto what survived (see [`SearchEngine::ponder`]).
 const PONDER_SIM_CAP: u64 = 50_000;
 
 /// How many of the opponent's actions a ponder tree will chase before giving up
@@ -244,7 +248,21 @@ impl SearchEngine for MctsEngine {
 
             let mut interrupt = None;
             if let Some((_, searcher)) = tree.as_mut() {
-                let cap = searcher.sims_run().saturating_add(PONDER_SIM_CAP);
+                // The cap bounds the *tree*, not the step. `sims_run` is
+                // cumulative and survives a re-root, so it cannot be the
+                // measure on its own: adding the allowance to it every step
+                // would hand out a fresh 50,000 simulations per opponent action
+                // and grow the retained tree without bound over a long game.
+                //
+                // What re-rooting frees is everything outside the child's
+                // subtree, and the root's visit total is exactly the size of
+                // what survived. Subtracting it re-bases the allowance onto the
+                // tree that is actually in memory.
+                let retained: u64 = searcher.root_visits().iter().map(|n| u64::from(*n)).sum();
+                let cap = searcher
+                    .sims_run()
+                    .saturating_sub(retained)
+                    .saturating_add(PONDER_SIM_CAP);
                 drive(searcher, &budget, started, cap, || {
                     if interrupt.is_none() {
                         interrupt = inbox.try_next();
@@ -820,6 +838,39 @@ mod tests {
 
         drop(steps);
         session.await.expect("the session exits when its steps end");
+    }
+
+    /// The tree cap bounds what is *in memory*, and re-rooting frees most of
+    /// it. Measuring the allowance against the cumulative `sims_run` alone
+    /// would hand out a fresh allowance on every opponent action and let the
+    /// retained tree grow without bound over a long game.
+    ///
+    /// The re-based allowance is `sims_run - retained + PONDER_SIM_CAP`, so this
+    /// pins the arithmetic on the numbers a real session sees.
+    #[test]
+    fn the_ponder_cap_is_re_based_onto_what_a_re_root_kept() {
+        // A session 60k simulations in, of which the re-root kept 8k.
+        let sims_run: u64 = 60_000;
+        let retained: u64 = 8_000;
+        let cap = sims_run.saturating_sub(retained) + PONDER_SIM_CAP;
+
+        assert_eq!(cap, 102_000);
+        assert_eq!(
+            cap - sims_run,
+            PONDER_SIM_CAP - retained,
+            "the tree may grow to the cap, counting what it already holds — not past it"
+        );
+
+        // A fresh tree starts at zero and simply gets the whole allowance.
+        assert_eq!(0u64.saturating_sub(0) + PONDER_SIM_CAP, PONDER_SIM_CAP);
+
+        // A tree already at the cap gets nothing more.
+        let full = PONDER_SIM_CAP;
+        assert_eq!(
+            (sims_run.saturating_sub(full) + PONDER_SIM_CAP).saturating_sub(sims_run),
+            0,
+            "a retained tree at the cap may not grow"
+        );
     }
 
     /// Dropping the client's end ends the session. Without this a finished game

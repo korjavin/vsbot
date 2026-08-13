@@ -172,6 +172,11 @@ pub struct BotCore {
     position_key: Option<(u64, bool, Player)>,
     /// The version a search has already been started for.
     searched_version: u64,
+    /// The version a ponder step has already been queued for. The mirror of
+    /// [`BotCore::searched_version`], and needed for the same reason: the
+    /// server sends `move_made` and then `game_state` for one position, and a
+    /// resync can repeat a frame verbatim. One snapshot, one step.
+    pondered_version: u64,
     /// Cancels the in-flight search.
     cancel: Option<CancellationToken>,
     /// When the optimistic challenger busy-flag was set.
@@ -211,6 +216,7 @@ impl Default for BotCore {
             last_error: None,
             position_key: None,
             searched_version: 0,
+            pondered_version: 0,
             cancel: None,
             pending_game_since: None,
             last_resync: None,
@@ -641,6 +647,7 @@ impl Bot {
             core.current_game = Some(message.game_id.clone());
             core.seat = message.your_player as Player;
             core.searched_version = 0;
+            core.pondered_version = 0;
             core.pending_game_since = None;
             core.allocator = self.config.allocator();
             // Clearing the key forces the install even when a rematch happens
@@ -824,7 +831,7 @@ impl Bot {
         }
         let step = {
             let mut core = self.core();
-            if !core.may_ponder() {
+            if !core.may_ponder() || core.pondered_version == core.position_version {
                 return;
             }
             let (Some(game_id), Some(position)) =
@@ -834,6 +841,7 @@ impl Bot {
             };
             self.ensure_ponder_session(&mut core, &game_id);
             let cancel = CancellationToken::new();
+            core.pondered_version = core.position_version;
             let Some(slot) = core.ponder.as_mut() else {
                 return;
             };
