@@ -36,16 +36,25 @@ jobs:
       contents: read
       packages: write
 
+    env:
+      # Publish only from the default branch, and let login / push / the summary
+      # all key off the same expression. Testing the *ref* rather than the event
+      # matters for `workflow_dispatch`: dispatched from a feature branch the
+      # tag rules below (`enable={{is_default_branch}}`) produce nothing, so a
+      # push would try to upload an untagged image and fail the job. Off master,
+      # a manual run is a Dockerfile build test and stops there.
+      PUBLISH: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Skipped on pull_request: a fork PR's GITHUB_TOKEN cannot write packages,
-      # and there is nothing to log in for when push is false.
+      # Nothing to log in for when we are not pushing — and a fork PR's
+      # GITHUB_TOKEN cannot write packages anyway.
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: env.PUBLISH == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -68,7 +77,7 @@ jobs:
           file: ./Dockerfile
           # Pushing only from master keeps the registry free of per-PR images;
           # the build itself still runs on PRs as the Dockerfile's test.
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ env.PUBLISH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # The dependency layer (ring, rustls, tokio) is the slow part and is
@@ -77,7 +86,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Report what was published
-        if: github.event_name != 'pull_request'
+        if: env.PUBLISH == 'true'
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
