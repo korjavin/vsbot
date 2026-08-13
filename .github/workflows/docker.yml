@@ -1,11 +1,21 @@
-# Builds and publishes the deployment image to GHCR.
+# Builds and publishes the deployment image to GHCR, then moves the `deploy`
+# branch onto it and asks Portainer to redeploy.
 #
 # Kept separate from ci.yml on purpose: ci.yml is the correctness gate (fmt,
 # clippy, test, parity fixtures) and must stay fast and reviewable on every PR.
-# This workflow only produces an artifact, and only from master.
+# This workflow only produces an artifact — and, from master, publishes it.
 #
 # On a pull request it builds but does **not** push, so a broken Dockerfile is
-# caught in review rather than on master.
+# caught in review rather than on master; the deploy half runs as a dry run
+# (render + `docker compose config`) so the templating is proven on the PR
+# branch even though the branch move and the webhooks can only happen on master.
+#
+# The `deploy` branch is CI-owned and force-pushed. Never commit to it by hand:
+# its docker-compose.yml is generated from deploy/docker-compose.yml with the
+# image pinned to the immutable sha tag built by this same run, which is what
+# lets a remote Portainer stack say exactly which commit it is running. The
+# repository-root docker-compose.yml is untouched by all of this — it stays the
+# local-development stack (it still has `build:`).
 name: Docker image
 
 on:
@@ -16,6 +26,7 @@ on:
       - "Dockerfile"
       - ".dockerignore"
       - "docker-compose.yml"
+      - "deploy/**"
       - ".github/workflows/docker.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -35,6 +46,11 @@ jobs:
     permissions:
       contents: read
       packages: write
+
+    outputs:
+      # Non-empty only on a publishing run; the deploy job keys off exactly that
+      # rather than re-deriving "are we on master" a second time.
+      image_ref: ${{ steps.pinned.outputs.image_ref }}
 
     env:
       # Publish only from the default branch, and let login / push / the summary
@@ -85,6 +101,24 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The deploy branch must pin something immutable, so take the sha- tag
+      # metadata-action actually emitted rather than re-spelling its format
+      # here; if the tag rules above ever stop producing one, this fails the
+      # run instead of quietly deploying a moving `:latest`.
+      - name: Resolve the immutable image reference
+        id: pinned
+        if: env.PUBLISH == 'true'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          ref=$(printf '%s\n' "$TAGS" | grep -m1 ':sha-' || true)
+          if [ -z "$ref" ]; then
+            echo "no immutable sha- tag among the published tags:" >&2
+            printf '%s\n' "$TAGS" >&2
+            exit 1
+          fi
+          echo "image_ref=$ref" >> "$GITHUB_OUTPUT"
+
       - name: Report what was published
         if: env.PUBLISH == 'true'
         env:
@@ -94,5 +128,161 @@ jobs:
             echo "### Published image"
             echo '```'
             echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Move the deploy branch onto the image this run built, then poke Portainer.
+  # Runs only when something was actually published (see `image_ref` above).
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: publish deploy branch and redeploy
+    needs: build-and-push
+    if: needs.build-and-push.outputs.image_ref != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      # Force-pushing the deploy branch is the whole point of this job; it needs
+      # nothing else — the image was already pushed by the job above.
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render the deploy-branch compose
+        env:
+          IMAGE_REF: ${{ needs.build-and-push.outputs.image_ref }}
+        run: |
+          ./deploy/render.sh "$IMAGE_REF" docker-compose.yml
+          docker compose -f docker-compose.yml --project-name vsbot-deploy-check config >/dev/null
+          echo "rendered compose validates"
+
+      # The deploy branch is a full copy of the built commit with one file
+      # replaced, so `git checkout -B deploy` starts from what was just built —
+      # never from whatever the previous deploy branch happened to hold. That
+      # also makes the branch fast-forward-hostile on purpose: it is rewritten,
+      # not appended to, which is why the push is `--force`.
+      - name: Force-push the deploy branch
+        env:
+          IMAGE_REF: ${{ needs.build-and-push.outputs.image_ref }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B deploy
+          git add docker-compose.yml
+          # Belt and braces: the root compose is the only file this job may
+          # change. Anything else staged means render.sh grew a side effect.
+          changed=$(git diff --cached --name-only)
+          if [ "$changed" != "docker-compose.yml" ]; then
+            echo "unexpected staged changes: $changed" >&2
+            exit 1
+          fi
+          git commit -m "ci: deploy ${COMMIT_SHA} (${IMAGE_REF})"
+          git push origin deploy --force
+          {
+            echo "### Deploy branch updated"
+            echo ""
+            echo "Image: \`${IMAGE_REF}\`"
+            echo ""
+            echo "Portainer stacks tracking \`refs/heads/deploy\` will pick this up."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Optional, and silent when unset: the owner adds a secret once the remote
+      # stack exists. Each secret may itself hold several URLs separated by
+      # commas or whitespace, so one secret can fan out to N stacks; the
+      # numbered ones are there for people who would rather keep them apart.
+      # A failing webhook is reported loudly but does not fail master — the
+      # image and the deploy branch are already correct at that point, and a
+      # Portainer that was down when we knocked is an operational problem, not a
+      # bad build. Nothing ever prints a URL.
+      - name: Trigger Portainer redeploy webhooks
+        continue-on-error: true
+        env:
+          WEBHOOKS_1: ${{ secrets.PORTAINER_WEBHOOK_URL }}
+          WEBHOOKS_2: ${{ secrets.PORTAINER_WEBHOOK_URL_2 }}
+          WEBHOOKS_3: ${{ secrets.PORTAINER_WEBHOOK_URL_3 }}
+        run: |
+          set -u
+          fired=0
+          failed=0
+          n=0
+          for blob in "$WEBHOOKS_1" "$WEBHOOKS_2" "$WEBHOOKS_3"; do
+            [ -n "$blob" ] || continue
+            for url in $(printf '%s' "$blob" | tr ',' ' '); do
+              [ -n "$url" ] || continue
+              n=$((n + 1))
+              # curl's own error text can echo the URL back, so it is dropped;
+              # an unreachable host leaves %{http_code} empty, reported as 000.
+              code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+                       --max-time 30 --retry 2 --retry-delay 5 "$url" 2>/dev/null || true)
+              [ -n "$code" ] || code="000"
+              case "$code" in
+                2*|3*)
+                  echo "webhook #$n: HTTP $code"
+                  fired=$((fired + 1))
+                  ;;
+                *)
+                  echo "::warning title=Portainer webhook failed::webhook #$n returned HTTP $code"
+                  failed=$((failed + 1))
+                  ;;
+              esac
+            done
+          done
+          if [ "$n" -eq 0 ]; then
+            echo "no PORTAINER_WEBHOOK_URL* secret set — nothing to notify (this is fine)"
+            echo "_No Portainer webhook configured._" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "Portainer webhooks: ${fired} ok, ${failed} failed" >> "$GITHUB_STEP_SUMMARY"
+          [ "$failed" -eq 0 ]
+
+  # ---------------------------------------------------------------------------
+  # What the deploy job would produce, on branches that may not push it. Cheap
+  # (no image build, no registry) and it exercises the same render.sh, so a PR
+  # that breaks the template or the script fails in review rather than on the
+  # master push that would have deployed it.
+  # ---------------------------------------------------------------------------
+  deploy-dry-run:
+    name: deploy branch dry run
+    if: github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # REGISTRY and IMAGE_NAME come from the workflow-level env, so the dry run
+      # cannot drift from what the real job publishes.
+      - name: Render with a stand-in reference and validate
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          ref="${REGISTRY}/${IMAGE_NAME}:sha-${COMMIT_SHA}"
+          ./deploy/render.sh "$ref" rendered-compose.yml
+          docker compose -f rendered-compose.yml --project-name vsbot-deploy-check config >/dev/null
+
+          # The dry run must never disturb the local-development stack; the real
+          # job writes docker-compose.yml, this one writes elsewhere, and the
+          # root file has to be byte-identical to the checkout either way.
+          git diff --exit-code -- docker-compose.yml
+          grep -q 'build:' docker-compose.yml || {
+            echo "root docker-compose.yml lost its build: key" >&2; exit 1; }
+
+          {
+            echo "### Deploy branch dry run"
+            echo ""
+            echo "On a master push this run would pin:"
+            echo ""
+            echo "    ${ref}"
+            echo ""
+            echo "and force-push it to \`deploy\`. Rendered compose:"
+            echo ""
+            echo '```yaml'
+            grep -vE '^\s*#|^$' rendered-compose.yml
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
