@@ -137,6 +137,50 @@ VSBOT_CROSSPLAY=1 cargo test -p virus-arena --test crossplay -- --nocapture
 | `VSBOT_CROSSPLAY_TIMEOUT` | `1800` |
 | `VSBOT_ITEST_BACKEND` | `$HOME/Project/virusgame/backend` |
 
+### Opening diversity: why a game count is not a sample size
+
+Both deployed engines play argmax with no root noise, so with nothing
+randomising the opening a run **replays one game**. Measured (bd `vsbot-t3q.2`):
+the 400-game S1 run contained 65 distinct games, and the 50-game run behind the
+`49-1` contained 5. Every Wilson interval taken off the game count was therefore
+far too narrow.
+
+`vsbot` now carries the arena's lever: `--explore-eps` (default `0.15`) and
+`--explore-turns` (default `8`) drive `VSBOT_EXPLORE_EPS` /
+`VSBOT_EXPLORE_TURNS`, and inside that window it plays a uniformly random legal
+action instead of the searched one. **50 of 50 games are now distinct** on the
+Go-bot smoke, against 5 before.
+
+Three details are load-bearing:
+
+* **The window is counted in vsbot's own turns**, not the game's — a client
+  never sees the opponent's turns. Eight of ours is ~24 coin flips, the same
+  opening noise per game an `arena` run spends across *both* its sides, which is
+  what it takes for one-sided exploration to reach the arena's diversity.
+* **Seeds are derived, not reused.** Every phase, every `--vsbot-instances`
+  process and every `crossplay_pool.py` shard gets a disjoint stream mixed off
+  `--explore-seed` (default `20260813`); the per-game seed inside a process is
+  `mix64(seed ^ GOLDEN_GAMMA * (game + 1))`. Two vsbots on one seed would derive
+  the same schedule and replay each other, and `seed + k` is what caused
+  `nnue-trainer-riy`. `--self-test` covers the derivation, so CI does too.
+* **Only our side explores, on purpose.** The Go hoster's
+  `BOT_EXPLORE_EPSILON` applies to every turn of every game from an unseeded
+  global RNG (`--opponent-explore-eps` exposes it; it is never right for a
+  gating run), and the Java bot's `CHALLENGER_EXPLORE` only reaches its
+  `SEARCH=GOBOT` path, so it does nothing under `SEARCH=MCTS`. The asymmetry
+  handicaps `vsbot`, which is the safe direction for a "vsbot is stronger"
+  claim.
+
+A seed pins the **exploration schedule** — which of our plies are overridden and
+by which legal action — and not the games: a fixed-time engine against a live
+opponent is a wall-clock measurement, exactly as `ms:` mode is in the arena.
+`--explore-eps 0` reproduces the pre-fix harness, and the low-diversity warning
+then says so.
+
+Exploration is refused together with `VSBOT_PONDER`: a pondering session answers
+actions without ever consulting the exploration wrapper, so the two together
+would silently randomise nothing.
+
 It is a script rather than an `arena` subcommand because it orchestrates three
 external processes and reads an SQLite file — which this crate would otherwise
 need a C dependency to open, for a job Python's standard library already does.
@@ -178,7 +222,8 @@ is lopsided. **Read a cross-play result as a plumbing check, not as strength.**
 picks any idle peer, including another `vsbot`, so a multi-instance run spends
 about half its time on vsbot-vs-vsbot games. The name filter excludes them from
 the tally — they are never miscounted, only wasted — and the trade for
-concurrency is usually still worth it.
+concurrency is usually still worth it. (Each instance does get its own
+exploration stream, so the wasted games are not also correlated ones.)
 
 `SEARCH=ALPHABETA` and `SEARCH=MCTS` are rejected by the `vsbot` binary until
 the engine wiring lands (`build_engine` in `crates/vsbot/src/main.rs`), so the

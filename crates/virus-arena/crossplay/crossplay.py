@@ -57,6 +57,41 @@ structural rather than a matter of configuration:
   the Java bot challenging (``vsbot`` at P2) — and the pooled number is
   colour-balanced the way an ``arena`` gauntlet is.
 
+Opening diversity, and why a game count is not a sample size
+------------------------------------------------------------
+
+Both deployed engines play argmax with no root noise, so with nothing
+randomising the opening a run *replays one game*.  Measured (bd
+``vsbot-t3q.2``): the 400-game S1 run contained **65 distinct games**, and the
+50-game run behind the ``49-1`` contained **5**.  Every Wilson interval computed
+from the game count was therefore far too narrow, and no cross-play number could
+gate anything.
+
+``arena`` solves this with seeded eps-greedy openings.  Neither *deployed* bot
+had an equivalent, so ``vsbot`` grew one: ``VSBOT_EXPLORE_EPS`` /
+``VSBOT_EXPLORE_TURNS`` / ``VSBOT_EXPLORE_SEED`` (see ``crates/vsbot/src/
+explore.rs``).  This script drives them, and derives a **disjoint stream per
+phase and per instance** from ``--explore-seed`` so two vsbots in one lobby, or
+two shards of a pooled run, never replay each other.  The default is on: a
+cross-play run with no diversity is not a measurement.
+
+Only *our* side explores, and that is a deliberate asymmetry rather than an
+oversight:
+
+* The Go bot-hoster's ``BOT_EXPLORE_EPSILON`` applies to **every turn of every
+  game**, from an unseeded global ``rand``.  It would weaken the opponent for a
+  whole game and do it unreproducibly, which biases the result the *favourable*
+  way and cannot be replayed.  It is pinned to ``0`` unless
+  ``--opponent-explore-eps`` asks otherwise, and asking is never appropriate for
+  a gating run.
+* The Java bot's ``CHALLENGER_EXPLORE`` only reaches the ``SEARCH=GOBOT`` path
+  (``GameLoopHandler`` samples through ``GoBotExploration``), so it does nothing
+  at all in the ``SEARCH=MCTS`` configuration S1 measures.
+
+One-sided exploration handicaps ``vsbot`` — it plays a few random opening moves
+its opponent does not.  That is the safe direction for a "vsbot is stronger"
+claim, and it is stated in ``docs/benchmarks.md`` rather than hidden.
+
 Usage::
 
     # vsbot vs the Go bot (one chair only; a plumbing check)
@@ -99,6 +134,48 @@ PATCHED_LISTEN = (
 
 class Failure(RuntimeError):
     """Anything that means the run cannot produce a trustworthy number."""
+
+
+# Opening exploration is ON by default: a cross-play run without it measures a
+# handful of games however many it plays (bd `vsbot-t3q.2`). The numbers mirror
+# `virus_arena::gauntlet`'s -- eps 0.15 over an 8-turn window -- with the window
+# counted in vsbot's *own* turns, because only one side of a cross-play match
+# can be made to explore and it should carry the whole of the arena's noise.
+DEFAULT_EXPLORE_EPS = 0.15
+DEFAULT_EXPLORE_TURNS = 8
+DEFAULT_EXPLORE_SEED = 20260813
+
+_MASK64 = (1 << 64) - 1
+# SplitMix64's golden-ratio stride, the same constant `virus_arena::rng` uses.
+GOLDEN_GAMMA = 0x9E3779B97F4A7C15
+
+
+def mix64(z: int) -> int:
+    """SplitMix64's finalizer: a bijection on u64 with full avalanche.
+
+    Constant for constant with ``virus_arena::rng::mix64`` and
+    ``vsbot::explore``, so the seed a shard is handed here means the same thing
+    the Rust side computes from it.
+    """
+    z &= _MASK64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return z ^ (z >> 31)
+
+
+def derive_seed(base: int, stream: int) -> int:
+    """A disjoint sub-seed of ``base`` for stream index ``stream``.
+
+    Every vsbot process in a run needs its own exploration seed: two processes
+    handed the same one derive the same per-game schedule and replay each
+    other's openings, which is the very failure this whole mechanism exists to
+    remove.  ``base + stream`` is the obvious way to split a seed and it is the
+    wrong one -- that is ``nnue-trainer-riy``, where two runs launched at nearby
+    seeds turned out to be replaying each other.  Golden-ratio stride through a
+    full-avalanche mixer instead, exactly as
+    ``virus_arena::rng::derive_game_seed`` does for a pair index.
+    """
+    return mix64((base & _MASK64) ^ ((GOLDEN_GAMMA * ((stream & _MASK64) + 1)) & _MASK64))
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -194,6 +271,47 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=5,
         help="how often each vsbot instance offers a new game",
+    )
+    parser.add_argument(
+        "--explore-eps",
+        type=float,
+        default=DEFAULT_EXPLORE_EPS,
+        help=(
+            "vsbot's opening-exploration probability (VSBOT_EXPLORE_EPS). This "
+            "is what makes a run's games distinct; 0 reproduces the pre-fix "
+            "harness, whose game count was not its sample size (bd vsbot-t3q.2)"
+        ),
+    )
+    parser.add_argument(
+        "--explore-turns",
+        type=int,
+        default=DEFAULT_EXPLORE_TURNS,
+        help=(
+            "how many of vsbot's OWN turns the exploration window covers "
+            "(VSBOT_EXPLORE_TURNS). 8 of our turns is ~24 coin flips, the same "
+            "opening noise per game an `arena` run spends across both sides"
+        ),
+    )
+    parser.add_argument(
+        "--explore-seed",
+        type=int,
+        default=DEFAULT_EXPLORE_SEED,
+        help=(
+            "base seed for the exploration schedule. Each phase and each vsbot "
+            "instance gets a mixed, disjoint stream derived from it, so the "
+            "schedule is reproducible and nothing replays anything else"
+        ),
+    )
+    parser.add_argument(
+        "--opponent-explore-eps",
+        type=float,
+        default=0.0,
+        help=(
+            "BOT_EXPLORE_EPSILON for the Go bot-hoster. NOT a mirror of "
+            "--explore-eps: it fires on every turn of every game from an "
+            "unseeded global RNG, so it weakens the opponent throughout and "
+            "cannot be replayed. Leave it at 0 for anything that gates"
+        ),
     )
     parser.add_argument(
         "--timeout", type=int, default=3600, help="hard wall-clock limit, seconds"
@@ -572,13 +690,13 @@ def warn_about_seat_imbalance(report: dict) -> None:
 
 
 def warn_about_low_diversity(report: dict) -> None:
-    """The finding behind bd ``vsbot-t3q.1``, turned into a guard rail.
+    """The finding behind bd ``vsbot-t3q.1``/``t3q.2``, turned into a guard rail.
 
-    A cross-play run has no opening randomisation.  ``arena`` injects some on
-    purpose (eps 0.15 over the first 8 turns) precisely because two
+    Cross-play used to have no opening randomisation at all.  ``arena`` injects
+    some on purpose (eps 0.15 over the first 8 turns) precisely because two
     deterministic engines otherwise replay one game forever; this harness drives
     two *deployed* bots that both play argmax with no root noise, so the only
-    thing that varies between games is wall-clock jitter changing how deep a
+    thing that varied between games was wall-clock jitter changing how deep a
     search got.
 
     That is how row 3 of ``docs/benchmarks.md`` reported ``49-1`` with a Wilson
@@ -587,9 +705,11 @@ def warn_about_low_diversity(report: dict) -> None:
     only **4** distinct games and an opening identical across all nine.  The
     number was two or three game outcomes, repeated.
 
-    So the game count is not the sample size, and any interval computed from it
-    is optimistic by however much this ratio says.  Report it rather than
-    letting a confident-looking percentage stand on three games.
+    ``--explore-eps`` is the fix (``vsbot::explore``), and this warning is now
+    also the check that it *worked*: at eps 0 it says the mechanism is off, and
+    at eps > 0 a low count means something swallowed the exploration — a vsbot
+    that failed to start with the env set, a shard sharing another's seed — and
+    the run is measuring far fewer samples than it played either way.
     """
     total = report["games"]
     distinct = report["distinct_games"]
@@ -597,13 +717,20 @@ def warn_about_low_diversity(report: dict) -> None:
         return
     if distinct * 2 >= total:  # at least half the games were different games
         return
+    epsilon = report.get("explore_eps", 0.0)
+    cause = (
+        "nothing randomises the opening: both bots play deterministically and "
+        "--explore-eps is 0"
+        if not epsilon
+        else f"--explore-eps is {epsilon}, so this is unexpected — check the vsbot logs "
+        "for the `exploration=ON` banner and for per-instance VSBOT_EXPLORE_SEED values"
+    )
     print(
         f"crossplay: WARNING — only {distinct} of {total} games were distinct "
-        f"(the rest are replays: both bots play deterministically and nothing "
-        f"randomises the opening). The Wilson interval above assumes {total} "
+        f"({cause}). The Wilson interval above assumes {total} "
         f"independent games and is therefore far too narrow — the effective "
         f"sample is closer to {distinct}. Do not quote this as a strength "
-        f"result. See bd vsbot-t3q.1.",
+        f"result. See bd vsbot-t3q.1 and vsbot-t3q.2.",
         file=sys.stderr,
     )
 
@@ -655,7 +782,13 @@ def run_phase(
                         "BACKEND_URL": f"ws://127.0.0.1:{port}/ws",
                         "BOT_POOL_SIZE": str(args.go_bots),
                         "BOT_NAME_PREFIX": theirs,
-                        "BOT_EXPLORE_EPSILON": "0",
+                        # Pinned to 0 by default: the hoster's epsilon fires on
+                        # every turn of every game from an unseeded global RNG
+                        # (`bot_client.calculateAndQueueAction`), so switching it
+                        # on weakens the opponent for the whole game and cannot
+                        # be replayed. vsbot's own opening window is what makes
+                        # the games distinct.
+                        "BOT_EXPLORE_EPSILON": str(args.opponent_explore_eps),
                     },
                     log=workdir / f"gobot-{tag}.log",
                 )
@@ -684,6 +817,10 @@ def run_phase(
         time.sleep(2)
 
         for instance in range(args.vsbot_instances):
+            # One stream per (phase, instance). Two vsbots sharing a seed would
+            # derive the same per-game schedule and replay each other's
+            # openings; so would phase 2 replaying phase 1 from the other chair.
+            stream = phase_index * max(args.vsbot_instances, 1) + instance
             processes.append(
                 spawn(
                     [str(vsbot)],
@@ -697,6 +834,14 @@ def run_phase(
                         "MOVE_MILLIS": str(args.move_millis),
                         "CHALLENGER": "true" if we_challenge else "false",
                         "CHALLENGER_INTERVAL_SECS": str(args.challenge_secs),
+                        # Seeded eps-greedy openings: the reason a run's game
+                        # count is now close to its sample size. See the module
+                        # docstring and `crates/vsbot/src/explore.rs`.
+                        "VSBOT_EXPLORE_EPS": str(args.explore_eps),
+                        "VSBOT_EXPLORE_TURNS": str(args.explore_turns),
+                        "VSBOT_EXPLORE_SEED": str(
+                            derive_seed(args.explore_seed, stream)
+                        ),
                     },
                     log=workdir / f"vsbot-{tag}-{instance}.log",
                 )
@@ -845,6 +990,38 @@ def self_test() -> int:
     if not (low < 50.0 < high):
         failures.append(f"wilson95(5,10) should straddle 50%, got [{low}, {high}]")
 
+    # The exploration seed split. Every vsbot process in a run must get its own
+    # stream: two sharing one derive the same per-game schedule and replay each
+    # other's openings, which is the failure this whole mechanism removes.
+    check("mix64 is a u64", mix64(1) >> 64, 0)
+    check("mix64 avalanches", mix64(1) == mix64(2), False)
+    check("derive_seed is deterministic", derive_seed(7, 3), derive_seed(7, 3))
+    streams = {derive_seed(DEFAULT_EXPLORE_SEED, i) for i in range(64)}
+    check("derive_seed never repeats a stream", len(streams), 64)
+    # Adjacent base seeds must not overlap either -- `base + stream` did, and
+    # that is `nnue-trainer-riy`.
+    neighbour = {derive_seed(DEFAULT_EXPLORE_SEED + 1, i) for i in range(64)}
+    check("adjacent base seeds stay disjoint", bool(streams & neighbour), False)
+    check("derive_seed stays in u64", max(streams) >> 64, 0)
+
+    # The diversity warning must fire on a replay-heavy run and stay quiet on a
+    # diverse one -- it is the acceptance measure for bd vsbot-t3q.2, so a
+    # warning that never fires would be worse than none.
+    def warns(games: int, distinct: int) -> bool:
+        import io
+        import contextlib
+
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            warn_about_low_diversity(
+                {"games": games, "distinct_games": distinct, "explore_eps": 0.15}
+            )
+        return "WARNING" in captured.getvalue()
+
+    check("low diversity warns", warns(50, 5), True)
+    check("high diversity is quiet", warns(50, 47), False)
+    check("an empty run is quiet", warns(0, 0), False)
+
     for failure in failures:
         print(f"self-test FAIL {failure}", file=sys.stderr)
     if failures:
@@ -872,6 +1049,28 @@ def main(argv: list[str]) -> int:
     # Resolved here, against the invocation cwd, because the bots are started
     # with cwd=workdir. A relative artifact path silently missing is exactly the
     # failure that makes a run measure the wrong engine.
+    if not 0.0 <= args.explore_eps <= 1.0:
+        raise Failure(f"--explore-eps {args.explore_eps} is not a probability")
+    if not 0.0 <= args.opponent_explore_eps <= 1.0:
+        raise Failure(
+            f"--opponent-explore-eps {args.opponent_explore_eps} is not a probability"
+        )
+    if args.explore_turns < 0:
+        raise Failure(f"--explore-turns {args.explore_turns} is negative")
+    # `vsbot` refuses the combination at startup (a pondering session answers
+    # actions without consulting the exploration wrapper), and an inherited
+    # VSBOT_PONDER would otherwise kill every bot the run spawns with nothing
+    # but a line in a log file to say why.
+    if args.explore_eps > 0 and os.environ.get("VSBOT_PONDER", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        raise Failure(
+            "VSBOT_PONDER is set in this environment and vsbot refuses it together with "
+            "opening exploration — a pondering session never calls the exploration wrapper, "
+            "so the openings would stop being randomised. Unset VSBOT_PONDER, or run with "
+            "--explore-eps 0 and read the diversity warning"
+        )
+
     args.mcts_artifact = Path(args.mcts_artifact).resolve()
     if args.search.upper() == "MCTS" and not args.mcts_artifact.exists():
         raise Failure(
@@ -996,6 +1195,12 @@ def main(argv: list[str]) -> int:
         "direction": args.direction,
         "vsbot_search": args.search,
         "move_millis": args.move_millis,
+        # Recorded in the report because `distinct_games` is only interpretable
+        # next to it: the same tally with eps 0 is a different measurement.
+        "explore_eps": args.explore_eps,
+        "explore_turns": args.explore_turns,
+        "explore_seed": args.explore_seed,
+        "opponent_explore_eps": args.opponent_explore_eps,
         "wins": result["wins"],
         "losses": result["losses"],
         "draws": result["draws"],
@@ -1051,7 +1256,8 @@ def main(argv: list[str]) -> int:
         )
         print(
             f"    distinct games: {report['distinct_games']}/{report['games']} "
-            "(replays share an opening; see bd vsbot-t3q.1)"
+            f"(the sample size; explore eps={report['explore_eps']} over "
+            f"{report['explore_turns']} of our turns, seed {report['explore_seed']})"
         )
         if report["discarded_disconnects"]:
             print(

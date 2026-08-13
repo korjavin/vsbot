@@ -38,6 +38,31 @@ impl SearchEngine for CountingEngine {
     }
 }
 
+/// Counts `on_game_start` hooks as well as searches.
+///
+/// The hook is the only per-game signal the engine seam carries, and the
+/// cross-play exploration wrapper reseeds its opening stream from it (bd
+/// `vsbot-t3q.2`). It must fire once per *accepted* game start and never for a
+/// rejected one, or a run's openings drift out of the schedule its seed names.
+#[derive(Debug, Default)]
+struct GameCountingEngine {
+    games: AtomicUsize,
+}
+
+impl SearchEngine for GameCountingEngine {
+    fn choose(&self, state: &State, _budget: &SearchBudget) -> Option<SearchOutcome> {
+        state
+            .legal_actions()
+            .first()
+            .copied()
+            .map(SearchOutcome::new)
+    }
+
+    fn on_game_start(&self) {
+        self.games.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// Blocks until released, so a newer snapshot can overtake an in-flight search.
 #[derive(Debug)]
 struct BlockingEngine {
@@ -257,6 +282,46 @@ async fn game_end_invalidates_an_in_flight_search() {
     assert_silent(&mut inbox).await;
     assert_eq!(bot.core().counters.games_finished, 1);
     assert_eq!(bot.core().phase, virus_proto::Phase::Idle);
+}
+
+/// The per-game hook fires exactly once per accepted game start, and never for
+/// a start the client rejected. bd `vsbot-t3q.2` rides on this: the exploration
+/// wrapper derives one seeded opening stream per hook, so a hook that fired for
+/// a rejected start would shift every later game onto the wrong seed.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_per_game_hook_tracks_accepted_game_starts_only() {
+    let engine = Arc::new(GameCountingEngine::default());
+    let (bot, mut inbox) = build(engine.clone());
+    assert_eq!(
+        engine.games.load(Ordering::SeqCst),
+        0,
+        "nothing before a game"
+    );
+
+    // Seat 2 in the opening: accepted, but not our turn, so nothing is queued.
+    feed(&bot, &game_start(2, &opening().snapshot()));
+    assert_silent(&mut inbox).await;
+    assert_eq!(engine.games.load(Ordering::SeqCst), 1);
+
+    // Rejected starts: no snapshot, a seat outside the board, and no gameId.
+    feed(
+        &bot,
+        &json!({"type": "game_start", "gameId": "g", "yourPlayer": 1}),
+    );
+    feed(&bot, &game_start(9, &opening().snapshot()));
+    let mut no_id = game_start(1, &opening().snapshot());
+    no_id["gameId"] = json!("");
+    feed(&bot, &no_id);
+    assert_eq!(
+        engine.games.load(Ordering::SeqCst),
+        1,
+        "a rejected game start must not advance the per-game stream"
+    );
+
+    // A second real game does.
+    feed(&bot, &game_start(2, &opening().snapshot()));
+    assert_silent(&mut inbox).await;
+    assert_eq!(engine.games.load(Ordering::SeqCst), 2);
 }
 
 /// Port of Go's `TestOldGameEndCannotCancelNewGame`.

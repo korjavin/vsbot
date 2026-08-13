@@ -18,11 +18,13 @@ started is a game that counts, and N shards use N cores with no waste.
 Pooling is not just addition
 ----------------------------
 
-Games are summed, but **distinct games are unioned**, not summed.  Nothing
-randomises a cross-play opening (bd ``vsbot-t3q.1``), so two shards running the
-identical configuration can easily play the identical games; adding their
-distinct counts would report twice the diversity the run actually has.  The
-pooled report therefore counts unique move-sequence digests across every shard.
+Games are summed, but **distinct games are unioned**, not summed.  Two shards
+running an identical configuration would otherwise be credited with twice the
+diversity the run actually has -- and before bd ``vsbot-t3q.2`` they *did* run
+an identical configuration, because nothing randomised a cross-play opening.
+The pooled report therefore counts unique move-sequence digests across every
+shard, and each shard is now handed its own ``--explore-seed`` derived from the
+pool's, so shards no longer replay each other in the first place.
 
 Usage::
 
@@ -65,6 +67,22 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument(
         "--poll-secs", type=int, default=30, help="how often to print pooled progress"
     )
+    # Consumed here rather than passed through: every shard must get its own
+    # exploration stream, so the pool derives one per shard from this base. The
+    # epsilon is consumed only so the pooled report can record what produced its
+    # distinct-game count; it is handed to the shards unchanged.
+    parser.add_argument(
+        "--explore-seed",
+        type=int,
+        default=crossplay.DEFAULT_EXPLORE_SEED,
+        help="base exploration seed; shard k runs on derive_seed(base, k)",
+    )
+    parser.add_argument(
+        "--explore-eps",
+        type=float,
+        default=crossplay.DEFAULT_EXPLORE_EPS,
+        help="vsbot opening-exploration probability, passed to every shard",
+    )
     return parser.parse_known_args(argv)
 
 
@@ -103,6 +121,11 @@ def main(argv: list[str]) -> int:
             "--games", str(games),
             "--opponent", args.opponent,
             "--workdir", str(shard),
+            # Disjoint per shard. Shards are otherwise identical, and identical
+            # shards replay each other's games -- which the union in `pool`
+            # would report honestly as diversity this run never had.
+            "--explore-seed", str(crossplay.derive_seed(args.explore_seed, index)),
+            "--explore-eps", str(args.explore_eps),
             *passthrough,
         ]
         log = (shard / "shard.log").open("w")
@@ -193,6 +216,9 @@ def render(pooled: dict, args, theirs: str) -> dict:
     report = {
         "shards": args.shards,
         "opponent": theirs,
+        # `distinct_games` below only means something next to these.
+        "explore_eps": args.explore_eps,
+        "explore_seed": args.explore_seed,
         "wins": pooled["wins"],
         "losses": pooled["losses"],
         "draws": pooled["draws"],

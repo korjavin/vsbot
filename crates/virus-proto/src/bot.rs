@@ -671,6 +671,11 @@ impl Bot {
             "game {} started as seat {}",
             message.game_id, message.your_player
         ));
+        // After the core is installed and before the opening search, so an
+        // engine that keeps per-game state (the exploration decorator's seeded
+        // opening stream) has it in place for the very first action. Only ever
+        // reached once per accepted game start: every rejection above returns.
+        self.engine.on_game_start();
         self.maybe_search(Driver::GameStart);
         self.maybe_ponder();
     }

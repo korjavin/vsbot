@@ -27,6 +27,15 @@
 //! | `MCTS_SEED`                 | `1`                            | Seed for the searcher's RNG. |
 //! | `CHALLENGER`                | `false`                        | Initiate games on a timer. |
 //! | `CHALLENGER_INTERVAL_SECS`  | `300`                          | Challenger period; the first tick is jittered. |
+//! | `VSBOT_EXPLORE_EPS`         | `0` *(off)*                    | **Harness only.** Chance of a random legal action inside the opening window. |
+//! | `VSBOT_EXPLORE_TURNS`       | `8`                            | Window length, in *our own* turns. |
+//! | `VSBOT_EXPLORE_SEED`        | `1`                            | Base seed for the per-game opening stream. |
+//!
+//! `VSBOT_EXPLORE_EPS` is the one knob here that makes the bot **weaker on
+//! purpose**, so it is off unless a harness sets it — see [`explore`] for what
+//! it buys and why cross-play cannot be measured without it. It is refused
+//! together with `VSBOT_PONDER`, because a pondering session answers actions
+//! without ever calling `choose` and would silently explore nothing.
 //!
 //! Unset and empty are the same thing. An unparseable value is a startup
 //! failure, never a silent fallback: a typo that quietly downgrades the engine
@@ -45,6 +54,7 @@
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 
+pub mod explore;
 pub mod mcts;
 
 use std::fmt;
@@ -54,6 +64,7 @@ use std::time::Duration;
 
 use virus_proto::{BotConfig, EngineKind, GreedyEngine, SearchEngine, StopPolicy};
 
+pub use explore::{ExploreSettings, ExploringEngine};
 pub use mcts::MctsEngine;
 
 /// Where the champion artifact lives in the repository and in the deploy image.
@@ -72,6 +83,8 @@ pub struct Settings {
     pub engine: EngineKind,
     /// Inputs the MCTS engine needs; ignored by the other engines.
     pub mcts: MctsSettings,
+    /// Opening-exploration settings. Off by default; see [`explore`].
+    pub explore: ExploreSettings,
 }
 
 /// `SEARCH=MCTS` inputs.
@@ -167,6 +180,48 @@ impl Settings {
             None => EngineKind::default(),
         };
 
+        let explore_defaults = ExploreSettings::default();
+        let explore = ExploreSettings {
+            epsilon: parse_field(
+                read("VSBOT_EXPLORE_EPS").as_deref(),
+                "VSBOT_EXPLORE_EPS",
+                |raw| {
+                    raw.trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|value| (0.0..=1.0).contains(value))
+                },
+            )?
+            .unwrap_or(explore_defaults.epsilon),
+            turns: parse_field(
+                read("VSBOT_EXPLORE_TURNS").as_deref(),
+                "VSBOT_EXPLORE_TURNS",
+                |raw| raw.trim().parse::<u32>().ok(),
+            )?
+            .unwrap_or(explore_defaults.turns),
+            seed: parse_field(
+                read("VSBOT_EXPLORE_SEED").as_deref(),
+                "VSBOT_EXPLORE_SEED",
+                |raw| raw.trim().parse::<u64>().ok(),
+            )?
+            .unwrap_or(explore_defaults.seed),
+        };
+
+        // Refused, not quietly reconciled. A pondering session answers actions
+        // straight from its own tree and never calls `SearchEngine::choose`, so
+        // a run with both on would explore nothing at all and report a
+        // diversity number it did not earn — the exact class of silent
+        // downgrade the rest of this function exists to prevent.
+        if explore.is_on() && ponder {
+            return Err(ConfigError(
+                "VSBOT_EXPLORE_EPS",
+                "cannot be combined with VSBOT_PONDER=true: a pondering session answers actions \
+                 without consulting the exploration wrapper, so the openings would silently stop \
+                 being randomised. Turn one of them off."
+                    .to_owned(),
+            ));
+        }
+
         Ok(Settings {
             bot: BotConfig {
                 backend_url: read("BACKEND_URL").unwrap_or(defaults.backend_url),
@@ -191,6 +246,7 @@ impl Settings {
                     .unwrap_or(mcts_defaults.artifact),
                 seed,
             },
+            explore,
         })
     }
 }
@@ -231,6 +287,30 @@ pub struct EngineSetup {
     pub engine: Arc<dyn SearchEngine>,
     /// One line of provenance: which engine, and what it loaded.
     pub description: String,
+}
+
+impl EngineSetup {
+    /// Wraps the engine in [`ExploringEngine`] when `settings` asks for it.
+    ///
+    /// A separate step rather than a [`build_engine`] argument on purpose:
+    /// exploration is a *measurement harness* behaviour, not part of the engine
+    /// the deployment runs, and keeping it out of `build_engine` means every
+    /// caller that wants the deployed engine — the integration tests, the arena
+    /// — gets exactly that with no flag to forget.
+    ///
+    /// Off is the identity: at `eps = 0` the setup is returned untouched, so
+    /// nothing is interposed on the production path.
+    pub fn with_exploration(self, settings: &ExploreSettings) -> EngineSetup {
+        if !settings.is_on() {
+            return self;
+        }
+        let explorer = ExploringEngine::new(self.engine, *settings);
+        let description = format!("{} {}", self.description, explorer.describe());
+        EngineSetup {
+            engine: Arc::new(explorer),
+            description,
+        }
+    }
 }
 
 impl fmt::Debug for EngineSetup {
@@ -377,6 +457,72 @@ mod tests {
         assert!(!off.bot.stop_policy.extension);
     }
 
+    /// Exploration weakens the bot on purpose, so nothing but an explicit
+    /// `VSBOT_EXPLORE_EPS` may switch it on — CLAUDE.md's "production play
+    /// paths take no RNG unless explicitly configured".
+    #[test]
+    fn opening_exploration_is_off_unless_asked_for() {
+        let defaults = settings(&[]).expect("defaults");
+        assert_eq!(defaults.explore.epsilon, 0.0);
+        assert_eq!(defaults.explore.turns, explore::DEFAULT_EXPLORE_TURNS);
+        assert_eq!(defaults.explore.seed, 1);
+        assert!(!defaults.explore.is_on());
+
+        let asked = settings(&[
+            ("VSBOT_EXPLORE_EPS", "0.15"),
+            ("VSBOT_EXPLORE_TURNS", "6"),
+            ("VSBOT_EXPLORE_SEED", "20260813"),
+        ])
+        .expect("valid exploration settings");
+        assert_eq!(asked.explore.epsilon, 0.15);
+        assert_eq!(asked.explore.turns, 6);
+        assert_eq!(asked.explore.seed, 20_260_813);
+        assert!(asked.explore.is_on());
+    }
+
+    /// Off must be the *identity* on the deployed path: not a wrapper that
+    /// happens never to fire, but no wrapper at all.
+    #[test]
+    fn the_exploration_wrapper_is_only_installed_when_it_is_on() {
+        let plain = build_engine(EngineKind::Greedy, &champion()).expect("greedy");
+        let untouched = build_engine(EngineKind::Greedy, &champion())
+            .expect("greedy")
+            .with_exploration(&ExploreSettings::default());
+        assert_eq!(untouched.description, plain.description);
+
+        let explored = build_engine(EngineKind::Greedy, &champion())
+            .expect("greedy")
+            .with_exploration(&ExploreSettings {
+                epsilon: 0.15,
+                turns: 8,
+                seed: 4,
+            });
+        assert!(
+            explored.description.contains("exploration=ON"),
+            "{explored:?}"
+        );
+        assert!(explored.description.contains("WEAKER"), "{explored:?}");
+        // The wrapper must not disguise which engine is playing.
+        assert_eq!(explored.engine.name(), plain.engine.name());
+    }
+
+    /// A pondering session never calls `choose`, so the two together would
+    /// silently produce zero exploration. Refuse rather than reconcile.
+    #[test]
+    fn exploration_and_pondering_are_refused_together() {
+        let error = settings(&[("VSBOT_EXPLORE_EPS", "0.15"), ("VSBOT_PONDER", "true")])
+            .expect_err("the combination is rejected");
+        assert_eq!(error.0, "VSBOT_EXPLORE_EPS");
+        assert!(error.1.contains("VSBOT_PONDER"), "{error}");
+        // Off is not a conflict, whatever the window and seed say.
+        settings(&[
+            ("VSBOT_EXPLORE_EPS", "0"),
+            ("VSBOT_EXPLORE_TURNS", "8"),
+            ("VSBOT_PONDER", "true"),
+        ])
+        .expect("eps=0 is not exploration");
+    }
+
     #[test]
     fn mcts_is_the_default_engine() {
         assert_eq!(settings(&[]).expect("defaults").engine, EngineKind::Mcts);
@@ -461,6 +607,13 @@ mod tests {
             ("VSBOT_EXTENSION", "-1"),
             ("MCTS_SEED", "-1"),
             ("MCTS_SEED", "lucky"),
+            // A probability outside [0, 1] is a typo, not a stronger request.
+            ("VSBOT_EXPLORE_EPS", "1.5"),
+            ("VSBOT_EXPLORE_EPS", "-0.1"),
+            ("VSBOT_EXPLORE_EPS", "often"),
+            ("VSBOT_EXPLORE_TURNS", "-1"),
+            ("VSBOT_EXPLORE_TURNS", "eight"),
+            ("VSBOT_EXPLORE_SEED", "-1"),
             ("CHALLENGER", "maybe"),
             ("CHALLENGER_INTERVAL_SECS", "-1"),
         ] {

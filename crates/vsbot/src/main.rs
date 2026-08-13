@@ -27,6 +27,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Harness-only, and the identity at the default `VSBOT_EXPLORE_EPS=0`, so
+    // the deployed process runs the engine `build_engine` returned and nothing
+    // else. When it is on, `setup.description` says so in the banner below.
+    let setup = setup.with_exploration(&settings.explore);
 
     // Two lines, printed before the first connection: what the process is, and
     // what it is playing with. An operator must be able to confirm the engine
