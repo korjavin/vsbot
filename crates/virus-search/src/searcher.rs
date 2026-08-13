@@ -500,9 +500,16 @@ impl Searcher {
     /// Deterministic iterative deepening bounded by a node limit rather than a
     /// clock — Go's `ChooseNodeBudget`.
     ///
-    /// Consults the opening book. Returns `None` when the position has no legal
-    /// action or `limit == 0`. An aborted iteration is discarded outright: the
-    /// answer is always the deepest fully completed one.
+    /// An aborted iteration is discarded outright: the answer is always the
+    /// deepest fully completed one.
+    ///
+    /// Returns `None` when the position has no legal action, or when
+    /// `limit == 0` **and the opening book does not apply**. The book is
+    /// consulted first, exactly as Go's `chooseNodeBudget` and Java's
+    /// `searchNodeBudget` do, and that order is load-bearing rather than
+    /// incidental: the book plays by fiat without searching a single node, so a
+    /// zero *search* budget has nothing to withhold. Reordering the two would
+    /// diverge from the oracle this crate exists to reproduce.
     ///
     /// # Panics
     /// Panics when `state`'s mover is not this searcher's root player.

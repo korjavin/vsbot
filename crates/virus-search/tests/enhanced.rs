@@ -408,9 +408,24 @@ fn the_book_does_not_smuggle_a_move_for_the_wrong_seat() {
 #[test]
 fn a_zero_budget_has_no_answer() {
     let state = wedged();
+    assert!(virus_search::book::opening_book_move(&state).is_none());
     assert!(Searcher::enhanced(&state)
         .search_node_budget(&state, 0)
         .is_none());
     assert!(virus_search::choose_depth(&state, 0).is_none());
     assert!(virus_search::choose_depth(&state, 65).is_none());
+}
+
+/// Deliberate, and pinned so nobody "fixes" it: Go's `chooseNodeBudget` and
+/// Java's `searchNodeBudget` both consult the book before the zero-limit guard,
+/// because the book plays by fiat without searching a node — a zero *search*
+/// budget has nothing to withhold. Reordering would diverge from the oracle.
+#[test]
+fn a_zero_budget_still_plays_the_book() {
+    let state = State::new(12, 12, 2).expect("12x12 two-player board");
+    let result = Searcher::enhanced(&state)
+        .search_node_budget(&state, 0)
+        .expect("the book answers without searching");
+    assert!(result.book && result.nodes == 0);
+    assert_eq!(result.action, Some(Action::mv(1, 1)));
 }
