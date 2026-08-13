@@ -25,6 +25,7 @@
 //! | `VSBOT_ITEST_SOAK`       | unset — the ponder soak skips               |
 //! | `VSBOT_ITEST_SOAK_GAMES` | `20`                                        |
 //! | `VSBOT_ITEST_SOAK_TURN_MS` | `240` — turn budget for the soak          |
+//! | `VSBOT_ITEST_SOAK_OPPONENT` | `greedy` \| `mcts`                         |
 //!
 //! Three scenarios live here. The protocol run pits two instant engines against
 //! each other and is about *ordering*; the MCTS run puts the real champion on
@@ -222,8 +223,15 @@ async fn the_mcts_champion_plays_a_full_game_without_a_single_illegal_move() {
 ///   the proof;
 /// * **zero forfeits** — every game reaches `game_end` on both sides.
 ///
-/// Both sides run the real champion so the opponent actually takes time to
-/// think, which is the only way the ponder path gets meaningfully exercised.
+/// The opponent is the **instant** reference engine by default, which is the
+/// harsher choice and not the lazier one: a fast opponent packs `move_made`,
+/// `game_state` and `turn_change` into the tightest possible window, which is
+/// exactly the ordering that would race a pondering session into emitting off
+/// its own turn. `VSBOT_ITEST_SOAK_OPPONENT=mcts` puts the champion on both
+/// sides instead — a slower, more realistic opponent that gives the ponder tree
+/// real thinking time, at the cost of a second search burning CPU. (Strength
+/// under ponder is not this test's job; that is the deferred 400-game arena.)
+///
 /// The turn budget is scaled down so the run finishes in minutes; the allocator
 /// is proportional, so the code paths are the deployed ones.
 #[allow(clippy::await_holding_lock)] // see the note on the scenario above
@@ -258,6 +266,13 @@ async fn ponder_soak_plays_twenty_games_without_a_forfeit_or_an_out_of_turn_acti
         .engine
     };
 
+    let slow_opponent = std::env::var("VSBOT_ITEST_SOAK_OPPONENT").as_deref() == Ok("mcts");
+    let acceptor: Arc<dyn SearchEngine> = if slow_opponent {
+        engine(2)
+    } else {
+        Arc::new(GreedyEngine)
+    };
+
     let report = run_scenario(Scenario {
         label: "ponder-soak",
         target_games,
@@ -265,7 +280,7 @@ async fn ponder_soak_plays_twenty_games_without_a_forfeit_or_an_out_of_turn_acti
         ponder: true,
         timeout: Duration::from_secs(1800),
         challenger: engine(1),
-        acceptor: engine(2),
+        acceptor,
     })
     .await;
 
@@ -290,10 +305,11 @@ async fn ponder_soak_plays_twenty_games_without_a_forfeit_or_an_out_of_turn_acti
     );
 
     eprintln!(
-        "OK (ponder soak): {} games at {turn_millis}ms/turn, ponderer sent {} actions \
+        "OK (ponder soak): {} games at {turn_millis}ms/turn vs {}, ponderer sent {} actions \
          ({} ponder steps, {} pondered answers, {} fallbacks), control sent {} actions, \
          0 illegal moves, 0 server errors, 0 out-of-turn actions",
         report.challenger.games_finished,
+        if slow_opponent { "mcts" } else { "greedy" },
         report.challenger.actions_sent,
         report.challenger.ponder_steps,
         report.challenger.ponder_answers,
