@@ -253,6 +253,85 @@ fn both_convolution_paths_hit_parity() {
     );
 }
 
+/// The batched trunk pass is the *same* arithmetic in a different memory
+/// layout, so it must agree with the single-position pass exactly — not within
+/// a tolerance.
+///
+/// This is the load-bearing test for `forward_batch`: the searcher chooses
+/// between the two paths by batch size alone (a round with one leaf takes the
+/// single-position path), so any divergence would make a search's result depend
+/// on how its leaves happened to group up. Both the champion (32ch x 4 layers,
+/// with a value head) and the policy-only artifact are covered, and every
+/// partial-group size from 1 to 2 * BATCH_LANES + 1, because a trailing partial
+/// group is the case where lanes carry zeroed inputs whose outputs are
+/// discarded.
+#[test]
+fn the_batched_forward_is_bit_identical_to_the_serial_one() {
+    for weights in ["artifacts/mcts_champion.json", "artifacts/mcts_policy.json"] {
+        let net = net(weights);
+        let fixture = fixture("fixtures/mcts/mcts_policy_parity.json");
+        let encoded: Vec<Encoded> = fixture.samples.iter().map(|s| s.encoded()).collect();
+        assert!(encoded.len() > 2, "fixture has samples to batch");
+
+        let mut single = net.scratch();
+        let mut batch_scratch = net.batch_scratch();
+        for size in 1..=(2 * virus_mcts::BATCH_LANES + 1) {
+            let inputs: Vec<Encoded> = encoded.iter().cycle().take(size).cloned().collect();
+            let mut batched = Vec::new();
+            net.forward_batch(&inputs, &mut batch_scratch, &mut batched);
+            assert_eq!(batched.len(), size, "{weights}: one Heads per input");
+            for (i, input) in inputs.iter().enumerate() {
+                let want = net.forward(input, &mut single);
+                let got = &batched[i];
+                assert_eq!(
+                    want.move_logits, got.move_logits,
+                    "{weights}: batch {size}, sample {i}: move logits differ"
+                );
+                assert_eq!(
+                    want.pair_u, got.pair_u,
+                    "{weights}: batch {size}, sample {i}: pair utilities differ"
+                );
+                assert_eq!(
+                    want.value.map(f32::to_bits),
+                    got.value.map(f32::to_bits),
+                    "{weights}: batch {size}, sample {i}: value differs"
+                );
+            }
+        }
+    }
+}
+
+/// The batched kernel's SIMD and portable code paths must agree with each
+/// other, the same guarantee `both_convolution_paths_hit_parity` gives the
+/// single-position kernel.
+#[test]
+fn both_batched_convolution_paths_hit_parity() {
+    let net = net("artifacts/mcts_champion.json");
+    let mut scalar = net.clone();
+    scalar.force_scalar();
+
+    let fixture = fixture("fixtures/mcts/mcts_policy_parity.json");
+    let inputs: Vec<Encoded> = fixture.samples.iter().map(|s| s.encoded()).collect();
+    let (mut a, mut b) = (net.batch_scratch(), scalar.batch_scratch());
+    let (mut fast, mut slow) = (Vec::new(), Vec::new());
+    net.forward_batch(&inputs, &mut a, &mut fast);
+    scalar.forward_batch(&inputs, &mut b, &mut slow);
+
+    let mut worst = 0.0f32;
+    for (fast, slow) in fast.iter().zip(&slow) {
+        for i in 0..CELLS {
+            worst = worst
+                .max((fast.move_logits[i] - slow.move_logits[i]).abs())
+                .max((fast.pair_u[i] - slow.pair_u[i]).abs());
+        }
+    }
+    println!("batched simd vs scalar: worst absolute deviation {worst:e}");
+    assert!(
+        worst <= 1e-5,
+        "the two batched convolution paths diverged by {worst:e}"
+    );
+}
+
 /// The champion is the artifact the bot actually plays: it must load, declare
 /// the expected architecture, and carry a value head.
 #[test]

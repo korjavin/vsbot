@@ -104,11 +104,38 @@ fn play_mode_ignores_the_seed_entirely() {
 
 /// Splitting one budget into two calls must build the same tree as spending it
 /// in one go — the property `run_until_deadline` relies on to be sane.
+///
+/// Leaf batching makes this a **batch-granular** property, not a
+/// simulation-granular one: a round collects `batch_size` leaves, evaluates
+/// them together and backs them up together, so a split that lands mid-round
+/// necessarily backs that round's leaves up in two pieces and the trees
+/// diverge from there. Both halves of the property are pinned below — aligned
+/// splits at the default batch size, and arbitrary splits at `batch_size: 1`,
+/// which is the serial searcher.
 #[test]
-fn simulations_are_resumable() {
+fn simulations_are_resumable_at_batch_boundaries() {
     let net = champion();
     let config = Config {
         value_source: ValueSource::Net,
+        ..Config::play()
+    };
+    let batch = u32::from(config.batch_size);
+    let one_shot = run(midgame(), config, Some(&net), 8 * batch);
+    let mut split = MctsSearcher::new(midgame(), config, Some(&net));
+    split.run_sims(3 * batch);
+    split.run_sims(5 * batch);
+    assert_eq!(one_shot.root_visits(), split.root_visits());
+    assert_eq!(one_shot.sims_run(), split.sims_run());
+}
+
+/// The serial searcher — `batch_size: 1` — keeps the original
+/// simulation-granular resumability, at any split point.
+#[test]
+fn the_serial_searcher_is_resumable_at_any_split() {
+    let net = champion();
+    let config = Config {
+        value_source: ValueSource::Net,
+        batch_size: 1,
         ..Config::play()
     };
     let one_shot = run(midgame(), config, Some(&net), 120);
@@ -117,6 +144,89 @@ fn simulations_are_resumable() {
     split.run_sims(70);
     assert_eq!(one_shot.root_visits(), split.root_visits());
     assert_eq!(one_shot.sims_run(), split.sims_run());
+}
+
+/// A batched search spends exactly the simulations it was asked for, whatever
+/// the batch size divides into — the count is what a fixed-sims gauntlet pairs
+/// two engines on.
+#[test]
+fn a_batched_budget_is_spent_exactly() {
+    let net = champion();
+    for batch in [1u16, 3, 8, 16, 32] {
+        let config = Config {
+            value_source: ValueSource::Net,
+            batch_size: batch,
+            ..Config::play()
+        };
+        let searcher = run(midgame(), config, Some(&net), 100);
+        assert_eq!(searcher.sims_run(), 100, "batch {batch}");
+        let visits: u32 = searcher.root_visits().iter().sum();
+        assert_eq!(
+            visits, 100,
+            "every simulation credited the root, batch {batch}"
+        );
+    }
+}
+
+/// Batching must not disturb the search's determinism: same seed, same batch
+/// size, same tree, byte for byte.
+#[test]
+fn batched_search_is_deterministic() {
+    let net = champion();
+    for batch in [2u16, 8, 16, 32] {
+        let config = Config {
+            value_source: ValueSource::Net,
+            batch_size: batch,
+            ..Config::play()
+        };
+        let a = run(midgame(), config, Some(&net), 96);
+        let b = run(midgame(), config, Some(&net), 96);
+        assert_eq!(a.root_visits(), b.root_visits(), "batch {batch}");
+        assert_eq!(
+            a.root_value_abs().to_bits(),
+            b.root_value_abs().to_bits(),
+            "batch {batch}: root value is bit-identical, not merely close"
+        );
+        assert_eq!(a.best_action(), b.best_action(), "batch {batch}");
+    }
+}
+
+/// Virtual loss decorrelates the batch: a round of `B` descents must not pile
+/// `B` visits onto one root edge the way `B` un-decorrelated selections against
+/// a frozen tree would.
+#[test]
+fn virtual_loss_spreads_a_batch_over_several_edges() {
+    let net = champion();
+    let config = Config {
+        value_source: ValueSource::Net,
+        batch_size: 32,
+        ..Config::play()
+    };
+    let mut searcher = MctsSearcher::new(midgame(), config, Some(&net));
+    searcher.run_sims(32);
+    let visited = searcher.root_visits().iter().filter(|n| **n > 0).count();
+    assert!(
+        visited >= 4,
+        "one batch of 32 landed on {visited} root edges: {:?}",
+        searcher.root_visits()
+    );
+
+    // With the virtual loss switched off the same batch collapses onto far
+    // fewer edges — the property this knob exists for.
+    let mut flat = MctsSearcher::new(
+        midgame(),
+        Config {
+            virtual_loss: 0.0,
+            ..config
+        },
+        Some(&net),
+    );
+    flat.run_sims(32);
+    let flat_visited = flat.root_visits().iter().filter(|n| **n > 0).count();
+    assert!(
+        visited > flat_visited,
+        "virtual loss spread the batch over {visited} edges, no-virtual-loss over {flat_visited}"
+    );
 }
 
 #[test]
@@ -242,10 +352,12 @@ fn the_deadline_budget_runs_at_least_one_sim_and_then_stops() {
         },
         Some(&net),
     );
-    // An already-expired deadline still buys one simulation, so the caller
-    // always has a move to play.
+    // An already-expired deadline still buys one batch, so the caller always
+    // has a move to play. The deadline is checked between batches, so the floor
+    // is one full round rather than one simulation.
+    let batch = u64::from(searcher.config().batch_size);
     searcher.run_until_deadline(Instant::now());
-    assert_eq!(searcher.sims_run(), 1);
+    assert_eq!(searcher.sims_run(), batch);
     assert!(searcher.best_action().is_some());
 
     let start = Instant::now();

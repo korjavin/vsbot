@@ -67,6 +67,17 @@ const PADDED: usize = BOARD + 2;
 /// Number of distinct cell symbols the first eight planes one-hot encode.
 const SYMBOLS: usize = 8;
 
+/// Positions a batched trunk pass processes in one interleaved group.
+///
+/// The batched kernels lay the batch out as the **innermost** axis
+/// (`[channel][cell][LANES]`), so one group's activations for a given cell are
+/// `LANES` contiguous floats — exactly one 256-bit vector. Eight is the AVX2
+/// register width; the single-position kernel's innermost run is the 12-wide
+/// board row, which wastes a third of every vector and needs overlapping
+/// unaligned loads for the kernel's three columns. See
+/// [`PolicyValueNet::forward_batch`].
+pub const BATCH_LANES: usize = 8;
+
 /// Architectures this crate implements.
 ///
 /// `conv-policy-v1` is the Phase 1 policy-only trunk; `conv-policy-value-v1`
@@ -604,6 +615,121 @@ impl PolicyValueNet {
         }
     }
 
+    /// Scratch space for [`PolicyValueNet::forward_batch`]. Hold one per
+    /// thread and reuse it — a batched pass allocates nothing beyond the
+    /// [`Heads`] it hands back.
+    pub fn batch_scratch(&self) -> BatchScratch {
+        let width = self.channels.max(PLANES);
+        BatchScratch {
+            cur: vec![0.0; width * CELLS * BATCH_LANES],
+            next: vec![0.0; width * CELLS * BATCH_LANES],
+            padded: vec![0.0; width * PADDED * PADDED * BATCH_LANES],
+        }
+    }
+
+    /// One trunk pass over many positions at once, appending one [`Heads`] per
+    /// input to `out` in input order.
+    ///
+    /// # Why this is faster than the same positions one at a time
+    ///
+    /// Nothing about the arithmetic changes — the same
+    /// `channels * in_channels * 9 * 144` multiply-adds happen per position,
+    /// in the same order, so a batched result is bit-identical to the serial
+    /// one (`batched_forward_matches_the_serial_one` in `tests/net_parity.rs`
+    /// pins that). What changes is the shape of the inner loop:
+    ///
+    /// * **Vector utilisation.** [`PolicyValueNet::forward`] reduces over a
+    ///   12-wide board row, which is 1.5 AVX2 registers; the batched kernel
+    ///   reduces over [`BATCH_LANES`] positions, which is exactly one.
+    /// * **Loads.** The single-position kernel reads three *overlapping*
+    ///   unaligned windows of the same row (`row[c]`, `row[c+1]`, `row[c+2]`)
+    ///   for the kernel's three columns. With the batch innermost those become
+    ///   three disjoint aligned vectors.
+    /// * **Weights.** One `[out][in*9]` weight row is broadcast across
+    ///   `BATCH_LANES` positions instead of one, so the ~125 KB of trunk
+    ///   weights is streamed out of L2 once per group rather than once per
+    ///   position.
+    ///
+    /// Inputs are processed in groups of [`BATCH_LANES`]; a partial trailing
+    /// group leaves its unused lanes zeroed and discards their outputs, so a
+    /// batch of 9 costs the same as a batch of 16. Callers that care should
+    /// size their batches in multiples of [`BATCH_LANES`].
+    pub fn forward_batch(
+        &self,
+        inputs: &[Encoded],
+        scratch: &mut BatchScratch,
+        out: &mut Vec<Heads>,
+    ) {
+        for group in inputs.chunks(BATCH_LANES) {
+            self.forward_group(group, scratch, out);
+        }
+    }
+
+    /// One trunk pass over a single lane group of at most [`BATCH_LANES`].
+    fn forward_group(&self, group: &[Encoded], scratch: &mut BatchScratch, out: &mut Vec<Heads>) {
+        debug_assert!(!group.is_empty() && group.len() <= BATCH_LANES);
+        let BatchScratch { cur, next, padded } = scratch;
+        let lanes = BATCH_LANES;
+
+        // --- input planes, interleaved by lane; unused lanes stay zero ---
+        cur[..PLANES * CELLS * lanes].fill(0.0);
+        for (lane, input) in group.iter().enumerate() {
+            for (i, sym) in input.sym.iter().enumerate() {
+                let plane = *sym as usize;
+                debug_assert!(plane < SYMBOLS, "symbol {plane} has no plane");
+                cur[(plane.min(SYMBOLS - 1) * CELLS + i) * lanes + lane] = 1.0;
+            }
+            // Same clamp as the single-position path: the encoding contract is
+            // `moves_left in 1..=3` and a malformed caller must not land in the
+            // symbol planes.
+            let moves_left = (input.moves_left as usize).clamp(1, 3);
+            let mut set = |plane: usize| {
+                for i in 0..CELLS {
+                    cur[(plane * CELLS + i) * lanes + lane] = 1.0;
+                }
+            };
+            set(SYMBOLS + moves_left - 1);
+            if input.nu_own {
+                set(11);
+            }
+            if input.nu_opp {
+                set(12);
+            }
+        }
+
+        // --- trunk ---
+        let mut in_channels = PLANES;
+        for layer in 0..self.layers {
+            conv3x3_relu_batch(
+                self.simd,
+                &cur[..in_channels * CELLS * lanes],
+                ConvLayer {
+                    in_channels,
+                    out_channels: self.channels,
+                    w: &self.conv_w[layer],
+                    b: &self.conv_b[layer],
+                },
+                padded,
+                next,
+            );
+            std::mem::swap(cur, next);
+            in_channels = self.channels;
+        }
+        let trunk = &cur[..self.channels * CELLS * lanes];
+
+        // --- heads, one lane at a time ---
+        for lane in 0..group.len() {
+            out.push(Heads {
+                move_logits: self.head_lane(trunk, &self.move_w, self.move_b, lane),
+                pair_u: self.head_lane(trunk, &self.pair_w, self.pair_b, lane),
+                value: self
+                    .value
+                    .as_ref()
+                    .map(|head| self.value_of_lane(trunk, head, lane)),
+            });
+        }
+    }
+
     /// 1x1 convolution from the trunk to a single 12x12 map.
     fn head(&self, trunk: &[f32], w: &[f32], bias: f32) -> [f32; CELLS] {
         let mut out = [bias; CELLS];
@@ -616,6 +742,21 @@ impl PolicyValueNet {
         out
     }
 
+    /// [`PolicyValueNet::head`] over one lane of an interleaved trunk.
+    ///
+    /// Accumulates channel-major, exactly like the contiguous version, so the
+    /// two agree bit for bit.
+    fn head_lane(&self, trunk: &[f32], w: &[f32], bias: f32, lane: usize) -> [f32; CELLS] {
+        let mut out = [bias; CELLS];
+        for (ch, weight) in w.iter().enumerate() {
+            let base = ch * CELLS * BATCH_LANES + lane;
+            for (c, slot) in out.iter_mut().enumerate() {
+                *slot += weight * trunk[base + c * BATCH_LANES];
+            }
+        }
+        out
+    }
+
     /// Global average pool -> fc1 ReLU -> fc2 -> tanh.
     fn value_of(&self, trunk: &[f32], head: &ValueHead) -> f32 {
         let mut gap = vec![0.0f32; self.channels];
@@ -623,10 +764,31 @@ impl PolicyValueNet {
             let plane = &trunk[ch * CELLS..(ch + 1) * CELLS];
             *slot = plane.iter().sum::<f32>() / CELLS as f32;
         }
+        self.value_from_gap(&gap, head)
+    }
+
+    /// [`PolicyValueNet::value_of`] over one lane of an interleaved trunk.
+    fn value_of_lane(&self, trunk: &[f32], head: &ValueHead, lane: usize) -> f32 {
+        let mut gap = vec![0.0f32; self.channels];
+        for (ch, slot) in gap.iter_mut().enumerate() {
+            let base = ch * CELLS * BATCH_LANES + lane;
+            // Summed in cell order, matching `Iterator::sum`'s sequential fold
+            // over the contiguous plane, so the pooled value is identical.
+            let mut sum = 0.0f32;
+            for c in 0..CELLS {
+                sum += trunk[base + c * BATCH_LANES];
+            }
+            *slot = sum / CELLS as f32;
+        }
+        self.value_from_gap(&gap, head)
+    }
+
+    /// The value head's dense tail, shared by both pooling paths.
+    fn value_from_gap(&self, gap: &[f32], head: &ValueHead) -> f32 {
         let mut out = head.fc2_b;
         for (h, bias) in head.fc1_b.iter().enumerate() {
             let row = &head.fc1_w[h * self.channels..(h + 1) * self.channels];
-            let acc = bias + dot(row, &gap);
+            let acc = bias + dot(row, gap);
             if acc > 0.0 {
                 out += head.fc2_w[h] * acc;
             }
@@ -665,6 +827,17 @@ fn head_weights(head: &RawHead, channels: usize, what: &str) -> Result<Vec<f32>,
 /// Reusable buffers for [`PolicyValueNet::forward`].
 #[derive(Clone, Debug)]
 pub struct NetScratch {
+    cur: Vec<f32>,
+    next: Vec<f32>,
+    padded: Vec<f32>,
+}
+
+/// Reusable buffers for [`PolicyValueNet::forward_batch`].
+///
+/// Laid out `[channel][cell][BATCH_LANES]` — the batch is the innermost,
+/// contiguous axis, which is the whole point of the batched kernel.
+#[derive(Clone, Debug)]
+pub struct BatchScratch {
     cur: Vec<f32>,
     next: Vec<f32>,
     padded: Vec<f32>,
@@ -795,6 +968,130 @@ fn conv3x3_relu_scalar(input: &[f32], layer: ConvLayer<'_>, padded: &mut [f32], 
             let dst = &mut out[o * CELLS + r * BOARD..o * CELLS + r * BOARD + BOARD];
             for (slot, value) in dst.iter_mut().zip(&acc) {
                 *slot = if *value > 0.0 { *value } else { 0.0 };
+            }
+        }
+    }
+}
+
+/// [`conv3x3_relu_batch_scalar`], recompiled for AVX2 + FMA.
+///
+/// # Safety
+/// Same contract as [`conv3x3_relu_avx2`]: `#[target_feature]` makes this
+/// callable only on a CPU with AVX2 and FMA, and every call site goes through
+/// the `simd` flag that [`simd_available`] set from `is_x86_feature_detected!`.
+/// `batched_forward_matches_the_serial_one` in `tests/net_parity.rs` runs the
+/// fixtures through this path.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn conv3x3_relu_batch_avx2(
+    input: &[f32],
+    layer: ConvLayer<'_>,
+    padded: &mut [f32],
+    out: &mut [f32],
+) {
+    conv3x3_relu_batch_scalar(input, layer, padded, out);
+}
+
+/// Dispatches the batched convolution to the widest instruction set available.
+fn conv3x3_relu_batch(
+    simd: bool,
+    input: &[f32],
+    layer: ConvLayer<'_>,
+    padded: &mut [f32],
+    out: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if simd {
+        // SAFETY: see `conv3x3_relu` — `simd` is only set when this CPU
+        // reported both AVX2 and FMA at load time.
+        unsafe {
+            conv3x3_relu_batch_avx2(input, layer, padded, out);
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = simd;
+    conv3x3_relu_batch_scalar(input, layer, padded, out);
+}
+
+/// [`conv3x3_relu_scalar`] over [`BATCH_LANES`] interleaved positions.
+///
+/// Buffers are `[channel][cell][BATCH_LANES]`, so the innermost run is one
+/// full-width vector of *positions* rather than a 12-wide board row. The
+/// reduction order is unchanged — for every output cell the kernel's three
+/// columns are still summed as one `k0*a + k1*b + k2*c` expression before
+/// being added to the accumulator, and channels are still walked in order — so
+/// this produces bit-identical results to the single-position kernel.
+///
+/// The accumulator is a `[[f32; BATCH_LANES]; C_TILE]` tile rather than a whole
+/// board row: 12 lanes-wide accumulators plus the three loaded operand vectors
+/// and three broadcast weights overflow the 16 AVX2 registers and start
+/// spilling, which measured slower than re-walking the row in tiles.
+#[inline(always)]
+fn conv3x3_relu_batch_scalar(
+    input: &[f32],
+    layer: ConvLayer<'_>,
+    padded: &mut [f32],
+    out: &mut [f32],
+) {
+    /// Board columns whose accumulators are held live at once.
+    const C_TILE: usize = 6;
+    const L: usize = BATCH_LANES;
+
+    let ConvLayer {
+        in_channels,
+        out_channels,
+        w,
+        b,
+    } = layer;
+    let plane = PADDED * PADDED * L;
+    let padded = &mut padded[..in_channels * plane];
+    padded.fill(0.0);
+    for ic in 0..in_channels {
+        for r in 0..BOARD {
+            let src = (ic * CELLS + r * BOARD) * L;
+            let dst = ic * plane + ((r + 1) * PADDED + 1) * L;
+            padded[dst..dst + BOARD * L].copy_from_slice(&input[src..src + BOARD * L]);
+        }
+    }
+
+    let k = in_channels * 9;
+    for o in 0..out_channels {
+        let w_row = &w[o * k..(o + 1) * k];
+        for r in 0..BOARD {
+            for c0 in (0..BOARD).step_by(C_TILE) {
+                let mut acc = [[b[o]; L]; C_TILE];
+                for ic in 0..in_channels {
+                    let kernel = &w_row[ic * 9..ic * 9 + 9];
+                    let channel = &padded[ic * plane..(ic + 1) * plane];
+                    for kr in 0..3 {
+                        // `r` is a board row, so padded row `r + kr` is board
+                        // row `r + kr - 1` — the same offset the single
+                        // position kernel uses.
+                        let base = ((r + kr) * PADDED + c0) * L;
+                        let row = &channel[base..base + (C_TILE + 2) * L];
+                        let (k0, k1, k2) = (kernel[kr * 3], kernel[kr * 3 + 1], kernel[kr * 3 + 2]);
+                        for (c, slot) in acc.iter_mut().enumerate() {
+                            let window = &row[c * L..c * L + 3 * L];
+                            for lane in 0..L {
+                                slot[lane] += k0 * window[lane]
+                                    + k1 * window[L + lane]
+                                    + k2 * window[2 * L + lane];
+                            }
+                        }
+                    }
+                }
+                let dst = (o * CELLS + r * BOARD + c0) * L;
+                for (c, values) in acc.iter().enumerate() {
+                    let slot = &mut out[dst + c * L..dst + c * L + L];
+                    for lane in 0..L {
+                        slot[lane] = if values[lane] > 0.0 {
+                            values[lane]
+                        } else {
+                            0.0
+                        };
+                    }
+                }
             }
         }
     }
