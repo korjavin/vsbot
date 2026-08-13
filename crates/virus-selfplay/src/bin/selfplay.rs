@@ -84,6 +84,24 @@ struct Args {
     out: Option<PathBuf>,
 }
 
+/// Parses a flag's value **into the field's own type**, so a value too large
+/// for that type is an error rather than a wrap.
+///
+/// Going through `u64` and casting with `as` would make `--sims 4294967297`
+/// mean `--sims 1`: a generation that looks like it ran at the requested
+/// strength, took the expected wall clock for one simulation per action, and
+/// produced rows that pass every contract check while being worthless. That is
+/// exactly the class of silent misconfiguration this binary refuses unknown
+/// flags to avoid, so it must not reintroduce it in the numbers themselves.
+fn number<T>(text: &str, what: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    text.parse::<T>()
+        .map_err(|error| format!("{what}: {error} (got {text:?})"))
+}
+
 fn parse() -> Result<Option<Args>, String> {
     let mut args = Args {
         options: Options::default(),
@@ -99,37 +117,21 @@ fn parse() -> Result<Option<Args>, String> {
     let mut raw = std::env::args().skip(1);
     while let Some(flag) = raw.next() {
         let mut value = || raw.next().ok_or_else(|| format!("{flag} needs a value"));
-        let number = |text: String, what: &str| -> Result<u64, String> {
-            text.parse::<u64>()
-                .map_err(|error| format!("{what}: {error}"))
-        };
         match flag.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return Ok(None);
             }
-            "--games" => args.options.games = number(value()?, "--games")?,
-            "--seed" => args.options.seed = number(value()?, "--seed")?,
-            "--shard" => args.options.shard_idx = number(value()?, "--shard")?,
-            "--shards" => args.options.shard_count = number(value()?, "--shards")?,
-            "--sims" => {
-                args.options.game.sims = number(value()?, "--sims")? as u32;
-            }
-            "--max-turns" => {
-                args.options.game.max_turns = number(value()?, "--max-turns")? as u32;
-            }
-            "--batch" => {
-                args.options.game.batch_size = number(value()?, "--batch")? as u16;
-            }
-            "--cpuct" => {
-                args.options.game.cpuct = value()?
-                    .parse()
-                    .map_err(|error| format!("--cpuct: {error}"))?;
-            }
+            "--games" => args.options.games = number(&value()?, "--games")?,
+            "--seed" => args.options.seed = number(&value()?, "--seed")?,
+            "--shard" => args.options.shard_idx = number(&value()?, "--shard")?,
+            "--shards" => args.options.shard_count = number(&value()?, "--shards")?,
+            "--sims" => args.options.game.sims = number(&value()?, "--sims")?,
+            "--max-turns" => args.options.game.max_turns = number(&value()?, "--max-turns")?,
+            "--batch" => args.options.game.batch_size = number(&value()?, "--batch")?,
+            "--cpuct" => args.options.game.cpuct = number(&value()?, "--cpuct")?,
             "--value-scale" => {
-                args.options.game.value_scale = value()?
-                    .parse()
-                    .map_err(|error| format!("--value-scale: {error}"))?;
+                args.options.game.value_scale = number(&value()?, "--value-scale")?;
             }
             "--net" => args.net = Some(PathBuf::from(value()?)),
             "--no-net" => args.net = None,

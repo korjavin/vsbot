@@ -284,6 +284,16 @@ pub fn play_game(
         ply += 1;
     }
 
+    // A game whose *last allowed* action ended it exits on the loop condition
+    // rather than through the `game_over` break, so the flag has to be settled
+    // here too. Only the statistic is at stake — `z` is read off the final
+    // state either way — but the capped count is how a generation reports
+    // whether its turn cap is biting, and a cap that silently absorbs finished
+    // games would hide that.
+    if state.game_over() {
+        capped = false;
+    }
+
     let z = sign(terminal_value_abs(&state));
     for row in &mut pending {
         row.z = z;
@@ -609,6 +619,45 @@ mod tests {
         assert!(
             stats.outcomes[0] + stats.outcomes[2] > 0,
             "capped games were all scored 0 — the turn cap became a fake draw"
+        );
+    }
+
+    /// The boundary the `capped` flag is easiest to get wrong on: a game whose
+    /// *last allowed* action ends it leaves the loop on the ceiling condition,
+    /// not through the `game_over` break, so a naive flag reports a finished
+    /// game as capped.
+    #[test]
+    fn a_game_ending_on_its_last_allowed_ply_is_not_reported_capped() {
+        let generous = GameConfig {
+            sims: 8,
+            max_turns: DEFAULT_MAX_TURNS,
+            ..GameConfig::default()
+        };
+        let per_turn = u32::from(ACTIONS_PER_TURN);
+
+        // A cap can only land exactly on the final action of a game whose
+        // length is a whole number of turns, so find one.
+        let (seed, plies) = (0..32u64)
+            .map(|game| {
+                let report = play_game("probe", derive_game_seed(1, game), None, &generous);
+                (game, report)
+            })
+            .find(|(_, report)| !report.capped && report.plies % per_turn == 0)
+            .map(|(game, report)| (game, report.plies))
+            .expect("some short game finishes on a turn boundary");
+
+        let exact = GameConfig {
+            max_turns: plies / per_turn,
+            ..generous
+        };
+        let report = play_game("probe", derive_game_seed(1, seed), None, &exact);
+        assert_eq!(
+            report.plies, plies,
+            "the tightened cap must land exactly on the final action"
+        );
+        assert!(
+            !report.capped,
+            "a game that ended on its last allowed ply is finished, not capped"
         );
     }
 }
