@@ -30,6 +30,13 @@ pub struct BotConfig {
     pub reconnect_min: Duration,
     /// Reconnect backoff ceiling.
     pub reconnect_max: Duration,
+    /// How long a session must last before its failure is treated as a fresh
+    /// fault rather than a continuation of the outage — i.e. before the
+    /// reconnect backoff resets to [`BotConfig::reconnect_min`].
+    pub stable_session: Duration,
+    /// How long an accepted-but-unstarted challenge may hold the bot out of the
+    /// pool before it heals back to idle.
+    pub pending_game_grace: Duration,
     /// Seed for the challenger's target choice and initial jitter. `None` takes
     /// the seed from the clock. No engine path consumes this.
     pub rng_seed: Option<u64>,
@@ -47,6 +54,8 @@ impl Default for BotConfig {
             challenge_cols: 12,
             reconnect_min: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(30),
+            stable_session: Duration::from_secs(30),
+            pending_game_grace: Duration::from_secs(15),
             rng_seed: None,
         }
     }

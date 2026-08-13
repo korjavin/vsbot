@@ -536,9 +536,13 @@ async fn a_busy_bot_declines_a_challenge() {
     assert_eq!(message["challengeId"], "c1");
 }
 
-/// An idle bot accepts, and answers `bot_wanted` by joining the named lobby.
+/// A bot that has accepted a challenge is busy *before* `game_start` arrives.
+///
+/// The server's `handleAcceptChallenge` has no in-game guard: a second accept
+/// creates a second game and overwrites our `gameId`, abandoning the first to
+/// time out. So the accept itself must claim the bot.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_idle_bot_accepts_and_joins() {
+async fn a_second_challenge_before_game_start_is_declined() {
     let (bot, mut inbox) = build(Arc::new(CountingEngine::default()));
     feed(
         &bot,
@@ -547,11 +551,83 @@ async fn an_idle_bot_accepts_and_joins() {
 
     feed(
         &bot,
+        &json!({"type": "challenge_received", "challengeId": "first"}),
+    );
+    let (accepted, _) = next_frame(&mut inbox).await;
+    assert_eq!(accepted["type"], "accept_challenge");
+    assert_eq!(accepted["challengeId"], "first");
+
+    // No `game_start` yet — and a second challenge lands.
+    feed(
+        &bot,
+        &json!({"type": "challenge_received", "challengeId": "second"}),
+    );
+    let (declined, _) = next_frame(&mut inbox).await;
+    assert_eq!(declined["type"], "decline_challenge");
+    assert_eq!(declined["challengeId"], "second");
+}
+
+/// ...but an accept the server never honours must not wedge the bot out of the
+/// pool for the life of the process.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_accepted_game_that_never_starts_heals_back_to_idle() {
+    let config = Arc::new(BotConfig {
+        pending_game_grace: Duration::from_millis(50),
+        ..BotConfig::default()
+    });
+    let (bot, mut inbox) = Bot::new(config, Arc::new(CountingEngine::default()));
+    feed(
+        &bot,
+        &json!({"type": "welcome", "userId": "me", "username": "Bot A"}),
+    );
+    feed(
+        &bot,
+        &json!({"type": "challenge_received", "challengeId": "dropped"}),
+    );
+    let (accepted, _) = next_frame(&mut inbox).await;
+    assert_eq!(accepted["type"], "accept_challenge");
+    assert_eq!(bot.core().phase, virus_proto::Phase::InGame);
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    // Any subsequent traffic heals the optimistic flag.
+    feed(&bot, &json!({"type": "users_update", "users": []}));
+    assert_eq!(bot.core().phase, virus_proto::Phase::Idle);
+
+    // And the bot is available again.
+    feed(
+        &bot,
+        &json!({"type": "challenge_received", "challengeId": "next"}),
+    );
+    let (message, _) = next_frame(&mut inbox).await;
+    assert_eq!(message["type"], "accept_challenge");
+}
+
+/// An idle bot accepts a challenge.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_bot_accepts_a_challenge() {
+    let (bot, mut inbox) = build(Arc::new(CountingEngine::default()));
+    feed(
+        &bot,
+        &json!({"type": "welcome", "userId": "me", "username": "Bot A"}),
+    );
+    feed(
+        &bot,
         &json!({"type": "challenge_received", "challengeId": "c1"}),
     );
     let (message, _) = next_frame(&mut inbox).await;
     assert_eq!(message["type"], "accept_challenge");
+    assert_eq!(message["challengeId"], "c1");
+}
 
+/// An idle bot answers `bot_wanted` by joining the named lobby, echoing the
+/// server's correlation id.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_bot_joins_a_wanted_lobby() {
+    let (bot, mut inbox) = build(Arc::new(CountingEngine::default()));
+    feed(
+        &bot,
+        &json!({"type": "welcome", "userId": "me", "username": "Bot A"}),
+    );
     feed(
         &bot,
         &json!({"type": "bot_wanted", "lobbyId": "L", "requestId": "r1"}),
@@ -560,6 +636,19 @@ async fn an_idle_bot_accepts_and_joins() {
     assert_eq!(message["type"], "join_lobby");
     assert_eq!(message["lobbyId"], "L");
     assert_eq!(message["requestId"], "r1");
+
+    // Once in the lobby it is no longer available for a challenge.
+    feed(
+        &bot,
+        &json!({"type": "lobby_joined", "lobby": {"lobbyId": "L"}}),
+    );
+    assert_eq!(bot.core().phase, virus_proto::Phase::InLobby);
+    feed(
+        &bot,
+        &json!({"type": "challenge_received", "challengeId": "c1"}),
+    );
+    let (message, _) = next_frame(&mut inbox).await;
+    assert_eq!(message["type"], "decline_challenge");
 }
 
 /// Unknown message types and undecodable frames are survivable: one bad frame

@@ -12,11 +12,11 @@
 //! Searches live on `spawn_blocking` workers owned by [`Bot`], not here.
 
 use crate::bot::{Bot, Outbound};
-use crate::config::{connect_url, Rng};
+use crate::config::{connect_url, BotConfig, Rng};
 use futures_util::stream::StreamExt;
 use futures_util::SinkExt;
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -95,19 +95,34 @@ pub async fn run_session(
     result
 }
 
-/// Reconnect loop with exponential backoff, reset on every successful session.
+/// Reconnect loop with exponential backoff, reset after any session that stood
+/// up long enough to count as healthy.
 pub async fn run_forever(bot: &Bot, inbox: &mut mpsc::UnboundedReceiver<Outbound>) -> ! {
     let mut backoff = bot.config().reconnect_min;
     loop {
+        let started = Instant::now();
         match run_session(bot, inbox).await {
             Ok(()) => bot.log("session closed; reconnecting"),
             Err(error) => bot.log(&format!("{error}; reconnecting")),
         }
         tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(bot.config().reconnect_max);
-        if bot.core().phase == crate::bot::Phase::Idle {
-            backoff = bot.config().reconnect_min;
-        }
+        backoff = next_backoff(backoff, started.elapsed(), bot.config());
+    }
+}
+
+/// The delay before the next reconnect attempt.
+///
+/// Backoff must not be reset from the bot's phase: [`run_session`] always calls
+/// `Bot::on_disconnected` on the way out, so the phase is *always*
+/// `Disconnected` here. Session **duration** is the signal that survives — a
+/// session that lasted is evidence the endpoint is healthy and the next outage
+/// deserves a fresh, short retry, while an immediate accept-then-drop keeps
+/// climbing instead of hot-looping.
+fn next_backoff(current: Duration, session: Duration, config: &BotConfig) -> Duration {
+    if session >= config.stable_session {
+        config.reconnect_min
+    } else {
+        (current * 2).min(config.reconnect_max)
     }
 }
 
@@ -163,4 +178,57 @@ fn clock_seed() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_nanos() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> BotConfig {
+        BotConfig {
+            reconnect_min: Duration::from_secs(1),
+            reconnect_max: Duration::from_secs(30),
+            stable_session: Duration::from_secs(30),
+            ..BotConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_flapping_endpoint_backs_off_to_the_ceiling() {
+        let config = config();
+        let mut backoff = config.reconnect_min;
+        let instant_failure = Duration::from_millis(20);
+        for _ in 0..10 {
+            backoff = next_backoff(backoff, instant_failure, &config);
+        }
+        assert_eq!(backoff, config.reconnect_max);
+    }
+
+    /// The regression: the old reset keyed on the bot's phase, which
+    /// `run_session` had already forced to `Disconnected` on its way out — so
+    /// a bot that had ever backed off stayed at the ceiling forever, even
+    /// after hours of healthy play.
+    #[test]
+    fn a_healthy_session_resets_the_backoff() {
+        let config = config();
+        let at_ceiling = config.reconnect_max;
+        assert_eq!(
+            next_backoff(at_ceiling, Duration::from_secs(3600), &config),
+            config.reconnect_min
+        );
+        // Exactly at the threshold counts as healthy.
+        assert_eq!(
+            next_backoff(at_ceiling, config.stable_session, &config),
+            config.reconnect_min
+        );
+        // Just under it does not.
+        assert_eq!(
+            next_backoff(
+                config.reconnect_min,
+                config.stable_session - Duration::from_millis(1),
+                &config
+            ),
+            config.reconnect_min * 2
+        );
+    }
 }

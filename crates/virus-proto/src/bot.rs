@@ -41,10 +41,6 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use virus_core::{Action, CellKind, Player, Pos, State};
 
-/// How long an optimistic "busy" flag may stand without a `game_start` before
-/// the bot heals itself back to idle. Only challenger mode sets that flag.
-const PENDING_GAME_GRACE: Duration = Duration::from_secs(15);
-
 /// Minimum gap between `resync` requests, so a burst of server errors cannot
 /// turn into a request storm.
 const RESYNC_COOLDOWN: Duration = Duration::from_secs(1);
@@ -486,13 +482,20 @@ impl Bot {
             });
             return;
         }
-        // Self-sparring only: flip busy *before* accepting so a second
-        // challenge arriving in the same instant is declined rather than
-        // double-accepted. `heal_pending_game` undoes it if no game shows up.
-        if self.config.challenger {
-            core.phase = Phase::InGame;
-            core.pending_game_since = Some(Instant::now());
-        }
+        // Flip busy *before* accepting, so a second challenge arriving in the
+        // window between our accept and the server's `game_start` is declined
+        // rather than double-accepted.
+        //
+        // This matters for every bot, not just self-sparring ones: the server's
+        // `handleAcceptChallenge` has no in-game guard, so a second accept
+        // creates a *second* game and overwrites our `gameId` — abandoning the
+        // first game to time out. The Go client only armed this in challenger
+        // mode and carried the hole everywhere else.
+        //
+        // The flag is only optimistic; `heal_pending_game` returns us to the
+        // pool if the game never materialises.
+        core.phase = Phase::InGame;
+        core.pending_game_since = Some(Instant::now());
         drop(core);
         self.send(Outgoing::AcceptChallenge {
             challenge_id: message.challenge_id.clone(),
@@ -649,14 +652,19 @@ impl Bot {
         });
     }
 
-    /// Undoes the challenger's optimistic busy flag if the game never arrived.
+    /// Undoes the optimistic busy flag if the accepted game never arrived.
+    ///
+    /// Without this, one accept the server dropped on the floor (admission
+    /// refused, challenger disconnected) would wedge the bot out of the pool
+    /// for the life of the process.
     fn heal_pending_game(&self) {
+        let grace = self.config.pending_game_grace;
         let mut core = self.core();
         let stuck = core.phase == Phase::InGame
             && core.current_game.is_none()
             && core
                 .pending_game_since
-                .is_some_and(|since| since.elapsed() > PENDING_GAME_GRACE);
+                .is_some_and(|since| since.elapsed() > grace);
         if stuck {
             core.go_idle();
         }
@@ -774,6 +782,10 @@ impl Bot {
     /// predecessor, so the user list is only ever *read* here — never acted on
     /// as it arrives.
     pub(crate) fn challenge_tick(&self, rng: &mut crate::config::Rng) {
+        // A challenge we accepted but never saw start would otherwise keep us
+        // out of the pool forever; the timer is the one thing guaranteed to
+        // keep running when no messages arrive.
+        self.heal_pending_game();
         let target = {
             let core = self.core();
             if core.phase != Phase::Idle || core.user_id.is_empty() {
