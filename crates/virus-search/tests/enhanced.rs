@@ -383,6 +383,28 @@ fn a_searcher_refuses_to_move_for_the_wrong_seat() {
     let _ = searcher.search_node_budget(&other, 1_000);
 }
 
+/// Regression: the opening book short-circuits ahead of the search, so the seat
+/// check has to happen ahead of the *book*. A book-eligible position is the one
+/// shape where a wrong-seat call would otherwise sail through and hand back the
+/// other player's wedge move.
+#[test]
+#[should_panic(expected = "searcher rooted at player")]
+fn the_book_does_not_smuggle_a_move_for_the_wrong_seat() {
+    let fresh = State::new(12, 12, 2).expect("12x12 two-player board");
+    let mut searcher = Searcher::enhanced(&fresh); // rooted at P1
+
+    let mut p2_to_move = fresh;
+    for action in [Action::mv(1, 1), Action::mv(2, 1), Action::mv(2, 2)] {
+        p2_to_move = p2_to_move.apply(action).expect("legal");
+    }
+    assert_eq!(p2_to_move.current_player(), 2);
+    assert!(
+        virus_search::book::opening_book_move(&p2_to_move).is_some(),
+        "the book must genuinely fire here for this to test anything"
+    );
+    let _ = searcher.search_node_budget(&p2_to_move, 1_000);
+}
+
 #[test]
 fn a_zero_budget_has_no_answer() {
     let state = wedged();

@@ -507,6 +507,7 @@ impl Searcher {
     /// # Panics
     /// Panics when `state`'s mover is not this searcher's root player.
     pub fn search_node_budget(&mut self, state: &State, limit: u64) -> Option<SearchResult> {
+        self.assert_root(state);
         if let Some(book) = self.book_result(state) {
             return Some(book);
         }
@@ -571,6 +572,7 @@ impl Searcher {
         state: &State,
         deadline: Instant,
     ) -> Option<SearchResult> {
+        self.assert_root(state);
         if let Some(book) = self.book_result(state) {
             return Some(book);
         }
@@ -644,9 +646,16 @@ impl Searcher {
         Some(result)
     }
 
-    /// Per-call reset. Budgets and counters are per move; the packed table
-    /// persists across moves, aged by one generation.
-    fn begin_search(&mut self, state: &State, deadline: Option<Instant>, limit: u64) {
+    /// A persistent searcher's scores are root-relative, so handing it the other
+    /// seat is a programming error rather than a recoverable condition.
+    ///
+    /// Checked *before* the opening book, not only inside [`Searcher::begin_search`]:
+    /// the book fires on any fresh opening turn regardless of seat, so a
+    /// book-eligible position would otherwise hand a P1-rooted searcher P2's
+    /// wedge move and skip the check entirely. Java has the same short-circuit
+    /// order and the same latent hole; an action played for the wrong seat is
+    /// exactly the class of bug that forfeits a live game.
+    fn assert_root(&self, state: &State) {
         assert_eq!(
             state.current_player(),
             self.root,
@@ -654,6 +663,12 @@ impl Searcher {
             self.root,
             state.current_player()
         );
+    }
+
+    /// Per-call reset. Budgets and counters are per move; the packed table
+    /// persists across moves, aged by one generation.
+    fn begin_search(&mut self, state: &State, deadline: Option<Instant>, limit: u64) {
+        self.assert_root(state);
         self.deadline = deadline;
         self.node_limit = limit;
         self.nodes = 0;
