@@ -18,3 +18,8 @@ virus-search = { workspace = true }
 virus-mcts = { workspace = true }
 virus-proto = { workspace = true }
 virus-arena = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "process"] }
