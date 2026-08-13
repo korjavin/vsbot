@@ -31,9 +31,12 @@ CANDIDATE: ____________________  BEAD: vsbot-____
 [ ]     container_name: vsbot-canary, no `build:` key.
 [ ]  5. Canary up ALONGSIDE the incumbent; banner checked; illegal_moves and
 [ ]     fallback_actions both zero.
-[ ]  6. Owner told the lobby name. Owner plays >= 5 completed games, including
-[ ]     the turtle probe and the gifting probe, plus 1 control game vs the incumbent.
-[ ]  7. Verdict appended to the bead: date + PROMOTE|REJECT|ITERATE + impressions.
+[ ]  6. Gate C soak: canary left up until >= 20 completed live games (any
+[ ]     opponents) with ZERO illegal moves / timeouts / out-of-turn emissions.
+[ ]     Live W-L-D recorded informationally (uncontrolled opposition — not a gate).
+[ ]  7. Auto-verdict appended to the bead: date + PROMOTE|REJECT + the three gate
+[ ]     results. (Owner plays and comments only if they feel like it — optional,
+[ ]     never waited on; owner feedback at any later time files a bug or rollback.)
 [ ]  8. On PROMOTE only: artifact -> artifacts/champions/gen-N.json + copied over
 [ ]     artifacts/mcts_champion.json, committed, image rebuilt, VSBOT_TAG re-pinned.
 [ ]  9. Canary container removed (`docker compose ... rm -sf vsbot-canary`).
@@ -41,21 +44,27 @@ CANDIDATE: ____________________  BEAD: vsbot-____
 ```
 
 **One candidate per canary.** Never change the net and the budget in the same
-canary — the owner's verdict then means nothing about either
-(canary doc:89-95, "one net per branch so the owner can A/B them").
+canary — a mixed result then means nothing about either
+(canary doc:89-95, "one net per branch").
 
 ---
 
-## Why this exists (the Goodhart lesson, cited)
+## Why the canary stage exists (and who decides)
 
 `vs-ai2.52` dominated every scripted gate it was measured against, then lost
 three straight games to the owner by base-turtling
-(`~/Project/virusgame/docs/nnue-canary.md:9-12`; bd memory
-`vs-ai2-goodhart-scripted-gates`). Gate fitness did **not** transfer to strength
-against the actual target opponent.
+(`~/Project/virusgame/docs/nnue-canary.md:9-12`). Gate fitness did **not**
+transfer to strength against the actual target opponent — that is the Goodhart
+lesson, and it is why a live soak stage exists at all.
 
-So: gauntlet numbers can only *stop* a promotion, never cause one. A candidate
-that clears Gate A and Gate B has earned a canary slot — nothing more.
+**Promotion is automated (owner decision, 2026-08-13).** The owner explicitly
+exited the gatekeeper role ("roll candidates without me"): a candidate that
+passes Gate A, Gate B, and the Gate C live soak **auto-promotes** — no human
+verdict is waited on. The residual Goodhart risk is accepted and mitigated
+three ways: the human-games curriculum keeps training aimed at real opponents,
+rollback is a seconds-fast tag re-pin, and any owner feedback at any time
+(e.g. "it played a nonsense neutral") files a bug bead and may trigger an
+immediate rollback — as happened with the 2026-08-13 ponder canary.
 
 ---
 
@@ -322,59 +331,55 @@ orphan container; that warning is expected and must not be answered with
 
 ---
 
-## 4. What the owner does
+## 4. Gate C — the automated live soak
 
-Tell the owner exactly one thing: **the lobby name** (e.g. `Canary-gen6 Bot 2131`)
-and what changed in one sentence.
+The canary stays up, accept-only, until it has **>= 20 completed live games**
+against whoever plays it (bots or humans), with **zero** protocol incidents:
 
-The protocol:
+- zero `illegal_move` / forfeits (grep both the container log and, where
+  available, the server-side result),
+- zero timeouts (no move past the turn budget's hard ceiling),
+- zero out-of-turn emissions,
+- pace within the owner's UX bound (10-15 s/turn, live default 10 s — a canary
+  that exceeds it is a REJECT even if strong).
 
-- **N >= 5 completed games** against the canary. Fewer than 5 is not a canary;
-  the precedent that defines this runbook was decided in 3
-  (nnue-canary.md:9-12).
-- Of those, at least **two adversarial probes** against the known live exploit
-  vectors the canary doc names: **base-turtling** and **en-prise gifting**
-  (nnue-canary.md, "Branch naming"). A candidate that plays beautifully until
-  turtled is exactly the failure this runbook exists to catch.
-- At least **one control game vs the incumbent** (`SuperiorBot Bot …`) in the
-  same session, so "felt stronger" has a same-day reference point rather than a
-  memory of last month's bot.
-- Judge on **pace as well as strength**. The owner's UX bound is 10-15 s for the
-  full 3-action turn (owner directive, 2026-08-13). A canary that is stronger
-  and unpleasant to play is a REJECT, and the bound itself is revisable only by
-  the owner.
+Live W-L-D over those games is **recorded informationally only** — live
+opposition is uncontrolled, so it can stop a promotion on catastrophe (e.g.
+losing to opponents the incumbent reliably beats) but a good number proves
+nothing Gate A didn't already claim.
 
-There is no win-rate threshold, and adding one would recreate the Goodhart
-failure at human scale. The verdict is a judgement.
+The owner may play the canary at any point — the lobby name should be posted in
+the session notes — but **nothing waits on it**. Owner impressions, whenever
+they arrive, append to the candidate's bead; a negative one after promotion is
+grounds for the §6 rollback, exactly like the 2026-08-13 ponder revert.
 
 ---
 
 ## 5. Recording the verdict
 
-The verdict goes in **the candidate's bead** (not this standing bead,
-`vsbot-eiw`), appended so the history of a candidate that took two canaries
-stays readable:
+The verdict goes in **the candidate's bead** (not a standing bead), appended so
+the history of a candidate that took two canaries stays readable:
 
 ```bash
-bd update vsbot-<candidate> --append-notes "CANARY VERDICT 2026-08-20 — PROMOTE
+bd update vsbot-<candidate> --append-notes "CANARY VERDICT 2026-08-20 — PROMOTE (auto)
 candidate: gen-6 (artifacts/champions/gen-6.json), image sha-9602b2f…
 deployed as: Canary-gen6 Bot 2131, Pattern B (net-only, incumbent tag sha-1a2b3c4)
-games: 6 (2 turtle probes, 1 gifting probe, 1 control vs SuperiorBot)
-owner impressions: punished the turtle line by turn 20 instead of shuffling;
-  still gifts an occasional en-prise cell in the opening; pace fine, ~9 s/turn.
-gates: A 0.571/400 (gen-6 report), B(i) 0.94/400 vs ab-enhanced, B(ii) no regression
+gate A: 0.571/400 vs champion   gate B(i): 0.94/400 vs ab-enhanced   B(ii): no regression
+gate C: 23 live games, 0 illegal/timeout/out-of-turn, live W-L-D 19-4-0 (informational)
+owner feedback: none at promotion time (not required)
 rollback target: VSBOT_TAG=sha-1a2b3c4…"
 ```
 
-Required fields, every time: **date**, **verdict** (`PROMOTE` | `REJECT` |
-`ITERATE`), **impressions in the owner's words**, the games played, and the
-rollback target.
+Required fields, every time: **date**, **verdict** (`PROMOTE` | `REJECT`, marked
+`(auto)`), the **three gate results**, and the **rollback target**. Owner
+feedback is included verbatim whenever it exists, with its date — including
+feedback that arrives after promotion.
 
-`REJECT` and `ITERATE` are recorded with the same weight as `PROMOTE` — a
-rejected candidate whose failure mode is written down is the only thing that
-stops the next generation from re-learning it. Tear the canary down (§3) and
-leave the incumbent exactly as it was; no other action is needed, because the
-canary never touched the default.
+`REJECT` is recorded with the same weight as `PROMOTE` — a rejected candidate
+whose failure mode is written down is the only thing that stops the next
+generation from re-learning it. Tear the canary down (§3) and leave the
+incumbent exactly as it was; no other action is needed, because the canary
+never touched the default.
 
 ---
 
