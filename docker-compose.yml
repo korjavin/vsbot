@@ -1,93 +1,102 @@
-# vsbot — live deployment against the public virusgame server.
+# vsbot — remote deployment template (Portainer, deploy branch).
 #
-# Runbook, env knobs and the promote/rollback procedure: see DEPLOY.md.
+# THIS FILE IS A TEMPLATE, NOT THE FILE PORTAINER READS.
+# `.github/workflows/docker.yml` renders it through `deploy/render.sh` on every
+# master push and force-pushes the result to the `deploy` branch as the
+# repository-root `docker-compose.yml`. Point a Portainer repository stack at
 #
-# Engine: MCTS (PUCT + the gen-5 champion net baked into the image) is the
-# default since PR #9. Per-game domain mismatches (>2 players, non-12x12)
-# fall back to GREEDY with a WARNING log line; a bad/missing artifact is a
-# hard startup failure, so this stack can never *think* it is running the
-# champion while playing at random. Strength claims still require >=400-game
-# gauntlets (see docs/plans/superiority.md) — live play is a canary, not a gate.
-
-# Pin the compose project name instead of inheriting the directory name, so the
-# stack is the same object whether it is brought up from the repo root, a git
-# worktree, or a Portainer stack directory.
-name: vsbot
+#     https://github.com/korjavin/vsbot   ref: refs/heads/deploy   path: docker-compose.yml
+#
+# and every master merge redeploys it. See DEPLOY.md → "Hosting elsewhere via
+# Portainer".
+#
+# Differences from the repository-root docker-compose.yml (which stays exactly
+# as it is, for local development on the build host):
+#
+#   * no `build:` key — a remote host has no source tree and must never try to
+#     compile a Rust workspace to bring a stack up;
+#   * the `image:` line below is rewritten by CI to the immutable
+#     `sha-<commit>` tag of the image that same run built, so the deploy branch
+#     always says precisely which commit is deployed. The `:latest` here is a
+#     placeholder that only exists so this template is itself valid compose and
+#     can be validated with `docker compose -f deploy/docker-compose.yml config`;
+#   * every knob is env-overridable with a production default baked in, so a
+#     stack works with an empty environment and is still tunable from the
+#     Portainer stack-variables screen;
+#   * no host-specific paths and no volumes — the trained artifacts are baked
+#     into the image at /opt/vsbot/artifacts and the bot is stateless.
+#
+# The compose project name is deliberately NOT pinned here: Portainer names the
+# stack itself (`-p <stack name>`, which wins over a `name:` key anyway), and a
+# hard-coded name only invites a collision with a stack the operator called
+# something else.
 
 services:
   vsbot:
-    # Pinning: :latest tracks master (pushed by .github/workflows/docker.yml).
-    # Set VSBOT_TAG to a commit SHA to freeze or to roll back — see DEPLOY.md.
-    image: ghcr.io/korjavin/vsbot:${VSBOT_TAG:-latest}
-    # Lets the same file serve a from-source deploy: `docker compose up -d
-    # --build`. Ignored when the image is pulled.
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: vsbot
+    # Rewritten by CI — see deploy/render.sh. Exactly one `image:` line may
+    # exist in this file; render.sh fails the build if that stops being true.
+    image: ghcr.io/korjavin/vsbot:sha-a0a4d1d08e3815e46f6fa66f9df4438d0e8b6f3b
+    container_name: ${VSBOT_CONTAINER_NAME:-vsbot}
     restart: unless-stopped
+    pull_policy: always
 
     environment:
-      # Production endpoint. The route is /ws (virusgame backend main.go);
-      # a plain GET returns 400 because it is WebSocket-only. The binary
-      # appends ?bot=true (and &namePrefix=…) itself — do not add them here.
-      BACKEND_URL: wss://vs.wandergeek.org/ws
+      # Production endpoint. The route is /ws (virusgame backend); a plain GET
+      # returns 400 because it is WebSocket-only. The binary appends ?bot=true
+      # (and &namePrefix=…) itself — do not add them here.
+      BACKEND_URL: ${BACKEND_URL:-wss://vs.wandergeek.org/ws}
 
       # The lobby name. The server appends its own suffix, so this shows up as
-      # e.g. "SuperiorBot Bot 2127".
+      # e.g. "SuperiorBot Bot 2127". Give a second installation its own prefix
+      # so two hosts are distinguishable in the lobby.
       BOT_NAME_PREFIX: ${BOT_NAME_PREFIX:-SuperiorBot}
 
       # MCTS is the production engine; ALPHABETA still aborts startup.
       SEARCH: ${SEARCH:-MCTS}
-      # Absolute path: the image bakes artifacts under /opt/vsbot but runs from /home/vsbot.
+      # Absolute path *inside the image*: artifacts are baked under /opt/vsbot
+      # but the process runs from /home/vsbot. Not a host path — nothing is
+      # mounted.
       MCTS_ARTIFACT: ${MCTS_ARTIFACT:-/opt/vsbot/artifacts/mcts_champion.json}
 
       # Wall-clock budget for a whole 3-action turn, split 50/30/20 across the
-      # turn's actions by the intra-turn allocator. The owner's UX bound is
-      # 10-15 s per turn (owner directive 2026-08-13); the server's 120 s
-      # per-action timer is a failsafe, not a budget.
+      # turn's actions. The owner's UX bound is 10-15 s per turn; the server's
+      # 120 s per-action timer is a failsafe, not a budget.
       VSBOT_TURN_MILLIS: ${VSBOT_TURN_MILLIS:-10000}
 
-      # Per-action override. Setting either of these DISABLES the allocator and
-      # gives every action a fixed budget — that is for gauntlets and A/Bs, not
-      # live play. Both are forwarded unset (empty reads as unset in the binary)
-      # so an existing .env keeps working: before the allocator landed the image
-      # hard-coded MOVE_MILLIS=1000, and an operator who set it must still get
-      # what they asked for rather than a silent switch to the turn budget.
-      # VSBOT_MOVE_MILLIS wins if both are set.
+      # Per-action override. Setting either DISABLES the intra-turn allocator
+      # and gives every action a fixed budget — that is for gauntlets and A/Bs,
+      # not live play. Forwarded unset so an operator who deliberately sets one
+      # still gets what they asked for. VSBOT_MOVE_MILLIS wins if both are set.
       VSBOT_MOVE_MILLIS: ${VSBOT_MOVE_MILLIS:-}
       MOVE_MILLIS: ${MOVE_MILLIS:-}
 
-      # The two visit-based stop rules, on by default. Unset here so the
-      # binary's defaults are the single source of truth.
+      # The two visit-based stop rules, on by default in the binary. Left unset
+      # so the binary's defaults stay the single source of truth.
       VSBOT_EARLY_STOP: ${VSBOT_EARLY_STOP:-}
       VSBOT_EXTENSION: ${VSBOT_EXTENSION:-}
 
-      # Pondering searches the opponent's positions during their turn. It is a
-      # behaviour change the owner judges, so it ships canary-first: an explicit
-      # documented "off" here rather than an omission someone mistakes for one.
+      # Pondering is off pending bd vsbot-gei (a 2026-08-13 canary found a
+      # quality regression). An explicit documented "off", not an omission.
       VSBOT_PONDER: ${VSBOT_PONDER:-false}
       VSBOT_PONDER_SECS: ${VSBOT_PONDER_SECS:-}
 
       # ACCEPT-ONLY. Challenger mode makes the bot initiate games on a timer;
-      # against the *public* server that means pestering real humans with a
-      # greedy bot. Leave this false in production. It is here as an explicit,
-      # documented "off" rather than an omission someone later mistakes for an
-      # oversight.
-      CHALLENGER: "false"
+      # against the *public* server that means pestering real humans. Keep it
+      # false unless this stack points at a private backend.
+      CHALLENGER: ${CHALLENGER:-false}
 
-    # The host is 4 vCPU / 8 GB and runs other stacks (traefik, portainer,
-    # omnigent, postgres). GREEDY barely registers; the headroom is sized for
-    # MCTS later, when the search actually uses its budget.
+    # Sized for MCTS on a small shared VPS. Note that under `docker compose up`
+    # (Portainer's standalone mode) `deploy.resources.limits` is honoured by
+    # Compose v2; on a Swarm endpoint it is the swarm scheduler's business.
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 512M
+          cpus: ${VSBOT_CPUS:-2.0}
+          memory: ${VSBOT_MEMORY:-512M}
         reservations:
           memory: 128M
 
-    # Without rotation a restart-looping bot fills the disk with reconnect
+    # Without rotation a restart-looping bot fills the host disk with reconnect
     # noise. 3 x 10 MB is plenty to debug a bad night.
     logging:
       driver: json-file
