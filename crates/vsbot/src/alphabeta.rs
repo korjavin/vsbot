@@ -40,14 +40,18 @@
 //! no runtime of its own. A `CANCEL_POLL`-interval watcher thread lives exactly
 //! as long as the search does, and is joined by the scope that spawned it.
 //!
-//! What this replaced was a *cost bound* rather than a fix. Until bd `vsbot-tz7`
-//! there was no public stop flag, so a superseded search burned a core and held
-//! its 32 MiB transposition table until its own deadline; a search that found
-//! the cache lock held took a deliberately small table so a burst of snapshots
-//! could not multiply the working set inside the deployment's 512 MB container.
-//! Prompt cancellation removes the multiplier that bound existed for — the
-//! predecessor now unwinds in milliseconds rather than seconds — so a contended
-//! search gets the full table and the strength that goes with it.
+//! Until bd `vsbot-tz7` there was no public stop flag, so what this adapter
+//! could do was bound the *cost* of an overlap rather than end it: the deadline
+//! handed over is [`SearchBudget::deadline`] and never the later `ceiling`, so a
+//! stale search died at the target; and a search that found the cache lock held
+//! took a deliberately small transposition table.
+//!
+//! The first of those is now redundant in spirit but kept, and the second is
+//! kept outright — see [`CONTENDED_TT_LOG2`]. Cancellation collapses how *long*
+//! any one overlap lasts, from the remainder of a superseded search's budget to
+//! a poll interval plus an unwind. It does not bound how many overlaps can exist
+//! at once, because snapshots can arrive faster than a cancelled search takes to
+//! notice, so the memory bound is still doing work.
 //!
 //! The two in-adapter workarounds that were rejected are still worth recording,
 //! because both look tempting from here. Slicing the budget into short
@@ -75,6 +79,28 @@ use virus_search::{CancelToken, SearchOptions, SearchResult, Searcher};
 /// allocator hands out — so it is invisible in move latency — and the watcher
 /// only exists while a search does.
 const CANCEL_POLL: Duration = Duration::from_millis(5);
+
+/// `log2` of the transposition table a *contended* search gets: 2^18 entries,
+/// 4 MiB against the cached searcher's 32 MiB.
+///
+/// Contention means a previous search has been superseded but has not finished
+/// unwinding yet, so for a moment two searches each hold a table.
+///
+/// The cancellation hook shortens that moment enormously — from "the rest of the
+/// superseded search's budget", which could be seconds, to one
+/// [`CANCEL_POLL`] plus an unwind — but it bounds each overlap's *duration*, not
+/// how many overlaps can pile up at once. Snapshots arriving faster than a
+/// cancelled search takes to notice still stack, and every one of them would
+/// allocate another full table. The failure that bound protects against is an
+/// OOM inside the deployment's 512 MB container, which kills the process and
+/// forfeits every game in it; what it costs is a slightly weaker move on a rare
+/// path, by a search that starts on a cold table whatever its size. That
+/// asymmetry decides it, so the bound stays.
+///
+/// It also buys latency rather than only spending it: a 32 MiB table has to be
+/// allocated and zeroed before the search starts, and that comes out of the same
+/// budget the move is judged against.
+const CONTENDED_TT_LOG2: u32 = 18;
 
 /// Runs `search` with `token` raised as soon as `budget` is cancelled.
 ///
@@ -242,17 +268,18 @@ impl AlphaBetaEngine {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                // A held lock means the predecessor has not finished unwinding.
-                // It gets the full table: the reason this path used to take a
-                // deliberately small one was that a superseded search could not
-                // be interrupted and held its own table for the rest of its
-                // budget, which a burst of snapshots multiplied. Cancellation
-                // now collapses that overlap to the predecessor's unwind, so the
-                // bound costs strength on a live position and buys nothing. It
-                // is still never cached — the searcher holding the lock is the
-                // one that should stay warm.
+                // A held lock means a superseded search has not finished
+                // unwinding. This one takes a small table so a burst of
+                // snapshots cannot stack full ones — see [`CONTENDED_TT_LOG2`],
+                // which the cancellation hook shortens the need for without
+                // removing it. It is never cached either: the searcher holding
+                // the lock is the one that should stay warm.
+                let options = SearchOptions {
+                    tt_log2: CONTENDED_TT_LOG2,
+                    ..self.options
+                };
                 self.built.fetch_add(1, Ordering::SeqCst);
-                let mut searcher = Searcher::new(state, self.options);
+                let mut searcher = Searcher::new(state, options);
                 searcher.set_cancel_token(token.clone());
                 return watching(budget, &token, || {
                     searcher.search_with_deadline(state, budget.deadline)
