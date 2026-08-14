@@ -12,6 +12,11 @@ Archived verbatim from work/gen6/report.md (gitignored), plus this header.
 
   The absolute paths below are the executor worktree's; the relative ones
   above are the repo's.
+
+  Produced at base 4834d6b (the PR #25 merge). PR #29 landed a self-play
+  resign threshold in crates/virus-selfplay afterwards, so re-running this
+  generation on current master will NOT reproduce these rows byte for byte.
+  The numbers below belong to that base commit.
 -->
 
 # gen 6 report
