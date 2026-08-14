@@ -47,6 +47,18 @@
 //! first-mover advantage cancels within the pair; see [`gauntlet`] for why that
 //! matters and [`rng`] for why the seed derivation is not `seed + k`.
 //!
+//! # Net vs net
+//!
+//! Two *different* artifacts in one run — the RL loop's candidate-vs-champion
+//! gate — is [`gauntlet::run_with_nets`] with a [`gauntlet::SideNets`] per arm,
+//! or `--a-net`/`--b-net` on the `arena` binary. [`run`] is the single-artifact
+//! case and is exactly `run_with_nets` with both arms borrowing one loaded net,
+//! so a one-net run still loads one net.
+//!
+//! A net follows its *side*, never its seat: the arms swap chairs between the
+//! two games of a pair and their artifacts swap with them. `tests/net_vs_net.rs`
+//! is the tripwire for that, and it is a tripwire that has been checked to fire.
+//!
 //! # Cross-play
 //!
 //! Rust-vs-Rust settles internal A/Bs, but the bar this project must clear is
@@ -76,5 +88,5 @@ pub mod rng;
 pub mod stats;
 
 pub use engine::{Budget, Engine, SideSpec};
-pub use gauntlet::{run, GauntletConfig, GauntletResult};
+pub use gauntlet::{run, run_with_nets, GauntletConfig, GauntletResult, SideNets};
 pub use stats::{wilson95, Interval, Record, Summary, Verdict, GATE_MIN_GAMES, VERDICT_MIN_GAMES};

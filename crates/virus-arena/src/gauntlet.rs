@@ -30,6 +30,19 @@
 //! plies would leave the two colours of a pair with different accumulated
 //! state. Java's `GauntletMatch` does the same thing for the same reason.
 //!
+//! # Two nets, one run
+//!
+//! A side's net follows the *side*, not the seat. [`SideNets`] carries one
+//! loaded artifact per arm and [`play_game`] hands each seat the net belonging
+//! to whichever side is sitting there, so game `2k` and game `2k+1` are the same
+//! two nets with the chairs swapped rather than two different pairings. Getting
+//! this backwards would keep artifact A at seat 1 for both halves of a pair,
+//! which is precisely the first-mover bias the pairing exists to cancel.
+//!
+//! [`SideNets::shared`] is the single-artifact case: both arms borrow the *same*
+//! loaded net, so a one-net run still loads one net and the memory profile of
+//! the original single-net path is unchanged.
+//!
 //! # Draws
 //!
 //! A game that reaches the turn cap is a **draw**, not a territory decision.
@@ -164,6 +177,53 @@ impl GauntletConfig {
     }
 }
 
+/// The loaded net artifacts a run plays, one per side.
+///
+/// Each field is the artifact belonging to that *arm*, not to a seat: the
+/// harness swaps chairs between the two games of a pair and the nets travel with
+/// their sides. `None` is correct for an arm whose engine needs no artifact —
+/// [`engine::build`] refuses an MCTS side without one, so a missing net is an
+/// error with a name rather than a panic in a worker.
+///
+/// Nets are borrowed, never owned, so one loaded artifact is shared by every
+/// game and thread of the run. Pointing `a` and `b` at the same net is
+/// [`SideNets::shared`] and costs exactly one load.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SideNets<'net> {
+    /// Side A's artifact.
+    pub a: Option<&'net PolicyValueNet>,
+    /// Side B's artifact.
+    pub b: Option<&'net PolicyValueNet>,
+}
+
+impl<'net> SideNets<'net> {
+    /// One artifact for both arms — the single-net path.
+    ///
+    /// Both fields borrow the same net, so a self-gauntlet is genuinely one
+    /// configuration against itself and still cancels exactly.
+    pub fn shared(net: Option<&'net PolicyValueNet>) -> SideNets<'net> {
+        SideNets { a: net, b: net }
+    }
+
+    /// A different artifact per arm.
+    pub fn new(a: Option<&'net PolicyValueNet>, b: Option<&'net PolicyValueNet>) -> SideNets<'net> {
+        SideNets { a, b }
+    }
+
+    /// The `(seat 1, seat 2)` artifacts for a game in which side A holds seat 1
+    /// iff `a_is_p1`.
+    fn by_seat(
+        self,
+        a_is_p1: bool,
+    ) -> (Option<&'net PolicyValueNet>, Option<&'net PolicyValueNet>) {
+        if a_is_p1 {
+            (self.a, self.b)
+        } else {
+            (self.b, self.a)
+        }
+    }
+}
+
 /// Why a game stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Termination {
@@ -229,9 +289,10 @@ pub struct GauntletResult {
     pub summary: Summary,
 }
 
-/// Runs a gauntlet, returning the tally from side A's perspective.
+/// Runs a gauntlet in which both arms play the same artifact (or none).
 ///
-/// `net` is loaded once by the caller and shared by every game and thread.
+/// `net` is loaded once by the caller and shared by every game and thread. For
+/// a net-vs-net run use [`run_with_nets`].
 ///
 /// # Determinism
 ///
@@ -244,6 +305,20 @@ pub struct GauntletResult {
 pub fn run(
     config: &GauntletConfig,
     net: Option<&PolicyValueNet>,
+) -> Result<GauntletResult, engine::SpecError> {
+    run_with_nets(config, SideNets::shared(net))
+}
+
+/// Runs a gauntlet with a per-side artifact — the net-vs-net shape.
+///
+/// [`run`] is this with [`SideNets::shared`], and the two are byte-identical
+/// when both arms name the same net: the per-side plumbing changes which
+/// artifact a *seat* borrows, never how a game is seeded, ordered or tallied.
+///
+/// The determinism contract of [`run`] applies unchanged.
+pub fn run_with_nets(
+    config: &GauntletConfig,
+    nets: SideNets<'_>,
 ) -> Result<GauntletResult, engine::SpecError> {
     config.validate()?;
     let total = config.even_games();
@@ -265,7 +340,7 @@ pub fn run(
                         if index >= total {
                             return Ok(mine);
                         }
-                        mine.push(play_game(config, index, net)?);
+                        mine.push(play_game_with_nets(config, index, nets)?);
                     }
                 }),
             );
@@ -314,11 +389,20 @@ pub fn run(
     })
 }
 
-/// Plays one game of the run.
+/// Plays one game of the run with one artifact shared by both arms.
 pub fn play_game(
     config: &GauntletConfig,
     index: u32,
     net: Option<&PolicyValueNet>,
+) -> Result<GameOutcome, engine::SpecError> {
+    play_game_with_nets(config, index, SideNets::shared(net))
+}
+
+/// Plays one game of the run, each arm on its own artifact.
+pub fn play_game_with_nets(
+    config: &GauntletConfig,
+    index: u32,
+    nets: SideNets<'_>,
 ) -> Result<GameOutcome, engine::SpecError> {
     // Even indices give side A seat 1. Both games of a pair share a seed, so
     // the pair is one opening played from both chairs.
@@ -331,8 +415,12 @@ pub fn play_game(
     } else {
         (&config.side_b, &config.side_a)
     };
-    let mut seat1 = engine::build(spec_p1, 1, net)?;
-    let mut seat2 = engine::build(spec_p2, 2, net)?;
+    // The spec and the net for a seat must come from the *same* arm. Deriving
+    // them separately is how a net-vs-net run silently becomes artifact A
+    // wearing artifact B's name, so both come out of one `a_is_p1`.
+    let (net_p1, net_p2) = nets.by_seat(a_is_p1);
+    let mut seat1 = engine::build(spec_p1, 1, net_p1)?;
+    let mut seat2 = engine::build(spec_p2, 2, net_p2)?;
 
     let mut state = State::new(config.rows, config.cols, 2).map_err(|error| {
         engine::SpecError(format!("{}x{} board: {error}", config.rows, config.cols))
