@@ -31,11 +31,26 @@ This script only normalises and filters; it applies no game rules. Replay
 happens in Rust, through `virus-core`, so the probe fixture is built by the
 same rules engine the probe then runs against.
 
+Seat-name filters
+-----------------
+
+`--seat-name` and `--human-seat` narrow the dump to a named subset of games so
+the `live-owner-game` half of the probe set can be mined by the *same*
+heuristic as the rest — the corpus changes, the method does not.
+
+A seat is read as a bot iff its name contains "bot", case-insensitively. That
+is the server's own naming: bots are `Bot 9261`, `NNUE Bot 1039`,
+`SuperiorBot Bot 1220`; a web player gets an adjective-animal-number name such
+as `WiseBuffalo50`. It is a heuristic on a display string and nothing downstream
+depends on it being right — a misclassified seat changes which games are mined,
+not what is measured — but the seat names are recorded in each position's
+provenance so a reader can check.
+
 Usage:
 
     python3 fixtures/probes/tools/dump_games.py \
         --db games.db --out games-dump.jsonl [--rows 12] [--cols 12] \
-        [--only-neutral]
+        [--only-neutral] [--seat-name SuperiorBot] [--human-seat]
 """
 
 import argparse
@@ -79,6 +94,17 @@ def normalise_move(move):
     return None
 
 
+def is_human(name):
+    """Whether a seat name looks like a web player rather than a bot.
+
+    The server names every bot with "Bot" in it and gives a web player an
+    adjective-animal-number name. A blank name is not a human: an unnamed seat
+    carries no evidence either way and the filter is for *selecting* games, so
+    the conservative reading is the one that does not select.
+    """
+    return bool(name) and "bot" not in name.lower()
+
+
 def normalise_turn(turn):
     """One stored turn as `{"turn": n, "player": p, "moves": [...]}`, or `None`."""
     player = field(turn, "player")
@@ -112,9 +138,31 @@ def main(argv):
         help="the HTTP Last-Modified of the downloaded games.db, recorded in the meta line",
     )
     parser.add_argument(
+        "--source",
+        default="https://vs.wandergeek.org/data/games.db",
+        help="where this games.db came from, recorded verbatim in the meta line and "
+        "from there into every mined position's provenance. Override it when the "
+        "input is not the published snapshot — a WAL-recovered prod copy is a "
+        "different artifact and saying otherwise makes the corpus unciteable.",
+    )
+    parser.add_argument(
         "--only-neutral",
         action="store_true",
         help="keep only games whose PGN contains a neutral placement",
+    )
+    parser.add_argument(
+        "--seat-name",
+        action="append",
+        default=[],
+        metavar="SUBSTR",
+        help="keep only games where some seat's name contains SUBSTR "
+        "(case-insensitive); repeatable, and every SUBSTR must match some seat",
+    )
+    parser.add_argument(
+        "--human-seat",
+        action="store_true",
+        help="keep only games where at least one seat is not a bot "
+        "(a seat is a bot iff its name contains 'bot')",
     )
     args = parser.parse_args(argv)
 
@@ -138,7 +186,7 @@ def main(argv):
             json.dumps(
                 {
                     "meta": {
-                        "source": "https://vs.wandergeek.org/data/games.db",
+                        "source": args.source,
                         "as_of": as_of,
                         "rows": args.rows,
                         "cols": args.cols,
@@ -171,6 +219,16 @@ def main(argv):
                 skipped += 1
                 continue
             if args.only_neutral and "eutral" not in pgn:
+                skipped += 1
+                continue
+            seats = [p1 or "", p2 or ""]
+            wanted = [want.lower() for want in args.seat_name]
+            if any(
+                not any(want in seat.lower() for seat in seats) for want in wanted
+            ):
+                skipped += 1
+                continue
+            if args.human_seat and not any(is_human(seat) for seat in seats):
                 skipped += 1
                 continue
             try:

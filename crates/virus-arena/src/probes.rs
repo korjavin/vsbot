@@ -134,8 +134,49 @@ pub enum ProbeSource {
     /// Produced by [`mine_self_play`] on the `ponderrepro` trajectory
     /// generator: a position the champion itself answered with a neutral.
     PonderRepro,
-    /// A position taken from one of the owner's own live games.
+    /// A position taken from a live game the owner played or watched — in
+    /// practice a human seat against a `SuperiorBot` seat, mined by
+    /// [`mine_games`] out of a dump narrowed to those games.
     LiveOwnerGame,
+}
+
+impl ProbeSource {
+    /// The `id` prefix records from this source carry.
+    ///
+    /// Ids are the handle everything else uses — the report table, the
+    /// per-position JSONL, a bead quoting one position — so the source has to be
+    /// legible in the id itself. Two positions from the same game id under two
+    /// different sources would otherwise be indistinguishable in a table.
+    pub fn id_prefix(self) -> &'static str {
+        match self {
+            ProbeSource::GamesDb => "gamesdb",
+            ProbeSource::PonderRepro => "selfplay",
+            ProbeSource::LiveOwnerGame => "live",
+        }
+    }
+
+    /// Parses the wire spelling, which is the kebab-case `serde` form.
+    pub fn parse(text: &str) -> Result<ProbeSource, ProbeError> {
+        match text {
+            "games-db" => Ok(ProbeSource::GamesDb),
+            "ponder-repro" => Ok(ProbeSource::PonderRepro),
+            "live-owner-game" => Ok(ProbeSource::LiveOwnerGame),
+            other => Err(ProbeError(format!(
+                "unknown probe source {other:?}; expected games-db, ponder-repro or \
+                 live-owner-game"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for ProbeSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ProbeSource::GamesDb => "games-db",
+            ProbeSource::PonderRepro => "ponder-repro",
+            ProbeSource::LiveOwnerGame => "live-owner-game",
+        })
+    }
 }
 
 /// What the mining heuristic said about the neutral placement at a position.
@@ -393,6 +434,14 @@ pub struct MineConfig {
     pub max_suspect: usize,
     /// Most `KeptAdvantage` control positions to keep.
     pub max_control: usize,
+    /// Which source the mined records are filed under.
+    ///
+    /// The heuristic is the same whatever the corpus; what changes is *which
+    /// games were fed in*, and that is provenance rather than method. A dump
+    /// narrowed to the owner's own live games is mined identically and filed
+    /// under [`ProbeSource::LiveOwnerGame`], so a reader can tell the two
+    /// halves apart without re-deriving which game ids were which.
+    pub source: ProbeSource,
 }
 
 impl Default for MineConfig {
@@ -402,6 +451,7 @@ impl Default for MineConfig {
             min_swing: 4,
             max_suspect: 30,
             max_control: 8,
+            source: ProbeSource::GamesDb,
         }
     }
 }
@@ -663,8 +713,8 @@ pub fn mine_games(
                 hash: position.state.state_hash(),
                 swing,
                 record: ProbeRecord {
-                    id: format!("gamesdb-{short}-t{}", position.turn),
-                    source: ProbeSource::GamesDb,
+                    id: format!("{}-{short}-t{}", config.source.id_prefix(), position.turn),
+                    source: config.source,
                     class,
                     snapshot: position.state.snapshot(),
                     provenance: Provenance {
@@ -1506,7 +1556,64 @@ mod tests {
             min_swing: 4,
             max_suspect: 10,
             max_control: 10,
+            source: ProbeSource::GamesDb,
         }
+    }
+
+    /// The wire spelling is what the fixture and the `--source` flag both use,
+    /// so `parse` and `Display` have to agree with `serde` and with each other.
+    #[test]
+    fn probe_sources_round_trip_their_wire_spelling() {
+        for source in [
+            ProbeSource::GamesDb,
+            ProbeSource::PonderRepro,
+            ProbeSource::LiveOwnerGame,
+        ] {
+            let text = source.to_string();
+            assert_eq!(ProbeSource::parse(&text), Ok(source), "{text}");
+            // `serde`'s kebab-case rename is the fixture's spelling; a `Display`
+            // that drifted from it would make `--source` and the committed file
+            // disagree about the same value.
+            assert_eq!(
+                serde_json::to_string(&source).expect("serialise"),
+                format!("\"{text}\"")
+            );
+        }
+        assert!(ProbeSource::parse("games_db").is_err());
+        assert!(ProbeSource::parse("").is_err());
+    }
+
+    /// The corpus a dump was narrowed to is provenance, not method: the same
+    /// heuristic files its output under whichever source the caller names, and
+    /// the id carries it so a report table stays legible.
+    #[test]
+    fn the_configured_source_reaches_the_mined_records() {
+        let config = MineConfig {
+            source: ProbeSource::LiveOwnerGame,
+            ..mine_config()
+        };
+        let (records, _) = mine_games(&[game_with_a_neutral(1)], config, "unit test");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, ProbeSource::LiveOwnerGame);
+        assert!(
+            records[0].id.starts_with("live-"),
+            "the id must name the source: {}",
+            records[0].id
+        );
+
+        // Same corpus, same heuristic, different tag: everything except the
+        // source and the id prefix must be identical, or the tag is quietly
+        // changing the measurement.
+        let (default, _) = mine_games(&[game_with_a_neutral(1)], mine_config(), "unit test");
+        assert!(default[0].id.starts_with("gamesdb-"));
+        assert_eq!(records[0].class, default[0].class);
+        assert_eq!(records[0].labels, default[0].labels);
+        assert_eq!(records[0].snapshot, default[0].snapshot);
+        assert_eq!(records[0].provenance, default[0].provenance);
+        assert_eq!(
+            records[0].id.trim_start_matches("live-"),
+            default[0].id.trim_start_matches("gamesdb-")
+        );
     }
 
     #[test]

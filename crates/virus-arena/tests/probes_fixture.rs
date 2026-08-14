@@ -96,7 +96,9 @@ fn every_record_carries_its_provenance() {
             record.id
         );
         match record.source {
-            ProbeSource::GamesDb => {
+            // Both of these are `mine_games` output — the same heuristic over a
+            // differently-narrowed corpus — so they owe the same provenance.
+            ProbeSource::GamesDb | ProbeSource::LiveOwnerGame => {
                 assert!(
                     record.provenance.game_id.is_some(),
                     "{}: a mined position must name its game",
@@ -110,6 +112,11 @@ fn every_record_carries_its_provenance() {
                 assert!(
                     record.labels.placer_won.is_some(),
                     "{}: the class leans on the outcome, so it must be recorded",
+                    record.id
+                );
+                assert!(
+                    !record.provenance.players.is_empty(),
+                    "{}: a recorded game's seats must be named",
                     record.id
                 );
             }
@@ -126,7 +133,6 @@ fn every_record_carries_its_provenance() {
                     record.id
                 );
             }
-            ProbeSource::LiveOwnerGame => {}
         }
         // Every source records the pair that was actually played there; that is
         // the decision the probe is about.
@@ -150,6 +156,54 @@ fn both_mined_classes_are_represented() {
             records.iter().any(|record| record.class == class),
             "the set has no {class} positions; without the control class the \
              suspect numbers have nothing to be compared against"
+        );
+    }
+}
+
+/// The `live-owner-game` half is no longer empty, and this is the tripwire for
+/// it silently going back to empty.
+///
+/// v1 shipped with the source declared in the schema and zero records in it: the
+/// published `games.db` snapshot stopped at 2026-08-09 and the games did not
+/// exist in it yet. They came in with the WAL-recovered prod copy. A fixture
+/// that quietly lost them again would still parse, still pass every other check
+/// here, and `docs/probes.md` would keep reporting numbers for a half that was
+/// not there.
+#[test]
+fn the_live_owner_half_is_populated() {
+    let records = probe_set();
+    let live: Vec<&ProbeRecord> = records
+        .iter()
+        .filter(|record| record.source == ProbeSource::LiveOwnerGame)
+        .collect();
+    assert!(
+        !live.is_empty(),
+        "the live-owner-game half is empty; docs/probes.md reports numbers for it"
+    );
+    for record in live {
+        // Every one of these is a human-named seat against a `SuperiorBot`
+        // seat — that pairing is the whole reason the source exists, and a
+        // record filed here off some other game would be mislabelled rather
+        // than merely surprising.
+        assert!(
+            record
+                .provenance
+                .players
+                .iter()
+                .any(|name| name.contains("SuperiorBot")),
+            "{}: a live-owner position must have a SuperiorBot seat, got {:?}",
+            record.id,
+            record.provenance.players
+        );
+        assert!(
+            record
+                .provenance
+                .players
+                .iter()
+                .any(|name| !name.to_lowercase().contains("bot")),
+            "{}: a live-owner position must have a non-bot seat, got {:?}",
+            record.id,
+            record.provenance.players
         );
     }
 }
