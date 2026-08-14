@@ -192,10 +192,22 @@ fn run(args: &[String]) -> Result<(), Failure> {
 
     let mut sims: Vec<u32> = Vec::new();
     for text in flags.all("--sims") {
-        sims.push(
-            text.parse()
-                .map_err(|_| Failure(format!("--sims wants a number, got {text}")))?,
-        );
+        let count: u32 = text
+            .parse()
+            .map_err(|_| Failure(format!("--sims wants a number, got {text}")))?;
+        // Reading the root prior costs one simulation, so a tree can never be
+        // observed at zero. Reporting a `sims: 0` row off that one-simulation
+        // tree would put a number in the table under a budget nobody spent —
+        // exactly the kind of plausible-looking meaningless figure this crate
+        // exists to prevent.
+        if count == 0 {
+            return Err(Failure(
+                "--sims 0 measures nothing: reading the root prior already \
+                 costs one simulation"
+                    .to_owned(),
+            ));
+        }
+        sims.push(count);
     }
     if sims.is_empty() {
         sims = vec![192, 1000];
@@ -307,9 +319,18 @@ fn mine_db(args: &[String]) -> Result<(), Failure> {
                 .to_owned(),
         ));
     }
+    // `--min-swing` is a magnitude: the class test is `swing <= -min_swing`,
+    // so a negative one inverts it and files placements that *gained* up to
+    // `|min_swing|` cells under `LostAdvantage`.
+    let min_swing = flags.number("--min-swing", 4i64)?;
+    if min_swing < 0 {
+        return Err(Failure(format!(
+            "--min-swing is a magnitude in cells and cannot be negative, got {min_swing}"
+        )));
+    }
     let config = MineConfig {
         horizon,
-        min_swing: flags.number("--min-swing", 4i64)?,
+        min_swing,
         max_suspect: flags.number("--max-suspect", 30usize)?,
         max_control: flags.number("--max-control", 8usize)?,
     };
