@@ -416,7 +416,20 @@ stage_gauntlet() {
     trap - EXIT
   fi
 
-  ran gauntlet "| gauntlet | $instances x $per_instance games = $((instances * per_instance)) at $GATE_SIMS FIXED sims, colour-paired, per-instance seeds from $((SEED_BASE + GEN * 10000)) spaced 1000, $GATE_JOBS concurrent games$( [ "$took_lock" = 1 ] && echo ", arena lock held" || echo ", arena lock NOT held") |"
+  # Report the lock's ACTUAL state, not just whether autoscale took it. A
+  # caller that holds the lock itself — which is what you must do to pin a full
+  # 400 while some other executor's timed `arena` is live, since autoscale
+  # declines in exactly that case — was being recorded as "arena lock NOT held",
+  # i.e. the report claimed the run was unprotected when it was.
+  local lock_note
+  if [ "$took_lock" = 1 ]; then
+    lock_note=", arena lock held (taken by this stage)"
+  elif [ -d "$ARENA_LOCK" ]; then
+    lock_note=", arena lock held (taken by the caller)"
+  else
+    lock_note=", arena lock NOT held"
+  fi
+  ran gauntlet "| gauntlet | $instances x $per_instance games = $((instances * per_instance)) at $GATE_SIMS FIXED sims, colour-paired, per-instance seeds from $((SEED_BASE + GEN * 10000)) spaced 1000, $GATE_JOBS concurrent games$lock_note |"
 }
 
 # ---------------------------------------------------------------- 4. report
