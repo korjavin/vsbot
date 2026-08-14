@@ -31,7 +31,7 @@ use std::process::ExitCode;
 
 use virus_arena::probes::{
     mine_games, mine_self_play, parse_set, render_set, render_table, run_probe, summarise,
-    DumpGame, MineConfig, ProbeRecord, SelfPlayConfig, INFORMATIONAL,
+    DumpGame, MineConfig, ProbeRecord, ProbeSource, SelfPlayConfig, INFORMATIONAL,
 };
 use virus_mcts::PolicyValueNet;
 
@@ -57,6 +57,12 @@ mine-db:
     --min-swing <N>    smallest |swing| in cells that earns a label [default: 4]
     --max-suspect <N>  cap on lost-advantage positions [default: 30]
     --max-control <N>  cap on kept-advantage control positions [default: 8]
+    --source <NAME>    source tag for the mined records [default: games-db]
+                       games-db | live-owner-game
+                       Same heuristic either way — this records *which corpus*
+                       was fed in, which is provenance, not method.  Use
+                       live-owner-game for a dump narrowed to live games (see
+                       dump_games.py's --human-seat / --seat-name).
 
 mine-play:
     --net <PATH>       net artifact [default: artifacts/mcts_champion.json]
@@ -304,6 +310,7 @@ fn mine_db(args: &[String]) -> Result<(), Failure> {
             "--min-swing",
             "--max-suspect",
             "--max-control",
+            "--source",
         ],
     )?;
     let games_path = PathBuf::from(flags.required("--games")?);
@@ -328,11 +335,29 @@ fn mine_db(args: &[String]) -> Result<(), Failure> {
             "--min-swing is a magnitude in cells and cannot be negative, got {min_swing}"
         )));
     }
+    // `ponder-repro` is `mine-play`'s source and cannot be produced from a
+    // games dump, so it is rejected here rather than silently mislabelling a
+    // mined record as self-play.
+    let source = match flags.last("--source") {
+        None => ProbeSource::GamesDb,
+        Some(text) => {
+            let source = ProbeSource::parse(text).map_err(|error| Failure(error.to_string()))?;
+            if source == ProbeSource::PonderRepro {
+                return Err(Failure(
+                    "--source ponder-repro is mine-play's tag: a position mined from a \
+                     recorded game is not a self-play position"
+                        .to_owned(),
+                ));
+            }
+            source
+        }
+    };
     let config = MineConfig {
         horizon,
         min_swing,
         max_suspect: flags.number("--max-suspect", 30usize)?,
         max_control: flags.number("--max-control", 8usize)?,
+        source,
     };
 
     let text = read(&games_path)?;
@@ -367,6 +392,7 @@ fn mine_db(args: &[String]) -> Result<(), Failure> {
 
     eprintln!("{INFORMATIONAL}");
     eprintln!("origin: {origin}");
+    eprintln!("source: {source}");
     eprintln!("{stats:#?}");
     eprintln!(
         "wrote {} positions to {}",

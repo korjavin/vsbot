@@ -79,13 +79,42 @@ are measured and written down.
 colour-paired, per-instance seed ranges spaced >= 1000
 (`docs/plans/superiority.md` §4).
 
-> **Harness status, 2026-08-13:** `virus-arena` shares one loaded net across all
-> games and threads, so a *net-vs-net* run is refused rather than silently
-> playing one artifact against itself — see `docs/benchmarks.md`, "What is not
-> measured yet". Until that follow-up bead lands, Gate A for an RL candidate
-> comes from the nightly generation gate in `nnue-trainer`
-> (`scripts/mcts_selfplay_gen.sh`, same pooled arithmetic), and the candidate's
-> bead cites the generation report. Do not fabricate a local number.
+Run it locally with `arena`, one artifact per side (bd `vsbot-0zr`):
+
+```bash
+cargo build --release -p virus-arena
+
+# Gate A — candidate vs the current champion, fixed sims, colour-paired.
+./target/release/arena \
+    --a mcts --a-net artifacts/champions/gen-7.json \
+    --b mcts --b-net artifacts/champions/gen-6.json \
+    --budget nodes:400 --games 400 --seed 20260814 --threads 4
+```
+
+`nodes:` is simulations for an MCTS side, and it is the fixed-sims mode this
+gate wants: it consults no clock, so the run reproduces byte for byte and a
+loaded box changes the wall time rather than the result. Never run Gate A in
+`ms:` mode — that measures the machine, not the candidate.
+
+`--a-net` / `--b-net` default to `--net`, so a single-artifact run is unchanged
+and still loads exactly one net. `--a mcts:<path>` is the same statement spelled
+inside the SPEC; giving both for one side is an error unless they agree.
+
+The summary names both artifacts (`mcts[gen-7]:n400 vs mcts[gen-6]:n400`), which
+is what makes the row reproducible — record it verbatim in `docs/benchmarks.md`.
+
+> **Pooling:** 400 games is the floor for **one** cell. Runs whose results are
+> pooled must use base seeds spaced `>= 1000` apart — nearby seeds used to
+> replay each other's openings and their "independent" results were correlated.
+
+> **Harness status, 2026-08-14:** net-vs-net is now runnable locally; the
+> refusal this note used to record is gone. `trainer/netgauntlet` — the
+> out-of-workspace workaround that existed only because `arena` could not do
+> this — is now redundant and is deleted in a follow-up, together with
+> repointing `trainer/generation.sh`'s gauntlet stage at `arena`. Until that
+> lands, `generation.sh` still calls `netgauntlet`; both produce the same pooled
+> arithmetic, and a gate reported from either is valid as long as the bead says
+> which one ran.
 
 ### Gate B — no regression against fixed external opponents
 
