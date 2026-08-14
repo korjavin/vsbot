@@ -718,8 +718,14 @@ fn quantize(policy: &[f32], total: u32) -> Vec<u32> {
             let (rx, ry) = (scaled[x] - scaled[x].floor(), scaled[y] - scaled[y].floor());
             ry.total_cmp(&rx).then(x.cmp(&y))
         });
-        for &slot in order.iter().take(short as usize) {
-            counts[slot] += 1;
+        // Cyclic rather than `take(short)`. In the ordinary case `short` is
+        // below the entry count and the two are the same walk. They part when
+        // `policy` sums to slightly under 1 — an `f32` softmax over 30-odd
+        // actions can — because then the floors can fall more than one whole
+        // count per entry short of `total`, and `take` would silently return a
+        // vector summing to less than the visit total this function promises.
+        for step in 0..short as usize {
+            counts[order[step % order.len()]] += 1;
         }
     }
     if counts.iter().all(|c| *c == 0) {
