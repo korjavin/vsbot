@@ -282,14 +282,14 @@ impl GumbelPlan {
             !self.needs_halving(),
             "halve the plan before taking from it"
         );
-        let slot = if self.alive.len() == 1 {
-            0
-        } else {
-            self.given as usize % self.alive.len()
-        };
+        // Always in range: a remainder mod `alive.len()` cannot reach it. (The
+        // clamp this used to carry was left over from the block ordering, where
+        // `given / per_action` *could* run one past the end on the last take of
+        // a phase.)
+        let slot = self.given as usize % self.alive.len();
         self.given += 1;
         self.scheduled += 1;
-        self.alive[slot.min(self.alive.len() - 1)]
+        self.alive[slot]
     }
 
     /// Cuts the worse half of the candidate set by `scores`, then re-plans the
