@@ -56,12 +56,22 @@
 //! `games.db`. It is a script rather than a subcommand because it orchestrates
 //! three external processes and an SQLite file that this crate would otherwise
 //! need a C dependency to read. See `README.md`.
+//!
+//! # The `PlaceNeutrals` probe
+//!
+//! [`probes`] is the other measuring instrument here, and it measures something
+//! the gauntlet cannot: *what a net believes* about one named position class
+//! (bd `vsbot-07x`'s unmotivated neutral placements). It is deliberately not a
+//! gauntlet and deliberately not a gate — invariant 7 again, from the other
+//! direction. Its output carries [`probes::INFORMATIONAL`] so no number out of
+//! it can be quoted as a strength claim.
 
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 
 pub mod engine;
 pub mod gauntlet;
+pub mod probes;
 pub mod rng;
 pub mod stats;
 

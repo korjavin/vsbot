@@ -12,6 +12,11 @@ virus-core = { workspace = true }
 virus-eval = { workspace = true }
 virus-search = { workspace = true }
 virus-mcts = { workspace = true }
+# `probes` reads and writes the probe set as JSONL and carries the wire
+# `Snapshot` verbatim, so the fixture is re-validated by the same decoder the
+# live client uses (ARCHITECTURE.md invariant 5).
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # `src/bin/arena.rs` is the CLI a human runs a gauntlet with. It lives in this
 # crate rather than as a subcommand of `vsbot`: `vsbot` is the deployed
