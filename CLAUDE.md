@@ -15,9 +15,9 @@ bug in the Go or Java predecessor.
 ## Conventions
 
 - Workspace crates: `virus-core`, `virus-eval`, `virus-search`, `virus-mcts`,
-  `virus-proto`, `virus-arena`, `vsbot` (bin). Keep dependency direction:
-  core ← eval ← search/mcts; proto and arena depend on the engine crates,
-  never the reverse.
+  `virus-proto`, `virus-arena`, `virus-selfplay`, `vsbot` (bin). Keep dependency
+  direction: core ← eval ← search/mcts; proto, arena and selfplay depend on the
+  engine crates, never the reverse.
 - No `unsafe` without a comment justifying it and a test covering it.
 - All engine randomness is seeded and deterministic; production play paths take
   no RNG unless explicitly configured (exploration).

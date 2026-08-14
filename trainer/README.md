@@ -19,6 +19,9 @@ chain end to end.
 | file | what it is |
 |---|---|
 | `Dockerfile` | python 3.12 + CPU torch. **No trainer code inside** — the checkout is bind-mounted. |
+| `generation.sh` | **one RL generation**: selfplay → train → gauntlet → report, stamped and resumable. |
+| `reports/` | the generations that have actually been run, copied out of gitignored `work/`. |
+| `netgauntlet/` | a candidate-vs-champion (two-net) gauntlet, which `arena` cannot run. See below. |
 | `roundtrip.sh` | rows → train → artifact → Rust load, in one command. The proof. |
 | `rows_schema.py` | the `SelfPlayMcts` row contract + flat-action-id codec, in one place. |
 | `validate_rows.py` | strict checker for emitter output. **Point the Rust emitter at this.** |
@@ -107,61 +110,112 @@ trained on them learns nothing). Its only purpose is to make every stage
 downstream of the emitter runnable *today*, so the emitter is the sole new
 variable when it arrives.
 
-## A full local generation, once the emitter exists
-
-The Java reference is `~/Project/nnue-trainer/scripts/mcts_selfplay_gen.sh`
-(stages `selfplay curriculum train gauntlet report`, resumable `.done.<stage>`
-stamps). The Rust equivalent should keep that contract stage for stage. Below is
-what each stage's command line looks like locally at reduced size; `<selfplay>`
-is whatever binary/example `virus-mcts` grows.
+## A full local generation: `generation.sh`
 
 ```bash
-export WORK=work/mcts-rl
-mkdir -p "$WORK/gen1/logs"
-cp artifacts/mcts_champion.json "$WORK/champion.json"   # continue the ladder, don't restart it
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo build --release -p virus-selfplay --jobs 2
+(cd trainer/netgauntlet && cargo build --release --jobs 2)
+
+GEN=6 trainer/generation.sh                 # the whole thing
+GEN=6 trainer/generation.sh --until train   # stop before the gauntlet
+GEN=6 trainer/generation.sh --from train    # redo training and everything after
 ```
 
-**1. self-play** — sharded across cores, deterministic per `(seed, shard)`
-regardless of shard count, `seed = SEED_BASE + gen*1000` (`SEED_BASE=11`):
+Four stages — `selfplay train gauntlet report` — ported in spirit from the Java
+reference `~/Project/nnue-trainer/scripts/mcts_selfplay_gen.sh`, which the
+header comment cites stage for stage. Everything lands in `work/gen<N>/`
+(gitignored). Each finished stage drops `work/gen<N>/<stage>.done` and is
+skipped on a re-run, so an interrupted run resumes by re-invoking the same
+command and a deliberate redo is `--from <stage>`. `report` always re-runs; it
+is the file a human re-reads.
 
-```bash
-for i in $(seq 0 3); do
-  <selfplay> --net "$WORK/champion.json" --out "$WORK/gen1/selfplay_shard_$i.jsonl" \
-             --games 24 --sims 128 --shard "$i" --shards 4 --seed 11011 \
-             > "$WORK/gen1/logs/selfplay_$i.log" 2>&1 &
-done; wait
-cat "$WORK"/gen1/selfplay_shard_*.jsonl > "$WORK/gen1/selfplay.jsonl"
-python3 trainer/validate_rows.py "$WORK/gen1/selfplay.jsonl"
-```
+Exit codes follow the Java script: **0** the pooled score met the gate at the
+sample size played, **1** KEPT BACK, **2** a stage failed. `1` is an outcome,
+not a bug.
 
-**2. train** — the sliding window, see below:
+Three differences from the Java script, all deliberate:
 
-```bash
-docker run --rm --user "$(id -u):$(id -g)" --cpus 4 \
-  -v "$HOME/Project/nnue-trainer":/trainer:ro \
-  -v "$PWD/$WORK":/work \
-  vsbot-trainer:cpu \
-  python python/mcts/train_selfplay.py \
-    /work/gen1/selfplay.jsonl \
-    --out /work/gen1/candidate.json --epochs 8
-python3 trainer/validate_artifact.py "$WORK/gen1/candidate.json" \
-    --reference artifacts/mcts_champion.json
-```
+* **No `curriculum` stage.** It needs the prod `games.db`, which is not on this
+  box. The window logic that would consume it is already in the trainer call
+  site (see below), so adding the stage later changes one function.
+* **No auto-promotion.** Java copies a passing candidate over `champion.json`.
+  This does not, ever: `docs/CANARY.md` promotes on Gate A **and** Gate B **and**
+  the Gate C live soak, and Gate A itself needs `N >= 400`. A local generation is
+  one third of one of those. It reports; the canary pipeline promotes.
+* **Gauntlet instances run sequentially.** Java forks four JVMs at once on a
+  bigger machine. Here four concurrent instances would oversubscribe four
+  shared cores; fixed sims means sequencing costs wall clock and changes no
+  number.
 
-**3. gauntlet** — candidate vs champion at fixed sims, seeds spaced 1000 per
-instance, `virus-arena`'s job.
+Knobs are environment variables, defaulted for this box — `SELFPLAY_GAMES=1000`,
+`SIMS=192`, `SHARDS=2`, `EPOCHS=8`, `CHANNELS=32`, `LAYERS=4`, `WINDOW=3`,
+`GATE_GAMES=100`, `GATE_SIMS=192`, `GATE=0.55`, `SEED_BASE=11`, `JOBS=2`. Run
+`trainer/generation.sh --help` for the full list and what each one costs.
 
-**4. report** — pool the instances, apply the gate, promote or keep:
-
-```bash
-# PROMOTE -> cp gen1/candidate.json to champion.json (archive champion_gen1.json)
-# KEEP    -> champion unchanged
-# either way gen increments, so the next generation gets fresh seeds
-```
+`CHANNELS=32 LAYERS=4` is the load-bearing one: that is the **champion's**
+geometry and the trainer's own default. `roundtrip.sh`'s `8x2` is a schema test
+(it matches the vendored tiny fixture on purpose); training a ladder candidate
+at `8x2` would produce a net that validates, loads, gauntlets, and is
+structurally incapable of beating gen-5.
 
 Java defaults that produced gen-5, for reference: `GAMES=192`, `SIMS=256`,
 `GATE_GAMES=100 × GATE_INSTANCES=4`, `GATE_SIMS=256`, `EPOCHS=8`, `WINDOW=3`,
-`SEED_BASE=11`. Locally, shrink `--games`/`--sims`; keep everything else.
+`SEED_BASE=11`.
+
+### `netgauntlet/` — why a two-net gauntlet lives here
+
+`arena` refuses `--a mcts:X --b mcts:Y` when `X != Y`, and that refusal is
+correct: `virus_arena::gauntlet::run` shares one loaded `PolicyValueNet` across
+every game and thread, so honouring two paths needs a second net threaded
+through `engine::build`'s call sites. Silently playing one artifact against
+itself would report a tidy 50/50 for a comparison that never happened.
+`docs/CANARY.md` records the gap under "Harness status".
+
+A generation's gate is exactly that comparison, so `trainer/netgauntlet` does
+it — by *reusing* arena rather than reimplementing it. The pairing RNG
+(`virus_arena::rng`), the side construction (`virus_arena::engine::build`, i.e.
+arena's own `MctsSide` with `ValueSource::Net` and `Config::play()`) and the
+pooled/Wilson arithmetic (`virus_arena::stats`) are all imported. Only the game
+loop is local, and only because it holds two nets instead of one.
+
+It is its own cargo workspace (`[workspace]` in its `Cargo.toml`), so it is not
+built by `cargo build --workspace`, not linted by the `-D warnings` gate, and
+not shipped. **The proper end state is `--a-net`/`--b-net` inside `virus-arena`,
+at which point this deletes and `generation.sh` calls `arena`.** That is a
+follow-up bead.
+
+```bash
+trainer/netgauntlet/target/release/netgauntlet \
+    --a-net work/gen6/candidate.json --b-net work/champion.json \
+    --games 100 --sims 192 --seed 60011 --jobs 2
+```
+
+Its last line is machine-readable, which is how `stage_report` pools instances:
+
+```text
+RESULT w=<W> l=<L> d=<D> n=<N> pooled=<(W+0.5D)/N> capped=<C> stalled=<S>
+```
+
+**The instrument has a control.** Before trusting a candidate-vs-champion
+number, it is worth checking that the harness can see a difference it should
+see. The gen-5 champion against the gen-0 policy prior
+(`artifacts/mcts_policy.json`), 40 games at 192 sims, seed 424242:
+`34-6-0`, pooled `0.850`. A harness that reported 50% there would be measuring
+nothing, and a candidate's `0.48` would mean nothing either.
+
+## `reports/` — generations that were actually run
+
+`work/` is gitignored (a generation is ~120 MB of JSONL, reproducible from net
+and seed). The report is the part worth keeping, so it is copied to
+`trainer/reports/gen<N>.md` when a generation finishes. The candidate artifact
+stays in `work/gen<N>/candidate.json` and the report records its path — a
+kept-back net is evidence, not a deliverable, and 740 KB of weights that lost
+its gauntlet does not belong in git.
+
+| generation | verdict | pooled | N |
+|---|---|---|---|
+| [gen 6](reports/gen6.md) | KEPT BACK | 0.480 | 100 |
 
 ## The `WINDOW=3` sliding window
 
@@ -187,6 +241,18 @@ for g in $(seq $((GEN - WINDOW + 1)) "$GEN"); do
 done
 # ... python python/mcts/train_selfplay.py $DATASETS --out /work/gen$GEN/candidate.json
 ```
+
+**gen 6 is a degenerate case, and says so in its report.** It is the first
+*Rust* generation: gens 1–5 were emitted by the Java pipeline and their
+`selfplay.jsonl` files live in that repo's work tree, not here. So the window
+collapses to gen 6's own rows — the exact single-generation overfitting case
+`WINDOW=3` exists to damp. From gen 7 it fills naturally (gen 7 pools 6+7, gen 8
+pools 6+7+8, gen 9 drops gen 6) with no change to `generation.sh`, because the
+window is over *generations that have a `selfplay.jsonl`*, not over the last
+three directories. Pointing gen 7 at the Java rows (copy them to
+`work/gen4/selfplay.jsonl` etc.) would fill it a generation earlier; whether the
+two emitters' rows are close enough to pool is a question for the bead that
+tries it, not an assumption to bake in here.
 
 Why 3: one generation's rows are too few and too correlated (a net trained only
 on its own predecessor's games overfits that opponent), while the full history
