@@ -339,8 +339,12 @@ pub struct Config {
     /// Gumbel *replaces* Dirichlet rather than stacking on it, and
     /// [`MctsSearcher::new`] refuses a configuration that asks for both.
     ///
-    /// **Ignored by [`crate::parallel::ParallelMcts`]**, like [`Config::dag`]:
-    /// self-play runs one game per process on the serial searcher.
+    /// **Refused by [`crate::parallel::ParallelMcts`]** — *not* ignored, which
+    /// is where it parts company with [`Config::dag`]. Silently dropping the
+    /// DAG costs simulations; silently dropping this would run PUCT with
+    /// argmax-visit selection and write a different training target under a
+    /// configuration that says Gumbel. Self-play is single-threaded and one
+    /// game per process, so nothing needs the combination.
     pub gumbel: Option<GumbelConfig>,
 }
 
