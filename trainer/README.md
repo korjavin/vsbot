@@ -20,6 +20,7 @@ chain end to end.
 |---|---|
 | `Dockerfile` | python 3.12 + CPU torch. **No trainer code inside** — the checkout is bind-mounted. |
 | `generation.sh` | **one RL generation**: selfplay → train → gauntlet → report, stamped and resumable. |
+| `reports/` | the generations that have actually been run, copied out of gitignored `work/`. |
 | `netgauntlet/` | a candidate-vs-champion (two-net) gauntlet, which `arena` cannot run. See below. |
 | `roundtrip.sh` | rows → train → artifact → Rust load, in one command. The proof. |
 | `rows_schema.py` | the `SelfPlayMcts` row contract + flat-action-id codec, in one place. |
@@ -195,6 +196,26 @@ Its last line is machine-readable, which is how `stage_report` pools instances:
 ```text
 RESULT w=<W> l=<L> d=<D> n=<N> pooled=<(W+0.5D)/N> capped=<C> stalled=<S>
 ```
+
+**The instrument has a control.** Before trusting a candidate-vs-champion
+number, it is worth checking that the harness can see a difference it should
+see. The gen-5 champion against the gen-0 policy prior
+(`artifacts/mcts_policy.json`), 40 games at 192 sims, seed 424242:
+`34-6-0`, pooled `0.850`. A harness that reported 50% there would be measuring
+nothing, and a candidate's `0.48` would mean nothing either.
+
+## `reports/` — generations that were actually run
+
+`work/` is gitignored (a generation is ~120 MB of JSONL, reproducible from net
+and seed). The report is the part worth keeping, so it is copied to
+`trainer/reports/gen<N>.md` when a generation finishes. The candidate artifact
+stays in `work/gen<N>/candidate.json` and the report records its path — a
+kept-back net is evidence, not a deliverable, and 740 KB of weights that lost
+its gauntlet does not belong in git.
+
+| generation | verdict | pooled | N |
+|---|---|---|---|
+| [gen 6](reports/gen6.md) | KEPT BACK | 0.480 | 100 |
 
 ## The `WINDOW=3` sliding window
 
