@@ -180,6 +180,169 @@ fn a_deadline_search_respects_its_budget() {
     );
 }
 
+// ---------------------------------------------------------------- cancellation
+
+/// The cooperative stop flag, on the path it exists for: a search under a
+/// deadline no test could reach, ended from another thread.
+///
+/// Two things are asserted, and the second is the load-bearing one. Promptness
+/// is why the hook exists — a superseded search used to burn a core and hold its
+/// transposition table until its own deadline. But a stop flag that returned a
+/// *worse* move than the search had already committed to would be a regression
+/// of ARCHITECTURE.md invariant 3, the bug with the 0-10 live record. It cannot
+/// be, because cancellation is polled at the same site as the deadline and
+/// unwinds through the same discard-and-salvage path, so this pins exactly the
+/// relation `a_deadline_search_returns_the_completed_iteration` pins.
+#[test]
+fn a_cancelled_search_returns_promptly_and_keeps_invariant_three() {
+    let state = wedged();
+    let mut searcher = Searcher::new(&state, deterministic());
+    let token = searcher.cancel_token();
+
+    let waker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        token.cancel();
+    });
+    let started = Instant::now();
+    let result = searcher
+        .search(&state, Duration::from_secs(300))
+        .expect("a legal action exists");
+    let elapsed = started.elapsed();
+    waker.join().expect("the cancelling thread survived");
+
+    // Generous by an order of magnitude over the ~100 ms this should take, and
+    // still four hundred times short of the deadline, so a regression to
+    // "runs to its own deadline" cannot hide inside the tolerance.
+    assert!(
+        elapsed < Duration::from_millis(1_000),
+        "a cancelled search took {elapsed:?} — it ran on toward its 300 s deadline"
+    );
+    assert!(
+        result
+            .action
+            .is_some_and(|action| state.apply(action).is_ok()),
+        "a cancelled search returned an illegal action"
+    );
+    assert!(
+        result.depth >= 1,
+        "no iteration completed in 100 ms, so the invariant below proves nothing"
+    );
+
+    if !result.salvaged {
+        let mut fixed = Searcher::new(&state, deterministic());
+        let oracle = fixed
+            .search_to_depth(&state, result.depth)
+            .expect("a legal action exists");
+        assert_eq!(
+            (result.action, result.score),
+            (oracle.action, oracle.score),
+            "cancelled at reported depth {} but returned a different move",
+            result.depth,
+        );
+    }
+}
+
+/// A cancel raised *before* the search starts is not swallowed.
+///
+/// That gap — between the caller deciding its position is superseded and the
+/// search actually beginning — is the race the hook exists to close, so the
+/// searcher deliberately never clears the flag at an entry point. The answer is
+/// still a legal action: the root fallback is chosen without consulting any
+/// budget precisely so an already-cancelled caller is never left with nothing.
+#[test]
+fn a_search_cancelled_before_it_starts_does_no_work() {
+    let state = wedged();
+    let mut searcher = Searcher::new(&state, deterministic());
+    searcher.cancel_token().cancel();
+
+    let started = Instant::now();
+    let result = searcher
+        .search(&state, Duration::from_secs(300))
+        .expect("the root fallback is still offered");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "a pre-cancelled search searched anyway: {:?}",
+        started.elapsed()
+    );
+    assert!(!result.book, "the book answered, so this proves nothing");
+    assert_eq!(result.nodes, 0, "a pre-cancelled search visited nodes");
+    assert_eq!(result.depth, 0);
+    assert!(!result.salvaged, "there was nothing to salvage");
+    assert!(result
+        .action
+        .is_some_and(|action| state.apply(action).is_ok()));
+}
+
+/// The public hook and the lazy-SMP shutdown flag are one mechanism, so they
+/// have to compose: cancelling an SMP search must wind the helpers down and join
+/// them, not deadlock inside the thread scope.
+///
+/// Liveness only — helper transposition entries steer the main tree, so an SMP
+/// search has no reproducible move to assert against.
+#[test]
+fn cancelling_an_smp_search_winds_the_helpers_down() {
+    let state = wedged();
+    let mut searcher = Searcher::new(
+        &state,
+        SearchOptions {
+            smp_threads: 3,
+            ..SearchOptions::default()
+        },
+    );
+    let token = searcher.cancel_token();
+
+    let waker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        token.cancel();
+    });
+    let started = Instant::now();
+    let result = searcher
+        .search(&state, Duration::from_secs(300))
+        .expect("a legal action exists");
+    let elapsed = started.elapsed();
+    waker.join().expect("the cancelling thread survived");
+
+    assert!(
+        elapsed < Duration::from_millis(1_000),
+        "a cancelled SMP search took {elapsed:?} — a helper did not wind down"
+    );
+    assert!(result
+        .action
+        .is_some_and(|action| state.apply(action).is_ok()));
+}
+
+/// The searcher never raises its own stop flag.
+///
+/// The fixtures prove the unused hook changes no move; what they cannot see is a
+/// searcher that lives for a whole game. If the entry points had reused the
+/// caller's token as the lazy-SMP shutdown flag — the obvious way to write this,
+/// since they raise that flag on the way out — every move after the first would
+/// abort before visiting a node, and every fixture would still pass because each
+/// one builds a fresh searcher.
+#[test]
+fn a_searcher_never_raises_its_own_stop_flag() {
+    let state = wedged();
+    let mut searcher = Searcher::new(&state, deterministic());
+    let token = searcher.cancel_token();
+
+    for move_number in 1..=3 {
+        let result = searcher
+            .search_node_budget(&state, 30_000)
+            .expect("a legal action exists");
+        assert!(
+            !token.is_cancelled(),
+            "search {move_number} cancelled its own token"
+        );
+        assert!(
+            result.nodes > 0 && result.depth >= 1,
+            "search {move_number} returned without searching: {} nodes, depth {}",
+            result.nodes,
+            result.depth
+        );
+    }
+}
+
 // ---------------------------------------------------------------- transposition
 
 #[test]

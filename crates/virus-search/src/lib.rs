@@ -31,6 +31,7 @@
 //! | Aspiration windows (delta = [`ASPIRATION_DELTA`]) | [`Searcher`] |
 //! | Lazy SMP on the shared table (off by default) | [`SearchOptions::smp_threads`] |
 //! | Soft deadline + guarded partial-iteration salvage | [`Searcher::search_with_deadline`] |
+//! | Cooperative stop flag for a superseded search | [`Searcher::cancel_token`] |
 //! | The wedge opening book | [`book`] |
 //!
 //! Move-ordering tiers, highest first: TT move `+10_000_000`, killer
@@ -47,7 +48,9 @@
 //! 2. **A deadline search returns what the fixed-depth search returns at the
 //!    depth it completed.** Go's wall-clock `choose()` bug made a parity-perfect
 //!    engine lose 0-10 live. An aborted iteration is discarded; salvage happens
-//!    only when `best_score > alpha_orig`.
+//!    only when `best_score > alpha_orig`. A [`CancelToken`] abort is the same
+//!    unwind through the same poll site, so it inherits the guarantee rather
+//!    than needing its own.
 //! 3. **Transposition discipline.** The key covers `moves_left`, `neutral_used`
 //!    and the side to move; mate scores are rebased on store and probe; and a
 //!    `PlaceNeutrals` TT move never takes the staged fast path, because the
@@ -76,8 +79,8 @@ pub mod tt;
 
 pub use searcher::{
     choose, choose_depth, choose_depth_with, choose_node_budget, choose_node_budget_plain,
-    RootMove, SearchOptions, SearchResult, SearchStats, Searcher, ASPIRATION_DELTA, INF_SCORE,
-    MAX_DEPTH, SMP_THREAD_CAP, SOFT_DEADLINE_PERCENT,
+    CancelToken, RootMove, SearchOptions, SearchResult, SearchStats, Searcher, ASPIRATION_DELTA,
+    INF_SCORE, MAX_DEPTH, SMP_THREAD_CAP, SOFT_DEADLINE_PERCENT,
 };
 
 /// The search score type, re-exported so callers need not depend on
