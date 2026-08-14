@@ -39,9 +39,10 @@ use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use virus_mcts::PolicyValueNet;
+use virus_mcts::{PolicyValueNet, DEFAULT_GUMBEL_M};
 use virus_selfplay::{
-    generate, GameConfig, Options, ResignConfig, DEFAULT_MAX_TURNS, DEFAULT_SIMS,
+    generate, GameConfig, GumbelOptions, GumbelPv, Options, ResignConfig, DEFAULT_MAX_TURNS,
+    DEFAULT_SIMS,
 };
 
 const USAGE: &str = "\
@@ -89,17 +90,45 @@ RESIGN (off unless --resign-threshold / RESIGN_THRESHOLD is given):
     that ran RESIGN_PLIES=4 and quietly resigned nothing is the failure this
     binary refuses unknown flags to avoid.
 
+GUMBEL ROOT SELECTION (off unless --gumbel / GUMBEL=1 is given):
+    --gumbel                   replace PUCT + Dirichlet at the root with
+                               Gumbel top-m + sequential halving. This flag
+                               is the on switch
+    --gumbel-m <N>             candidate-set size for the top-m draw
+                               [default: 16]
+    --gumbel-pv <raw|improved> what the emitted rows put in `pv`
+                               [default: raw]
+
+      raw       the literal root visit counts. Sequential halving spends the
+                budget on m candidates and then on the finalists, so this is
+                a SPARSE target (~m non-zero of ~34) and it discards every
+                completed-Q value the recipe computed.
+      improved  the completed-Q improved policy, quantised to integer
+                pseudo-counts summing to the search's visit total. Dense and
+                schema-valid, but NOT literal visit counts.
+
+    Neither is lossless -- the row schema has one target field and Gumbel
+    produces two different things. See the crate docs before choosing.
+
+    Env equivalents: GUMBEL=1, GUMBEL_M, GUMBEL_PV; the flag wins when both
+    are set. --gumbel-m/--gumbel-pv without the on switch are an error, not a
+    silent no-op, for the same reason the resign flags are.
+
 OUTPUT:
     --out <PATH>         JSONL destination [default: - for stdout]
     -h, --help           this text
 
-Dirichlet root noise is always on and temperature-1 visit sampling always
-covers the first 21 plies: this binary only generates self-play, and both are
-what makes self-play data worth training on.
+In the default (PUCT) arm, Dirichlet root noise is always on and temperature-1
+visit sampling always covers the first 21 plies: this binary only generates
+self-play, and both are what makes self-play data worth training on. The Gumbel
+arm replaces both -- its own draw is the exploration.
 
 Resignation is OFF by default and must stay off until a measurement run shows
 a false-resign rate under 5 %: it trades a correct label for a shorter game,
 and the control arm is the only thing that says which way that trade went.
+
+Gumbel is OFF by default for the mirror reason: it changes the training target,
+and it ships only behind a fixed-sims gauntlet plus a policy-target measurement.
 ";
 
 struct Args {
@@ -140,6 +169,70 @@ where
     match std::env::var(name) {
         Ok(text) if !text.trim().is_empty() => number(text.trim(), name).map(Some),
         _ => Ok(None),
+    }
+}
+
+/// A boolean from the environment: `1`/`true`/`on`/`yes` and their negatives.
+///
+/// Unset or empty reads as `None` so `GUMBEL= selfplay ...` clears an inherited
+/// setting, the same shape [`env_number`] accepts.
+fn env_bool(name: &str) -> Result<Option<bool>, String> {
+    let Ok(text) = std::env::var(name) else {
+        return Ok(None);
+    };
+    match text.trim() {
+        "" => Ok(None),
+        "1" | "true" | "on" | "yes" => Ok(Some(true)),
+        "0" | "false" | "off" | "no" => Ok(Some(false)),
+        other => Err(format!("{name} wants a boolean, got {other:?}")),
+    }
+}
+
+/// Gumbel settings as the command line and environment left them: `on` is the
+/// switch, the other two only refine it.
+#[derive(Default)]
+struct GumbelArgs {
+    on: Option<bool>,
+    m: Option<u16>,
+    pv: Option<GumbelPv>,
+}
+
+impl GumbelArgs {
+    /// Environment first, so a flag of the same name can overwrite it.
+    fn from_env() -> Result<GumbelArgs, String> {
+        Ok(GumbelArgs {
+            on: env_bool("GUMBEL")?,
+            m: env_number("GUMBEL_M")?,
+            pv: match std::env::var("GUMBEL_PV") {
+                Ok(text) if !text.trim().is_empty() => {
+                    Some(GumbelPv::parse(&text).map_err(|error| format!("GUMBEL_PV: {error}"))?)
+                }
+                _ => None,
+            },
+        })
+    }
+
+    fn resolve(self) -> Result<Option<GumbelOptions>, String> {
+        if self.on != Some(true) {
+            if self.m.is_some() || self.pv.is_some() {
+                return Err("--gumbel-m/--gumbel-pv (or GUMBEL_M/GUMBEL_PV) were set \
+                            without --gumbel, so Gumbel root selection would have \
+                            stayed off. Pass --gumbel to turn it on."
+                    .to_owned());
+            }
+            return Ok(None);
+        }
+        let options = GumbelOptions {
+            m: self.m.unwrap_or(DEFAULT_GUMBEL_M),
+            pv: self.pv.unwrap_or_default(),
+        };
+        if options.m < 2 {
+            return Err(format!(
+                "--gumbel-m must be at least 2; {} candidates is not a choice",
+                options.m
+            ));
+        }
+        Ok(Some(options))
     }
 }
 
@@ -210,6 +303,7 @@ fn parse() -> Result<Option<Args>, String> {
         ..GameConfig::default()
     };
     let mut resign = ResignArgs::from_env()?;
+    let mut gumbel = GumbelArgs::from_env()?;
 
     let mut raw = std::env::args().skip(1);
     while let Some(flag) = raw.next() {
@@ -236,6 +330,13 @@ fn parse() -> Result<Option<Args>, String> {
             "--resign-plies" => resign.plies = Some(number(&value()?, "--resign-plies")?),
             "--resign-control-frac" => {
                 resign.control_frac = Some(number(&value()?, "--resign-control-frac")?);
+            }
+            "--gumbel" => gumbel.on = Some(true),
+            "--gumbel-m" => gumbel.m = Some(number(&value()?, "--gumbel-m")?),
+            "--gumbel-pv" => {
+                gumbel.pv = Some(
+                    GumbelPv::parse(&value()?).map_err(|error| format!("--gumbel-pv: {error}"))?,
+                );
             }
             "--net" => args.net = Some(PathBuf::from(value()?)),
             "--no-net" => args.net = None,
@@ -264,6 +365,7 @@ fn parse() -> Result<Option<Args>, String> {
         return Err("--sims must be at least 1".to_owned());
     }
     args.options.game.resign = resign.resolve()?;
+    args.options.game.gumbel = gumbel.resolve()?;
     Ok(Some(args))
 }
 
@@ -279,7 +381,7 @@ fn run(args: Args) -> Result<(), String> {
     // The banner goes to stderr so `--out -` stays a clean JSONL stream that a
     // caller can pipe straight into the validator.
     eprintln!(
-        "shard {}/{}: games {}, sims {}, seed {}, net {}, resign {}",
+        "shard {}/{}: games {}, sims {}, seed {}, net {}, resign {}, root {}",
         args.options.shard_idx,
         args.options.shard_count,
         args.options.games,
@@ -296,6 +398,18 @@ fn run(args: Args) -> Result<(), String> {
                 r.plies,
                 r.control_frac * 100.0
             )
+        ),
+        // Printed on every run, not only the Gumbel ones: which root rule and
+        // which `pv` a generation was written with is the first thing anyone
+        // reading its rows six weeks later needs, and "PUCT + Dirichlet" is a
+        // fact about the file just as much as the other arm is.
+        args.options.game.gumbel.map_or_else(
+            || "PUCT + Dirichlet, pv = raw visits".to_owned(),
+            |g| format!(
+                "Gumbel top-{} + sequential halving, pv = {}",
+                g.m,
+                g.pv.label()
+            ),
         ),
     );
 

@@ -152,6 +152,10 @@ use std::time::{Duration, Instant};
 use virus_core::{Action, Player, Scratch, State};
 use virus_eval::{evaluate, EvalParams, EvalWorkspace};
 
+use crate::gumbel::{
+    logits_from_prior, rescale, softmax, GumbelConfig, GumbelPlan, DEFAULT_GUMBEL_C_SCALE,
+    DEFAULT_GUMBEL_C_VISIT,
+};
 use crate::net::{BatchScratch, Encoded, Heads, NetScratch, PolicyValueNet, BOARD};
 use crate::rng::Rng;
 
@@ -325,6 +329,19 @@ pub struct Config {
     /// its nodes by `Arc` identity and merging them needs a concurrent index,
     /// which is its own piece of work.
     pub dag: bool,
+    /// Gumbel / sequential-halving root selection. **Self-play only** — the
+    /// same rule, and the same reason, as [`Config::root_noise`]: it is an
+    /// exploration mechanism that deliberately does not play the strongest
+    /// move it knows.
+    ///
+    /// `None` is ordinary PUCT at the root and is what [`Config::default`] and
+    /// [`Config::play`] give. Mutually exclusive with [`Config::root_noise`]:
+    /// Gumbel *replaces* Dirichlet rather than stacking on it, and
+    /// [`MctsSearcher::new`] refuses a configuration that asks for both.
+    ///
+    /// **Ignored by [`crate::parallel::ParallelMcts`]**, like [`Config::dag`]:
+    /// self-play runs one game per process on the serial searcher.
+    pub gumbel: Option<GumbelConfig>,
 }
 
 impl Default for Config {
@@ -342,14 +359,25 @@ impl Default for Config {
             virtual_loss: DEFAULT_VIRTUAL_LOSS,
             threads: 1,
             dag: DEFAULT_DAG,
+            gumbel: None,
         }
     }
 }
 
 impl Config {
-    /// The play-mode configuration: no noise, no sampling, no RNG draws at all.
+    /// The play-mode configuration: no noise, no Gumbel, no sampling, no RNG
+    /// draws at all.
+    ///
+    /// The three exploration knobs are spelled out rather than inherited so
+    /// that a future change to [`Config::default`] cannot turn any of them on
+    /// in production. `play_mode_takes_no_exploration_knob` pins it.
     pub fn play() -> Config {
-        Config::default()
+        Config {
+            root_noise: false,
+            visit_sampling: false,
+            gumbel: None,
+            ..Config::default()
+        }
     }
 
     /// The self-play configuration for `ply`: Dirichlet root noise always, and
@@ -360,6 +388,35 @@ impl Config {
             value_source: ValueSource::Net,
             root_noise: true,
             visit_sampling: ply < TEMPERATURE_PLIES,
+            ..Config::default()
+        }
+    }
+
+    /// The **Gumbel** self-play configuration: root-only Gumbel top-`m` with
+    /// sequential halving over a `sims` budget.
+    ///
+    /// Neither Dirichlet noise nor temperature sampling, and that is the point
+    /// rather than an omission. Both exist to stop self-play from replaying one
+    /// game; the Gumbel draw already does that, and it does it as a *policy
+    /// improvement* — the selected action is the argmax of `g + logit +
+    /// sigma(q)`, which the paper shows never scores below a draw from the
+    /// prior. Stacking Dirichlet on top would perturb the very logits the
+    /// top-`m` draw is a sample from, and stacking visit sampling on top would
+    /// throw away the argmax the schedule spent its whole budget establishing.
+    ///
+    /// There is no `ply` argument for the same reason: the Gumbel variate is
+    /// redrawn at every root, so exploration does not need a decaying window.
+    pub fn self_play_gumbel(seed: u64, sims: u32, m: u16) -> Config {
+        Config {
+            seed,
+            value_source: ValueSource::Net,
+            root_noise: false,
+            visit_sampling: false,
+            gumbel: Some(GumbelConfig {
+                m,
+                sims,
+                ..GumbelConfig::default()
+            }),
             ..Config::default()
         }
     }
@@ -498,6 +555,18 @@ pub struct MctsSearcher<'net> {
     /// problem (the position check catches it and the node is duplicated) but
     /// it is the number to look at if the merge rate ever looks wrong.
     key_collisions: u64,
+    /// The root's sequential-halving schedule, when [`Config::gumbel`] is on.
+    /// Redrawn by [`MctsSearcher::rebase`], because a schedule belongs to one
+    /// root and its edge indices mean nothing at the next one.
+    gumbel: Option<GumbelPlan>,
+    /// The root's own leaf value, absolute frame — the net's `v(s_root)`, or
+    /// the hand-tuned squash when there is no value head.
+    ///
+    /// Kept because the completed-Q improved policy needs it: `v_mix`
+    /// interpolates between the root's *own* estimate and the visited
+    /// children's, and the visit-weighted [`MctsSearcher::root_value_abs`] is
+    /// not the same quantity — it is already the children's average.
+    root_leaf_value_abs: f64,
     rng: Rng,
     sims: u64,
     /// Reusable batch buffers, so a round of simulations allocates nothing
@@ -547,6 +616,12 @@ impl<'net> MctsSearcher<'net> {
             state.rows(),
             state.cols()
         );
+        assert!(
+            !(config.root_noise && config.gumbel.is_some()),
+            "Dirichlet root noise and Gumbel root selection are alternatives, \
+             not layers: Gumbel draws its top-m from the prior the noise would \
+             have perturbed"
+        );
         let net_scratch = net.map(|net| net.scratch());
         let mut searcher = MctsSearcher {
             config,
@@ -555,6 +630,8 @@ impl<'net> MctsSearcher<'net> {
             transpositions: Transpositions::default(),
             merges: 0,
             key_collisions: 0,
+            gumbel: None,
+            root_leaf_value_abs: 0.0,
             rng: Rng::new(config.seed),
             sims: 0,
             path: Vec::with_capacity(1024),
@@ -569,13 +646,35 @@ impl<'net> MctsSearcher<'net> {
             eval_params: EvalParams::default(),
             eval_workspace: EvalWorkspace::new(),
         };
-        if !searcher.nodes[0].terminal {
-            searcher.expand(0);
-            if !searcher.nodes[0].terminal && searcher.config.root_noise {
-                searcher.apply_root_noise();
+        if searcher.nodes[0].terminal {
+            searcher.root_leaf_value_abs = searcher.nodes[0].terminal_value_abs;
+        } else {
+            searcher.root_leaf_value_abs = searcher.expand(0);
+            if !searcher.nodes[0].terminal {
+                if searcher.config.root_noise {
+                    searcher.apply_root_noise();
+                }
+                // After the noise branch, not before, purely so the two are
+                // read as the alternatives they are; the assert above means at
+                // most one of them ever runs.
+                searcher.plan_gumbel();
             }
         }
         searcher
+    }
+
+    /// Draws this root's Gumbel schedule, if [`Config::gumbel`] asks for one.
+    fn plan_gumbel(&mut self) {
+        let Some(config) = self.config.gumbel else {
+            return;
+        };
+        let root = &self.nodes[0];
+        if root.terminal || root.actions.is_empty() {
+            self.gumbel = None;
+            return;
+        }
+        let prior = root.prior.clone();
+        self.gumbel = Some(GumbelPlan::new(&prior, &config, &mut self.rng));
     }
 
     /// Runs exactly `count` further simulations.
@@ -720,6 +819,77 @@ impl<'net> MctsSearcher<'net> {
         &self.nodes[0].prior
     }
 
+    /// Per-root-action mean value in the **absolute** frame (`W/N`), parallel
+    /// to [`MctsSearcher::root_actions`]; `0.0` for an edge with no visits.
+    ///
+    /// Absolute, like everything the tree stores: multiply by `+1` for a
+    /// player-1 root and `-1` for a player-2 one to read it from the mover's
+    /// chair. Exposed for the analysis tools (`examples/gumbelprobe`) and for
+    /// tests that need to check a frame conversion from outside the crate —
+    /// the searcher's own selection never goes through it.
+    pub fn root_action_values_abs(&self) -> Vec<f64> {
+        let root = &self.nodes[0];
+        (0..root.n.len())
+            .map(|a| {
+                if root.n[a] > 0 {
+                    root.w[a] / f64::from(root.n[a])
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
+    /// Whether this search is running a Gumbel root schedule.
+    pub fn is_gumbel(&self) -> bool {
+        self.gumbel.is_some()
+    }
+
+    /// The **completed-Q improved policy** over the root actions, parallel to
+    /// [`MctsSearcher::root_actions`] and summing to 1.
+    ///
+    /// `softmax(logit(a) + sigma(completedQ(a)))`, the Gumbel MuZero training
+    /// target. `completedQ(a)` is the measured `q(a)` for a visited action and
+    /// `v_mix` for an unvisited one, where
+    ///
+    /// ```text
+    /// v_mix = (v(root) + N * sum_{n(b)>0} pi(b) q(b) / sum_{n(b)>0} pi(b))
+    ///         / (1 + N)
+    /// ```
+    ///
+    /// interpolates the root's own value estimate with the prior-weighted
+    /// average of what its visited children measured. That completion is the
+    /// whole reason the target is better than visit counts at small budgets:
+    /// an action the schedule never visited is scored by what the position is
+    /// worth rather than by the zero visits it happens to have.
+    ///
+    /// Everything is in the **root mover's** frame; the tree's absolute-frame
+    /// `w` is converted by the single `sign(root)` multiply, once.
+    ///
+    /// Defined for a PUCT search too — the formula needs only priors, visits,
+    /// `q` and the root value, all of which any search has — so the two arms
+    /// can be compared on the same quantity. Empty at a terminal root.
+    ///
+    /// **Not the emitted `pv`.** See [`crate::gumbel`] and
+    /// `virus-selfplay`'s `GumbelPv` for what the row schema can and cannot
+    /// carry.
+    pub fn root_improved_policy(&self) -> Vec<f32> {
+        let root = &self.nodes[0];
+        if root.terminal || root.actions.is_empty() {
+            return Vec::new();
+        }
+        // The plan's logits when there is one (they are the pre-noise prior's,
+        // which is what the top-m draw sampled from); otherwise the root's own.
+        let mut scored = match &self.gumbel {
+            Some(plan) => plan.logits().to_vec(),
+            None => logits_from_prior(&root.prior),
+        };
+        for (logit, sigma) in scored.iter_mut().zip(self.completed_q_sigma()) {
+            *logit += sigma;
+        }
+        softmax(&scored)
+    }
+
     /// Root value estimate in the absolute frame.
     pub fn root_value_abs(&self) -> f64 {
         let root = &self.nodes[0];
@@ -734,10 +904,19 @@ impl<'net> MctsSearcher<'net> {
 
     /// Most-visited root action, ties broken by enumeration order. `None` at a
     /// terminal or stuck root.
+    ///
+    /// Under a Gumbel schedule this is instead the schedule's own answer — the
+    /// argmax of `g + logit + sigma(q)` over the surviving candidates. Visit
+    /// counts are the wrong reading there: sequential halving allocates visits
+    /// by phase, so the count only ranks the finalists and says nothing about
+    /// an action cut in round one.
     pub fn best_action(&self) -> Option<Action> {
         let root = &self.nodes[0];
         if root.terminal || root.actions.is_empty() {
             return None;
+        }
+        if let Some(plan) = &self.gumbel {
+            return Some(root.actions[plan.choice(&self.gumbel_scores())]);
         }
         let mut best = 0;
         for a in 1..root.actions.len() {
@@ -751,8 +930,12 @@ impl<'net> MctsSearcher<'net> {
     /// The action to play: [`MctsSearcher::best_action`] in play mode, or a
     /// draw proportional to the root visit counts when
     /// [`Config::visit_sampling`] is on.
+    ///
+    /// A Gumbel search answers with [`MctsSearcher::best_action`] whatever
+    /// `visit_sampling` says: [`Config::self_play_gumbel`] never sets it, and
+    /// the Gumbel draw is already the exploration a sampler would have added.
     pub fn chosen_action(&mut self) -> Option<Action> {
-        if !self.config.visit_sampling {
+        if !self.config.visit_sampling || self.gumbel.is_some() {
             return self.best_action();
         }
         let root = &self.nodes[0];
@@ -876,6 +1059,17 @@ impl<'net> MctsSearcher<'net> {
         }
         self.nodes = kept;
         self.rebuild_transpositions();
+        // A schedule belongs to one root: its edge indices, its Gumbel draw and
+        // its spent budget all describe the position that has just been thrown
+        // away. Redrawing is the only defensible answer — carrying it over
+        // would rank the new root's edges by the old root's variates, and
+        // dropping it would silently turn a Gumbel search into a PUCT one.
+        // Self-play (the only caller that sets `gumbel`) builds a fresh
+        // searcher per ply and never reaches this, so it is a well-definedness
+        // guarantee rather than a hot path.
+        self.root_leaf_value_abs = self.root_value_abs();
+        self.gumbel = None;
+        self.plan_gumbel();
         true
     }
 
@@ -907,6 +1101,7 @@ impl<'net> MctsSearcher<'net> {
     /// Returns the number of simulations actually run, which is `target` unless
     /// the root is terminal.
     fn simulate_round(&mut self, target: u32) -> u32 {
+        let target = self.gumbel_prepare(target);
         self.path.clear();
         self.descents.clear();
         self.leaves.clear();
@@ -952,7 +1147,13 @@ impl<'net> MctsSearcher<'net> {
                 break self.record_leaf(id, None);
             }
 
-            let a = self.select(id as usize);
+            let a = match (id, self.gumbel.as_mut()) {
+                // Root under a Gumbel schedule: the edge is dictated, not
+                // chosen. Everything below the root keeps ordinary PUCT — the
+                // schedule is a *root* bandit and says nothing about the tree.
+                (0, Some(plan)) => plan.take(),
+                _ => self.select(id as usize),
+            };
             let mut child = self.nodes[id as usize].children[a];
             if child == NO_NODE {
                 let next = {
@@ -1241,6 +1442,114 @@ impl<'net> MctsSearcher<'net> {
             }
         }
         best
+    }
+
+    /// Settles any due halving and shortens the coming round so the next one
+    /// does not straddle a phase boundary.
+    ///
+    /// Both halves matter. A halving must see statistics that have **backed
+    /// up**: a batch has `batch_size` descents in flight with only virtual loss
+    /// standing in for their results, so cutting the candidate set mid-batch
+    /// would rank several candidates on visits whose values had not arrived.
+    /// Clamping the round to [`GumbelPlan::phase_remaining`] makes every phase
+    /// boundary a batch boundary; the cost is a short final round per phase
+    /// (three of them per search at `m = 16`), which is nothing against the
+    /// batch throughput the rest of the schedule keeps.
+    fn gumbel_prepare(&mut self, target: u32) -> u32 {
+        let Some(plan) = &self.gumbel else {
+            return target;
+        };
+        if plan.needs_halving() {
+            let scores = self.gumbel_scores();
+            self.gumbel
+                .as_mut()
+                .expect("checked just above")
+                .halve(&scores);
+        }
+        let remaining = self
+            .gumbel
+            .as_ref()
+            .expect("checked just above")
+            .phase_remaining();
+        target.min(remaining).max(1)
+    }
+
+    /// `sigma(completedQ(a))` for every root edge, in the **root mover's**
+    /// frame — `mctx`'s `qtransform_completed_by_mix_value`.
+    ///
+    /// One function, used by both the sequential-halving ranking and the
+    /// improved policy, because in the reference implementation they are the
+    /// same transform and letting them drift apart would mean the target no
+    /// longer describes the action the search played.
+    ///
+    /// Three steps, and each is a documented failure if skipped:
+    ///
+    /// 1. **Complete.** A visited edge contributes its measured `q`; an
+    ///    unvisited one contributes `v_mix`, the `(1 + N)`-weighted blend of the
+    ///    root's own value with the prior-weighted average of what its visited
+    ///    children found. Scoring an unvisited action as `0` instead would rank
+    ///    it above every action in a lost position and below every action in a
+    ///    won one.
+    /// 2. **Rescale** min-max onto `[0, 1]`, so `c_scale` does not have to
+    ///    absorb this engine's leaf-value spread.
+    /// 3. **Scale** by `(c_visit + max_b N(b)) * c_scale`.
+    ///
+    /// The frame conversion — absolute `W` to the root mover's chair — is the
+    /// single `sign` multiply, applied here and nowhere else in the Gumbel
+    /// path (ARCHITECTURE.md invariant 1).
+    fn completed_q_sigma(&self) -> Vec<f64> {
+        let root = &self.nodes[0];
+        let sign = if root.mover == 1 { 1.0 } else { -1.0 };
+        let (c_visit, c_scale) = self
+            .config
+            .gumbel
+            .map_or((DEFAULT_GUMBEL_C_VISIT, DEFAULT_GUMBEL_C_SCALE), |gumbel| {
+                (gumbel.c_visit, gumbel.c_scale)
+            });
+        let edges = root.actions.len();
+
+        let q = |a: usize| sign * root.w[a] / f64::from(root.n[a]);
+        let visits: u32 = root.n.iter().sum();
+        let mut prior_visited = 0.0f64;
+        let mut prior_weighted_q = 0.0f64;
+        for a in 0..edges {
+            if root.n[a] > 0 {
+                let prior = f64::from(root.prior[a]);
+                prior_visited += prior;
+                prior_weighted_q += prior * q(a);
+            }
+        }
+        let v_root = sign * self.root_leaf_value_abs;
+        let v_mix = if visits == 0 || prior_visited <= 0.0 {
+            v_root
+        } else {
+            (v_root + f64::from(visits) * (prior_weighted_q / prior_visited))
+                / (1.0 + f64::from(visits))
+        };
+
+        let mut completed: Vec<f64> = (0..edges)
+            .map(|a| if root.n[a] > 0 { q(a) } else { v_mix })
+            .collect();
+        rescale(&mut completed);
+        let scale = (c_visit + f64::from(root.n.iter().copied().max().unwrap_or(0))) * c_scale;
+        for value in completed.iter_mut() {
+            *value *= scale;
+        }
+        completed
+    }
+
+    /// `g(a) + logit(a) + sigma(completedQ(a))` for every root edge — the
+    /// sequential-halving ranking and the final answer.
+    fn gumbel_scores(&self) -> Vec<f64> {
+        let plan = self
+            .gumbel
+            .as_ref()
+            .expect("only called on a Gumbel search");
+        self.completed_q_sigma()
+            .into_iter()
+            .enumerate()
+            .map(|(a, sigma)| plan.gumbel_logit(a) + sigma)
+            .collect()
     }
 
     /// Mixes Dirichlet noise into the root prior. Self-play exploration only.

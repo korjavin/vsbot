@@ -61,6 +61,15 @@
 //! is. `parallel_with_one_thread_matches_the_serial_searcher` pins the pairing
 //! by asking the serial side for `dag: false`.
 //!
+//! # No Gumbel here either — and this one is a hard error
+//!
+//! [`Config::gumbel`] is **refused** by [`ParallelMcts::new`], not ignored. The
+//! DAG can be dropped quietly because dropping it only costs simulations;
+//! dropping a Gumbel schedule would run PUCT with argmax-visit selection and
+//! produce a completely different *training target* under a configuration that
+//! says Gumbel. Self-play is single-threaded and one game per process
+//! (`virus-selfplay`'s `--shards`), so nothing needs the combination.
+//!
 //! # Determinism
 //!
 //! With `threads == 1` this engine is deterministic and identical to
@@ -516,6 +525,16 @@ impl<'net> ParallelMcts<'net> {
             "policy net is {BOARD}x{BOARD} only, got {}x{}",
             state.rows(),
             state.cols()
+        );
+        // Refused rather than ignored, unlike `Config::dag`. Ignoring the DAG
+        // costs efficiency and nothing else; ignoring Gumbel would silently
+        // run PUCT + argmax-visits and hand back rows a caller would label as
+        // a Gumbel generation. A wrong *training target* is not a performance
+        // difference, so it fails here instead.
+        assert!(
+            config.gumbel.is_none(),
+            "ParallelMcts has no Gumbel root schedule; a Gumbel search must use \
+             MctsSearcher (self-play runs one game per process anyway)"
         );
         let root = SharedNode::new(state);
         let mut searcher = ParallelMcts {

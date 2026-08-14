@@ -125,6 +125,54 @@
 //!   the game seed ([`is_control_game`]), so it is a pure function of
 //!   `(seed, game_index)` like everything else here — same shards, same arms.
 //!
+//! # Gumbel root selection (off by default)
+//!
+//! [`GumbelOptions`] swaps the root's PUCT+Dirichlet exploration for the
+//! Gumbel/sequential-halving recipe (`virus_mcts::gumbel`, superiority.md §2d
+//! item 3). It is off unless asked for, and asking for it changes *both* halves
+//! of a self-play ply: the move played, and the target the row carries.
+//!
+//! ## The `pv` mapping, and what it loses
+//!
+//! This is the part to read before turning it on, because the row schema cannot
+//! carry what Gumbel actually produces.
+//!
+//! Gumbel's training target is the **completed-Q improved policy** `pi' =
+//! softmax(logit(a) + sigma(completedQ(a)))` — a dense, real-valued
+//! distribution over every legal action, where an action the schedule never
+//! visited is scored by `v_mix` rather than by its zero visits. The
+//! `SelfPlayMcts` row has exactly one target field, `pv`, and
+//! `trainer/validate_rows.py` requires it to be **non-negative integers**
+//! parallel to `pi`. There is nowhere in the contract to put a real-valued
+//! distribution, and the emitter is not allowed to change the contract (that is
+//! the whole premise of this crate). So a choice has to be made, and
+//! [`GumbelPv`] makes it explicit rather than silently:
+//!
+//! * [`GumbelPv::Raw`] (**the default**) writes the literal root visit counts,
+//!   exactly as the PUCT arm does. Honest to the field's name and to the
+//!   trainer's reading of it — and **lossy in a way that matters**: sequential
+//!   halving concentrates the whole budget on the top-`m` candidates and then
+//!   on the finalists, so a 192-simulation root over ~34 actions produces a
+//!   target with ~16 non-zero entries whose mass sits on two of them. Every
+//!   completed-Q value is discarded. This target is *sparser and sharper* than
+//!   the PUCT arm's at the same budget, which is the opposite of what the
+//!   Gumbel recipe is for; `examples/gumbelprobe` in `virus-mcts` measures the
+//!   entropy gap so the size of the loss is a number and not an opinion.
+//! * [`GumbelPv::Improved`] writes `pi'` quantised to integer pseudo-counts
+//!   summing to the search's real visit total, by the largest-remainder method.
+//!   Schema-valid (non-negative integers, parallel to `pi`, positive sum) and
+//!   information-preserving to `1/sims` resolution, because the trainer
+//!   normalises `pv` into a distribution anyway. What it is **not** is literal
+//!   visit counts: a row written this way says "the search's policy for this
+//!   position was `pi'`", which is true, rather than "these edges were visited
+//!   this many times", which is not. Anyone reading a `pv` column as a search
+//!   diagnostic would be misled, so it is opt-in and stated in the run banner.
+//!
+//! Neither option is lossless. `Raw` loses the completed-Q information;
+//! `Improved` loses the visit counts. Carrying both would need a tenth field
+//! and therefore a trainer change, which is out of scope for T3 and is the
+//! follow-up this note exists to justify.
+//!
 //! The rule itself: at each ply, the side to move is "hopeless" when the root's
 //! absolute-frame value is beyond [`ResignConfig::threshold`] *against* it
 //! (`v < -threshold` for player 1, `v > threshold` for player 2). A per-side
@@ -140,10 +188,11 @@
 use std::io::{self, Write};
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use virus_core::{Player, State, ACTIONS_PER_TURN, MAX_PLAYERS};
 use virus_mcts::{
     action_id, net::Encoded, terminal_value_abs, Config, MctsSearcher, PolicyValueNet,
+    DEFAULT_GUMBEL_M,
 };
 
 /// The golden-ratio odd constant SplitMix64 strides by, and the multiplier in
@@ -184,6 +233,71 @@ pub const DEFAULT_RESIGN_CONTROL_FRAC: f64 = 0.10;
 /// salt of its own — a pure function of `(seed, game_index)` that touches
 /// nothing.
 const CONTROL_SALT: u64 = 0x5265_7369_676E_4B21; // "ResignK!"
+
+/// What a Gumbel row's `pv` column holds.
+///
+/// See the module docs for the full argument. Neither variant is lossless; the
+/// default is the one that keeps the field's documented meaning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GumbelPv {
+    /// Literal root visit counts — sparse (only the top-`m` candidates are
+    /// non-zero) and stripped of the completed-Q information. The default,
+    /// because `pv` means "raw root visits" everywhere else in this project.
+    #[default]
+    Raw,
+    /// The completed-Q improved policy, quantised to integer pseudo-counts
+    /// summing to the search's visit total. Schema-valid and dense, but not
+    /// literal visit counts.
+    Improved,
+}
+
+impl GumbelPv {
+    /// Parses the CLI/env spelling.
+    ///
+    /// # Errors
+    /// Returns the offending text for anything else; a typo must not fall back
+    /// to a default, because the two options produce differently-shaped
+    /// training data.
+    pub fn parse(text: &str) -> Result<GumbelPv, String> {
+        match text.trim() {
+            "raw" | "visits" => Ok(GumbelPv::Raw),
+            "improved" | "completed" => Ok(GumbelPv::Improved),
+            other => Err(format!(
+                "expected 'raw' or 'improved' for the gumbel pv target, got {other:?}"
+            )),
+        }
+    }
+
+    /// The spelling this variant is written as.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            GumbelPv::Raw => "raw",
+            GumbelPv::Improved => "improved",
+        }
+    }
+}
+
+/// Gumbel/sequential-halving root selection for a self-play run.
+///
+/// Absent from [`GameConfig`] (`gumbel: None`) nothing here runs and a
+/// generation is the PUCT+Dirichlet one every generation to date used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GumbelOptions {
+    /// Candidate-set size for the Gumbel-top-`m` draw.
+    pub m: u16,
+    /// Which target the emitted rows carry.
+    pub pv: GumbelPv,
+}
+
+impl Default for GumbelOptions {
+    fn default() -> GumbelOptions {
+        GumbelOptions {
+            m: DEFAULT_GUMBEL_M,
+            pv: GumbelPv::default(),
+        }
+    }
+}
 
 /// When to give a hopeless game up, and how often not to.
 ///
@@ -271,7 +385,12 @@ pub fn derive_game_seed(seed: u64, game: u64) -> u64 {
 ///
 /// Field order is the serialised key order and matches Java's `row()`. See the
 /// module docs for what each field means and which of them are traps.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+///
+/// `Deserialize` as well as `Serialize`: a row is the only durable artefact
+/// this crate produces, and being able to read one back is what lets a test
+/// (and any future analysis tool) assert on the target a run actually wrote
+/// rather than on the searcher it hopes wrote it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Row {
     /// Game id, `sp<seed>-<game index>`. Every row of a game shares it *and*
     /// shares `z`.
@@ -312,6 +431,10 @@ pub struct GameConfig {
     /// Resignation, or `None` for "play every game out" — the default, and what
     /// every generation to date ran with. See the module docs.
     pub resign: Option<ResignConfig>,
+    /// Gumbel root selection, or `None` for PUCT + Dirichlet — the default, and
+    /// what every generation to date ran with. See the module docs, especially
+    /// the `pv` mapping.
+    pub gumbel: Option<GumbelOptions>,
 }
 
 impl Default for GameConfig {
@@ -324,6 +447,28 @@ impl Default for GameConfig {
             batch_size: template.batch_size,
             max_turns: DEFAULT_MAX_TURNS,
             resign: None,
+            gumbel: None,
+        }
+    }
+}
+
+impl GameConfig {
+    /// The searcher configuration for one ply of this game.
+    ///
+    /// The seed derivation is the same in both arms — `mix64(game_seed ^ (ply +
+    /// 1))`, a pure function of `(seed, game, ply)` — so the determinism
+    /// guarantee the module docs make covers the Gumbel arm unchanged.
+    fn search_config(&self, game_seed: u64, ply: u32) -> Config {
+        let seed = mix64(game_seed ^ u64::from(ply + 1));
+        let template = match self.gumbel {
+            Some(gumbel) => Config::self_play_gumbel(seed, self.sims, gumbel.m),
+            None => Config::self_play(seed, ply),
+        };
+        Config {
+            cpuct: self.cpuct,
+            value_scale: self.value_scale,
+            batch_size: self.batch_size,
+            ..template
         }
     }
 }
@@ -413,12 +558,7 @@ pub fn play_game(
             capped = false;
             break;
         }
-        let search_config = Config {
-            cpuct: config.cpuct,
-            value_scale: config.value_scale,
-            batch_size: config.batch_size,
-            ..Config::self_play(mix64(game_seed ^ u64::from(ply + 1)), ply)
-        };
+        let search_config = config.search_config(game_seed, ply);
         let mut searcher = MctsSearcher::new(state.clone(), search_config, net);
         searcher.run_sims(config.sims);
         searches += 1;
@@ -445,7 +585,7 @@ pub fn play_game(
         }
 
         if searcher.root_actions().len() > 1 {
-            pending.push(row(game_id, &state, &searcher));
+            pending.push(row(game_id, &state, &searcher, config.gumbel));
         }
         if resigned.is_some() {
             capped = false;
@@ -550,8 +690,56 @@ impl ResignTracker {
     }
 }
 
+/// Integer pseudo-counts for `policy`, summing to `total`, by the
+/// largest-remainder (Hare) method.
+///
+/// Deterministic to the last count: remainders are ordered by size with the
+/// action index breaking ties, so two runs of the same search write the same
+/// bytes. Two properties the row contract needs are enforced rather than
+/// assumed — the sum is `total` (as long as `policy` sums to 1, which a softmax
+/// does to `f32` precision) and it is never all-zero, because a row whose `pv`
+/// sums to zero trains against an all-zero target and `validate_rows.py`
+/// rejects it outright.
+fn quantize(policy: &[f32], total: u32) -> Vec<u32> {
+    if policy.is_empty() {
+        return Vec::new();
+    }
+    let total = total.max(1);
+    let scaled: Vec<f64> = policy
+        .iter()
+        .map(|p| f64::from(*p).max(0.0) * f64::from(total))
+        .collect();
+    let mut counts: Vec<u32> = scaled.iter().map(|s| s.floor() as u32).collect();
+    let assigned: i64 = counts.iter().map(|c| i64::from(*c)).sum();
+    let short = i64::from(total) - assigned;
+    if short > 0 {
+        let mut order: Vec<usize> = (0..counts.len()).collect();
+        order.sort_by(|&x, &y| {
+            let (rx, ry) = (scaled[x] - scaled[x].floor(), scaled[y] - scaled[y].floor());
+            ry.total_cmp(&rx).then(x.cmp(&y))
+        });
+        for &slot in order.iter().take(short as usize) {
+            counts[slot] += 1;
+        }
+    }
+    if counts.iter().all(|c| *c == 0) {
+        // Only reachable from a degenerate policy (every entry zero or NaN).
+        // One count on the best entry beats an all-zero target.
+        let best = (0..policy.len())
+            .max_by(|x, y| policy[*x].total_cmp(&policy[*y]))
+            .expect("policy is non-empty");
+        counts[best] = 1;
+    }
+    counts
+}
+
 /// One row from a searched root. `z` is a placeholder until the game ends.
-fn row(game_id: &str, state: &State, searcher: &MctsSearcher) -> Row {
+fn row(
+    game_id: &str,
+    state: &State,
+    searcher: &MctsSearcher,
+    gumbel: Option<GumbelOptions>,
+) -> Row {
     // `Encoded::from_state` is the searcher's own input encoding, so `sym`,
     // `ml`, `nuo` and `nux` in a row are literally the tensor the net saw. A
     // second, row-only encoder here would be a place for the two to drift.
@@ -568,7 +756,17 @@ fn row(game_id: &str, state: &State, searcher: &MctsSearcher) -> Row {
             .iter()
             .map(|action| action_id(*action) as u32)
             .collect(),
-        pv: searcher.root_visits().to_vec(),
+        // The `pv` decision, in one expression. See the module docs: `Raw` is
+        // the literal counts and loses the completed-Q values; `Improved` is
+        // the completed-Q policy and loses the counts. Nothing here can widen
+        // the schema, so one of the two has to go.
+        pv: match gumbel.map(|options| options.pv) {
+            Some(GumbelPv::Improved) => quantize(
+                &searcher.root_improved_policy(),
+                searcher.root_visits().iter().sum(),
+            ),
+            _ => searcher.root_visits().to_vec(),
+        },
         z: 0,
     }
 }
@@ -803,6 +1001,17 @@ mod tests {
         games: u64,
         resign: Option<ResignConfig>,
     ) -> (Stats, String) {
+        tiny_cfg(shard_idx, shard_count, games, resign, None)
+    }
+
+    /// `tiny_with`, plus the Gumbel arm.
+    fn tiny_cfg(
+        shard_idx: u64,
+        shard_count: u64,
+        games: u64,
+        resign: Option<ResignConfig>,
+        gumbel: Option<GumbelOptions>,
+    ) -> (Stats, String) {
         let options = Options {
             games,
             seed: 7,
@@ -812,6 +1021,7 @@ mod tests {
                 sims: 8,
                 max_turns: 6,
                 resign,
+                gumbel,
                 ..GameConfig::default()
             },
         };
@@ -1356,6 +1566,211 @@ mod tests {
             "a rule that resigns games must save searches, got {saving}"
         );
         assert!(stats.control_plies_saved >= stats.control_searches_saved);
+    }
+
+    // ---- Gumbel root selection --------------------------------------------
+
+    /// The Gumbel arm at a size a fast test can reach. `m = 4` over an opening
+    /// position's ~10 actions is a real top-m draw, not a clamp.
+    fn gumbel(pv: GumbelPv) -> GumbelOptions {
+        GumbelOptions { m: 4, pv }
+    }
+
+    #[test]
+    fn gumbel_is_off_by_default_and_inert_when_absent() {
+        assert!(
+            GameConfig::default().gumbel.is_none(),
+            "a generation that did not ask for Gumbel must not get it"
+        );
+        // The searcher config the default arm builds is the one every
+        // generation to date ran: Dirichlet on, temperature sampling on.
+        let config = GameConfig::default().search_config(1234, 0);
+        assert!(config.gumbel.is_none());
+        assert!(config.root_noise);
+        assert!(config.visit_sampling);
+        let (_, baseline) = tiny(0, 1);
+        assert_eq!(tiny_cfg(0, 1, 4, None, None).1, baseline);
+    }
+
+    /// The Gumbel arm's searcher config must carry the run's own `sims` — the
+    /// sequential-halving schedule is planned against it, so a config that
+    /// passed the default would halve on the wrong boundaries at every other
+    /// budget.
+    #[test]
+    fn the_gumbel_search_config_is_planned_against_the_runs_own_budget() {
+        let config = GameConfig {
+            sims: 256,
+            gumbel: Some(gumbel(GumbelPv::Raw)),
+            ..GameConfig::default()
+        };
+        let asked = config.search_config(99, 3).gumbel.expect("gumbel is on");
+        assert_eq!(asked.sims, 256);
+        assert_eq!(asked.m, 4);
+        // And the exploration it replaces is genuinely off.
+        assert!(!config.search_config(99, 3).root_noise);
+        assert!(!config.search_config(99, 0).visit_sampling);
+    }
+
+    /// The acceptance gate: a Gumbel-generated file is still a SelfPlayMcts
+    /// file, on both `pv` mappings.
+    #[test]
+    fn gumbel_rows_satisfy_the_selfplay_contract() {
+        for pv in [GumbelPv::Raw, GumbelPv::Improved] {
+            let (stats, jsonl) = tiny_cfg(0, 1, 4, None, Some(gumbel(pv)));
+            assert_eq!(stats.games, 4);
+            assert!(stats.rows > 0, "{pv:?}: a 4-game run must produce rows");
+            assert_contract(&jsonl, 4);
+        }
+    }
+
+    /// The two mappings are genuinely different targets over the same games,
+    /// and both conserve the search's visit total — which is what makes them
+    /// interchangeable to a trainer that normalises `pv`.
+    ///
+    /// Deliberately **not** asserted here: which of the two is the better
+    /// target. That is an entropy and top-1-agreement measurement at a real
+    /// 192-simulation budget, it is what `virus-mcts`'s `examples/gumbelprobe`
+    /// exists for, and a unit test at 8 simulations — where the quantiser has
+    /// only 8 counts to spend — would pin whatever that toy budget happens to
+    /// produce rather than anything true.
+    #[test]
+    fn the_two_pv_mappings_are_different_targets_over_the_same_total() {
+        let rows = |jsonl: &str| -> Vec<Row> {
+            jsonl
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("a row"))
+                .collect()
+        };
+        let raw = rows(&tiny_cfg(0, 1, 4, None, Some(gumbel(GumbelPv::Raw))).1);
+        let improved = rows(&tiny_cfg(0, 1, 4, None, Some(gumbel(GumbelPv::Improved))).1);
+        assert_eq!(raw.len(), improved.len());
+        assert!(!raw.is_empty());
+
+        let mut differed = 0;
+        for (raw, improved) in raw.iter().zip(&improved) {
+            assert_eq!(raw.pi, improved.pi, "the mask is the same either way");
+            assert_eq!(
+                raw.pv.iter().sum::<u32>(),
+                improved.pv.iter().sum::<u32>(),
+                "both targets carry the search's whole visit total"
+            );
+            assert!(improved.pv.iter().sum::<u32>() > 0);
+            differed += usize::from(raw.pv != improved.pv);
+        }
+        assert!(
+            differed > 0,
+            "the completed-Q target never differed from the raw visits — the \
+             mapping is not reaching the row"
+        );
+    }
+
+    /// Only the target changes between the two `pv` mappings — the games are
+    /// the same games, because the mapping is a write-time decision and draws
+    /// nothing.
+    #[test]
+    fn the_pv_mapping_does_not_change_the_games() {
+        let raw = tiny_cfg(0, 1, 4, None, Some(gumbel(GumbelPv::Raw))).1;
+        let improved = tiny_cfg(0, 1, 4, None, Some(gumbel(GumbelPv::Improved))).1;
+        let strip = |text: &str| -> Vec<Row> {
+            text.lines()
+                .map(|line| Row {
+                    pv: Vec::new(),
+                    ..serde_json::from_str::<Row>(line).expect("a row")
+                })
+                .collect()
+        };
+        assert_eq!(strip(&raw), strip(&improved));
+    }
+
+    /// The determinism criterion, extended to the Gumbel arm: same seed and
+    /// shard, byte-identical output.
+    #[test]
+    fn same_seed_and_shard_is_byte_identical_with_gumbel_on() {
+        for pv in [GumbelPv::Raw, GumbelPv::Improved] {
+            let options = Some(gumbel(pv));
+            assert_eq!(
+                tiny_cfg(0, 1, 8, None, options).1,
+                tiny_cfg(0, 1, 8, None, options).1,
+                "{pv:?}: Gumbel must not introduce an unseeded draw"
+            );
+            assert_eq!(
+                tiny_cfg(1, 2, 8, None, options).1,
+                tiny_cfg(1, 2, 8, None, options).1
+            );
+        }
+    }
+
+    /// And the load-bearing half: shard count repartitions the same games in
+    /// the Gumbel arm too, because the per-ply seed is still a pure function of
+    /// `(seed, game, ply)`.
+    #[test]
+    fn sharding_repartitions_rather_than_regenerates_with_gumbel_on() {
+        let options = Some(gumbel(GumbelPv::Improved));
+        let sorted = |text: &str| {
+            let mut lines: Vec<&str> = text.lines().collect();
+            lines.sort_unstable();
+            lines.join("\n")
+        };
+        let whole = tiny_cfg(0, 1, 8, None, options).1;
+        let halves = format!(
+            "{}{}",
+            tiny_cfg(0, 2, 8, None, options).1,
+            tiny_cfg(1, 2, 8, None, options).1
+        );
+        assert_eq!(sorted(&whole), sorted(&halves));
+    }
+
+    /// Gumbel has to actually change the search, or none of the rest matters.
+    #[test]
+    fn the_gumbel_arm_plays_different_games_from_the_puct_arm() {
+        let puct = tiny_cfg(0, 1, 4, None, None).1;
+        let gumbel_rows = tiny_cfg(0, 1, 4, None, Some(gumbel(GumbelPv::Raw))).1;
+        assert_ne!(puct, gumbel_rows);
+    }
+
+    /// Gumbel and resignation are independent levers and must compose: the
+    /// resign rule reads a root value the Gumbel search produced just as
+    /// happily as a PUCT one.
+    #[test]
+    fn gumbel_composes_with_resignation() {
+        let rules = ResignConfig {
+            control_frac: 0.5,
+            ..eager()
+        };
+        let (stats, jsonl) = tiny_cfg(0, 1, 8, Some(rules), Some(gumbel(GumbelPv::Raw)));
+        assert!(stats.resigned > 0, "the eager rule must fire here too");
+        assert_contract(&jsonl, 8);
+    }
+
+    #[test]
+    fn quantize_sums_to_the_total_and_is_never_all_zero() {
+        assert_eq!(quantize(&[0.5, 0.25, 0.25], 100), vec![50, 25, 25]);
+        // Largest remainder: 1/3 each of 10 is 3.33, so the first (index tie-
+        // break) entry takes the leftover.
+        let thirds = quantize(&[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], 10);
+        assert_eq!(thirds.iter().sum::<u32>(), 10);
+        assert_eq!(thirds, vec![4, 3, 3]);
+        // A distribution too fine for the budget still produces a usable target.
+        let sparse = quantize(&[0.999, 0.0005, 0.0005], 4);
+        assert_eq!(sparse.iter().sum::<u32>(), 4);
+        assert!(sparse.iter().sum::<u32>() > 0);
+        // Degenerate inputs: an all-zero policy must not write an all-zero row.
+        let degenerate = quantize(&[0.0, 0.0], 8);
+        assert!(degenerate.iter().sum::<u32>() > 0);
+        assert!(quantize(&[], 8).is_empty());
+        // The mapping is a pure function of its inputs.
+        assert_eq!(quantize(&[0.7, 0.3], 192), quantize(&[0.7, 0.3], 192));
+    }
+
+    #[test]
+    fn the_gumbel_pv_spelling_round_trips_and_rejects_typos() {
+        assert_eq!(GumbelPv::parse("raw"), Ok(GumbelPv::Raw));
+        assert_eq!(GumbelPv::parse(" improved "), Ok(GumbelPv::Improved));
+        assert_eq!(GumbelPv::parse("visits"), Ok(GumbelPv::Raw));
+        assert!(GumbelPv::parse("improoved").is_err());
+        assert_eq!(GumbelPv::default(), GumbelPv::Raw);
+        assert_eq!(GumbelPv::Raw.label(), "raw");
+        assert_eq!(GumbelPv::Improved.label(), "improved");
     }
 
     #[test]

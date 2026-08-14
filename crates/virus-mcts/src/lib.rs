@@ -40,12 +40,14 @@
 #![deny(missing_debug_implementations)]
 
 pub mod action_id;
+pub mod gumbel;
 pub mod net;
 pub mod parallel;
 pub mod rng;
 pub mod search;
 
 pub use action_id::{action_from_id, action_id, ACTION_ID_COUNT};
+pub use gumbel::{GumbelConfig, DEFAULT_GUMBEL_C_SCALE, DEFAULT_GUMBEL_C_VISIT, DEFAULT_GUMBEL_M};
 pub use net::{
     BatchScratch, Encoded, Heads, NetError, NetScratch, PolicyValueNet, BATCH_LANES, BOARD, CELLS,
     PLANES,
