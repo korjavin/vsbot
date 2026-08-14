@@ -22,55 +22,115 @@
 //!    asserts its root player, and a bot that panics its search worker mid-game
 //!    forfeits on the server's 120 s timer.
 //!
-//! # Cancellation: what this engine can and cannot honour
+//! # Cancellation: how a superseded search is stopped
 //!
 //! [`SearchBudget`] asks an engine to stop at its deadline **and** to poll
-//! [`SearchBudget::is_cancelled`]. This one polls at entry and stops at the
-//! deadline, but it cannot abort a search already inside `virus-search`: the
-//! searcher's stop flag is private and reserved for its lazy-SMP helpers, and
-//! there is no public hook to raise it. So a superseded search runs on to its
-//! own deadline.
+//! [`SearchBudget::is_cancelled`]. This one does both, and the second half is
+//! [`Searcher::cancel_token`]: `virus-search` polls that flag in the same place
+//! and at the same cadence as it polls its deadline, so raising it aborts a
+//! search already deep inside the crate and the result obeys ARCHITECTURE.md
+//! invariant 3 unchanged — the move of the deepest fully completed iteration,
+//! or a salvage guarded by `best_score > alpha_orig`. A cancelled search can
+//! never answer with a worse move than it had already committed to; it simply
+//! stops sooner.
 //!
-//! The two obvious workarounds are both worse than the problem. Slicing the
-//! budget into short `search_with_deadline` calls restarts iterative deepening
-//! every slice, and — because a new iteration is not *started* past
+//! The bridge is a poll rather than a wait, because the two tokens come from
+//! different worlds: the client's is a `tokio_util::sync::CancellationToken`
+//! whose only waiter is a future, and this engine runs on a blocking worker with
+//! no runtime of its own. A `CANCEL_POLL`-interval watcher thread lives exactly
+//! as long as the search does, and is joined by the scope that spawned it.
+//!
+//! What this replaced was a *cost bound* rather than a fix. Until bd `vsbot-tz7`
+//! there was no public stop flag, so a superseded search burned a core and held
+//! its 32 MiB transposition table until its own deadline; a search that found
+//! the cache lock held took a deliberately small table so a burst of snapshots
+//! could not multiply the working set inside the deployment's 512 MB container.
+//! Prompt cancellation removes the multiplier that bound existed for — the
+//! predecessor now unwinds in milliseconds rather than seconds — so a contended
+//! search gets the full table and the strength that goes with it.
+//!
+//! The two in-adapter workarounds that were rejected are still worth recording,
+//! because both look tempting from here. Slicing the budget into short
+//! `search_with_deadline` calls restarts iterative deepening every slice, and —
+//! because a new iteration is not *started* past
 //! [`SearchOptions::soft_deadline_percent`] of the budget it was given — a
 //! sliced search stalls at a fixed shallow depth instead of deepening. The
 //! node-budget entry is deterministic rather than wall-clock and would break the
 //! deadline/depth consistency `virus-search` pins.
-//!
-//! What is bounded here instead is the *cost* of the overlap:
-//!
-//! * the deadline handed over is [`SearchBudget::deadline`], never the later
-//!   `ceiling`, so a stale search dies at the target rather than the extension;
-//! * a search that finds the cache lock held knows another search is still
-//!   running, and takes a [`CONTENDED_TT_LOG2`]-sized table instead of the full
-//!   one, so concurrent searches cannot multiply the engine's 32 MiB working set
-//!   inside the deployment's 512 MB container.
-//!
-//! Removing the residual needs a public stop flag on `virus-search::Searcher`,
-//! which is a change to that crate rather than to this adapter: bd `vsbot-tz7`.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::Duration;
 
 use virus_core::{Action, CellKind, Player, State, MAX_PLAYERS};
 use virus_proto::{SearchBudget, SearchEngine, SearchOutcome};
-use virus_search::{SearchOptions, SearchResult, Searcher};
+use virus_search::{CancelToken, SearchOptions, SearchResult, Searcher};
 
-/// `log2` of the transposition table a *contended* search gets: 2^18 entries,
-/// 4 MiB against the cached searcher's 32 MiB.
+/// How often the watcher re-reads the client's cancellation token.
 ///
-/// Contention means a previous search is still running on this engine — the
-/// client cancelled it, but `virus-search` cannot be interrupted, so it holds
-/// its table until its own deadline. Giving every such overlap a second full
-/// table is how a 512 MB container runs out of memory during a burst of
-/// snapshots. A contended search starts on a cold table whatever its size, so
-/// the strength it gives up for the bound is small and it gives it up only on
-/// the rare path.
-const CONTENDED_TT_LOG2: u32 = 18;
+/// The two token types cannot be joined any more cheaply: `CancellationToken`
+/// only offers an async waiter and this engine runs on a blocking worker. 5 ms
+/// is three orders of magnitude below the smallest budget the intra-turn
+/// allocator hands out — so it is invisible in move latency — and the watcher
+/// only exists while a search does.
+const CANCEL_POLL: Duration = Duration::from_millis(5);
+
+/// Runs `search` with `token` raised as soon as `budget` is cancelled.
+///
+/// Polls [`SearchBudget::is_cancelled`] rather than touching the client's
+/// `CancellationToken` directly — that method is the seam the trait documents,
+/// and going through it keeps `tokio-util` out of this crate's dependency graph
+/// for the sake of one boolean.
+///
+/// The watcher is a **scoped** thread, which is the whole safety argument: it
+/// cannot outlive the search it belongs to, so it can never raise a token that a
+/// later search is using, and there is no handle to leak. It is woken by
+/// `unpark` the instant the search returns, so a search that was *not* cancelled
+/// pays no shutdown latency for the bridge — only the thread.
+///
+/// The shutdown is a drop guard rather than two statements after `search()`,
+/// and that is not tidiness. A scope joins its threads on the way out of a
+/// *panic* as well as a return, so a search that panicked without the watcher
+/// having been told to stop would leave the scope blocking forever on a thread
+/// that is still polling: a hung blocking worker instead of a panic the client
+/// reports and recovers from. `Searcher::search_with_deadline` asserts its root
+/// player, so that panic is a real shape, not a hypothetical one.
+fn watching<T>(budget: &SearchBudget, token: &CancelToken, search: impl FnOnce() -> T) -> T {
+    /// Stops the watcher on the way out, however the search leaves.
+    struct Stop<'a> {
+        done: &'a AtomicBool,
+        watcher: std::thread::Thread,
+    }
+
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.done.store(true, Ordering::Relaxed);
+            self.watcher.unpark();
+        }
+    }
+
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                if budget.is_cancelled() {
+                    token.cancel();
+                    return;
+                }
+                // `park_timeout` may return spuriously and an `unpark` that
+                // arrives first is remembered, so the loop condition — not the
+                // wakeup — is what decides.
+                std::thread::park_timeout(CANCEL_POLL);
+            }
+        });
+        let _stop = Stop {
+            done: &done,
+            watcher: watcher.thread().clone(),
+        };
+        search()
+    })
+}
 
 /// Enhanced iterative-deepening alpha-beta with the hand-tuned leaf evaluation.
 ///
@@ -83,12 +143,12 @@ pub struct AlphaBetaEngine {
     /// whole budget building.
     ///
     /// Behind a `Mutex` because [`SearchEngine::choose`] takes `&self` and the
-    /// client may have two searches in flight — cancellation is cooperative, so
-    /// a superseded search runs on until its own deadline. The lock is therefore
-    /// only ever *tried*: a contended call builds its own searcher and searches
-    /// with a cold table rather than queueing behind a dead position's deadline,
-    /// because a search that answers late is a forfeit and a search that answers
-    /// with a cold table is merely a slightly worse move.
+    /// client may have two searches in flight: cancellation is cooperative, so a
+    /// superseded search still needs a moment to notice and unwind. The lock is
+    /// therefore only ever *tried*: a contended call builds its own searcher
+    /// rather than queueing behind the predecessor, because a search that
+    /// answers late is a forfeit and a search that answers on a cold table is
+    /// merely a slightly worse move.
     ///
     /// Paired with the shape it was built for, because that is the one thing a
     /// `Searcher` cannot be asked about after the fact.
@@ -165,8 +225,15 @@ impl AlphaBetaEngine {
     /// position of another shape is a programming error rather than a weaker
     /// search — `search_with_deadline` asserts the root outright, and the max^n
     /// branch is chosen once, from the position the searcher was built with.
-    fn search(&self, state: &State, deadline: Instant) -> Option<SearchResult> {
+    fn search(&self, state: &State, budget: &SearchBudget) -> Option<SearchResult> {
         let shape = SearcherShape::of(state);
+        // A fresh token per search, never the searcher's own. The cached
+        // searcher outlives the move, and `virus-search` deliberately does not
+        // clear the flag at an entry point (a cancel raised in the gap before a
+        // search starts is the race the hook exists to close), so reusing one
+        // token across moves would make the move after a cancellation abort
+        // before visiting a node.
+        let token = CancelToken::new();
         // `try_lock`, never `lock` — see the field comment. A poisoned lock is
         // treated as an empty cache for the same reason: the panic that poisoned
         // it says nothing about this position, and refusing to move would be a
@@ -175,18 +242,21 @@ impl AlphaBetaEngine {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                // A held lock *is* the signal that a superseded search is still
-                // running: it cannot be interrupted, so it keeps its table until
-                // its own deadline. This search gets a small one so the two
-                // cannot add up to two full working sets, and it is never
-                // cached — the searcher that owns the lock is the one that
-                // should stay warm.
-                let options = SearchOptions {
-                    tt_log2: CONTENDED_TT_LOG2,
-                    ..self.options
-                };
+                // A held lock means the predecessor has not finished unwinding.
+                // It gets the full table: the reason this path used to take a
+                // deliberately small one was that a superseded search could not
+                // be interrupted and held its own table for the rest of its
+                // budget, which a burst of snapshots multiplied. Cancellation
+                // now collapses that overlap to the predecessor's unwind, so the
+                // bound costs strength on a live position and buys nothing. It
+                // is still never cached — the searcher holding the lock is the
+                // one that should stay warm.
                 self.built.fetch_add(1, Ordering::SeqCst);
-                return Searcher::new(state, options).search_with_deadline(state, deadline);
+                let mut searcher = Searcher::new(state, self.options);
+                searcher.set_cancel_token(token.clone());
+                return watching(budget, &token, || {
+                    searcher.search_with_deadline(state, budget.deadline)
+                });
             }
         };
         // The cached shape, not the position's own: comparing the position with
@@ -195,11 +265,11 @@ impl AlphaBetaEngine {
         if guard.as_ref().map(|(cached, _)| *cached) != Some(shape) {
             *guard = Some((shape, self.fresh(state)));
         }
-        guard
-            .as_mut()
-            .expect("just built")
-            .1
-            .search_with_deadline(state, deadline)
+        let searcher = &mut guard.as_mut().expect("just built").1;
+        searcher.set_cancel_token(token.clone());
+        watching(budget, &token, || {
+            searcher.search_with_deadline(state, budget.deadline)
+        })
     }
 
     fn fresh(&self, state: &State) -> Searcher {
@@ -271,7 +341,15 @@ impl SearchEngine for AlphaBetaEngine {
         // read a PUCT root's visit distribution. Alpha-beta has no such root, so
         // it stops at the target — which is what `SearchBudget`'s own docs call
         // the correct behaviour for an engine that does not implement them.
-        let result = self.search(state, budget.deadline)?;
+        let result = self.search(state, budget)?;
+        if budget.is_cancelled() {
+            // Superseded while searching. The answer describes a position the
+            // client has already replaced, so this is the same documented `None`
+            // as the pre-check above rather than a move worth offering: the
+            // client's version guard would reject it anyway, and returning it
+            // would leave the only report of the outcome to that guard.
+            return None;
+        }
         let action = result.action?;
         Some(SearchOutcome {
             action,
@@ -317,7 +395,7 @@ impl SearchEngine for AlphaBetaEngine {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio_util::sync::CancellationToken;
     use virus_proto::EngineKind;
 
@@ -438,6 +516,120 @@ pub(crate) mod tests {
             started.elapsed() < Duration::from_millis(50),
             "a cancelled search still did work: {:?}",
             started.elapsed()
+        );
+    }
+
+    /// The other half of ARCHITECTURE.md invariant 5, and the reason bd
+    /// `vsbot-tz7` exists: a search that is *already running* when its position
+    /// is superseded must stop, not run on to its own deadline holding a core
+    /// and a 32 MiB table.
+    ///
+    /// The deadline is 30 s and the token fires at 100 ms, so the two outcomes
+    /// are three hundred times apart — no tolerance chosen for CI stability can
+    /// blur them. What the bound has to survive is scheduling noise on a shared
+    /// box, so it is set an order of magnitude above the ~105 ms this costs.
+    #[test]
+    fn a_search_cancelled_mid_flight_stops_instead_of_running_to_its_deadline() {
+        let engine = AlphaBetaEngine::new();
+        let state = past_the_book(12, 12, 2);
+        let cancel = CancellationToken::new();
+        let budget = SearchBudget::new(Instant::now() + Duration::from_secs(30), cancel.clone());
+
+        let waker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancel.cancel();
+        });
+        let started = Instant::now();
+        let outcome = engine.choose(&state, &budget);
+        let elapsed = started.elapsed();
+        waker.join().expect("the cancelling thread survived");
+
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "a superseded search took {elapsed:?} — it ran on toward its 30 s deadline"
+        );
+        assert!(
+            outcome.is_none(),
+            "a superseded search offered a move for a position the client has replaced"
+        );
+    }
+
+    /// Cancelling one search must not poison the searcher it was using.
+    ///
+    /// The cached searcher outlives the move and `virus-search` deliberately
+    /// never clears a raised stop flag, so an adapter that handed over the
+    /// searcher's *own* token — or reused one token across moves — would leave
+    /// every later move on that shape aborting before it visited a node. The
+    /// moves would all still be legal, which is what most of this file asserts,
+    /// so the damage is pinned on depth and nodes instead.
+    ///
+    /// The cancellation has to be mid-flight to reach the searcher at all: a
+    /// budget that is already cancelled on entry is answered by the pre-check in
+    /// `choose`, which never builds or touches one.
+    #[test]
+    fn a_cancelled_search_does_not_poison_the_cached_searcher() {
+        let engine = AlphaBetaEngine::new();
+        let state = past_the_book(12, 12, 2);
+
+        let cancel = CancellationToken::new();
+        let superseded =
+            SearchBudget::new(Instant::now() + Duration::from_secs(30), cancel.clone());
+        let waker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancel.cancel();
+        });
+        assert!(engine.choose(&state, &superseded).is_none());
+        waker.join().expect("the cancelling thread survived");
+        assert_eq!(
+            engine.searchers_built(),
+            1,
+            "the cancelled search did not go through the cached searcher, so the \
+             reuse below proves nothing"
+        );
+
+        // Same shape, so these reuse the searcher the cancelled search left behind.
+        for attempt in 1..=2 {
+            let outcome = engine
+                .choose(&state, &budget(200))
+                .unwrap_or_else(|| panic!("search {attempt} after a cancellation offered nothing"));
+            assert_eq!(
+                engine.searchers_built(),
+                1,
+                "the cache missed on its own shape"
+            );
+            assert!(
+                outcome.depth >= 1 && outcome.nodes > 0,
+                "search {attempt} after a cancellation returned without searching: \
+                 depth {} nodes {}",
+                outcome.depth,
+                outcome.nodes
+            );
+        }
+    }
+
+    /// A panicking search must still panic, not hang.
+    ///
+    /// The cancellation bridge parks a watcher thread inside a scope, and a
+    /// scope joins its threads while unwinding a panic just as it does on a
+    /// normal return. Without the drop guard in [`watching`] the watcher would
+    /// never be told to stop, the join would block forever, and a panic the
+    /// client reports as a failed search — `Searcher::search_with_deadline`
+    /// asserts its root player — would instead become a blocking worker that
+    /// never comes back.
+    ///
+    /// A regression here hangs rather than fails, which is exactly why it is
+    /// worth pinning: a hang is far harder to attribute after the fact.
+    #[test]
+    fn a_panicking_search_does_not_hang_the_cancellation_watcher() {
+        let budget = budget(30_000);
+        let token = virus_search::CancelToken::new();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            watching(&budget, &token, || panic!("the search blew up"));
+        }));
+        assert!(outcome.is_err(), "the panic was swallowed");
+        assert!(
+            !token.is_cancelled(),
+            "a panicking search is not a cancelled one"
         );
     }
 

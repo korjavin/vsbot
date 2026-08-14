@@ -95,12 +95,82 @@ const MAX_ALTERNATIVES: usize = 4;
 /// server's 120 s move timer. Deterministic paths never read the clock at all.
 const CLOCK_CHECK_INTERVAL: u32 = 1024;
 
-/// Signals that the running budget (node limit, deadline, or an SMP abort) was
-/// exhausted mid-search. Only the iterative-deepening loops catch it.
+/// Signals that the running budget (node limit, deadline, cancellation, or an
+/// SMP abort) was exhausted mid-search. Only the iterative-deepening loops catch
+/// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Incomplete;
 
 type Searched<T> = Result<T, Incomplete>;
+
+/// A cooperative stop flag for a running search.
+///
+/// Clone it, hand a clone to whichever thread decides the search is superseded,
+/// and call [`CancelToken::cancel`]. [`Searcher`] polls it in the *same* place,
+/// at the *same* cadence, as it polls its node limit and its deadline.
+///
+/// # What a cancelled search returns
+///
+/// Exactly what a deadline expiry at that instant would have returned, because
+/// it is the same unwind: the incomplete-search error propagates out of the root
+/// loop, the partially searched iteration is discarded, and the answer is the
+/// move of the deepest **fully completed** iteration. The single exception is
+/// salvage, guarded by `best_score > alpha_orig` and flagged
+/// [`SearchResult::salvaged`] (ARCHITECTURE.md invariant 3). A cancelled search
+/// therefore can never answer with a worse move than the last completed
+/// iteration, and cancellation needs no separate reasoning from the deadline it
+/// shares a code path with.
+///
+/// # The flag is never cleared by the searcher
+///
+/// A cancel raised between "the caller decided this search is superseded" and
+/// "the search actually started" is precisely the race this hook exists to
+/// close, so clearing the flag at the entry points would swallow it. A caller
+/// that reuses one searcher across moves installs a fresh token per search
+/// (or calls [`CancelToken::reset`]).
+///
+/// # Example
+///
+/// ```
+/// use virus_core::State;
+/// use virus_search::{CancelToken, Searcher};
+///
+/// let state = State::new(12, 12, 2).expect("12x12 two-player board");
+/// let mut searcher = Searcher::enhanced(&state);
+/// let token = searcher.cancel_token();
+/// token.cancel(); // from any thread, at any time
+/// assert!(token.is_cancelled());
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    /// A fresh handle that has not been cancelled.
+    pub fn new() -> CancelToken {
+        CancelToken::default()
+    }
+
+    /// Asks every search polling this handle to stop.
+    ///
+    /// Returns immediately: the search stops at its next budget poll, which is
+    /// once per interior node and once per generated root action.
+    pub fn cancel(&self) {
+        self.0.store(true, AtomicOrdering::Relaxed);
+    }
+
+    /// Whether [`CancelToken::cancel`] has been called.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Clears the flag so the handle can drive another search.
+    ///
+    /// Only sound while no search is polling it — a reset that races a running
+    /// search silently un-cancels it.
+    pub fn reset(&self) {
+        self.0.store(false, AtomicOrdering::Relaxed);
+    }
+}
 
 /// A root candidate action with the score the search gave it.
 ///
@@ -310,7 +380,10 @@ pub struct Searcher {
     deadline: Option<Instant>,
     clock_countdown: u32,
     timed_out: bool,
-    stop: Option<Arc<AtomicBool>>,
+    /// The cooperative stop flag. One mechanism, two users: a lazy-SMP helper is
+    /// handed the main thread's shutdown handle here, and an outside caller
+    /// installs its own through [`Searcher::set_cancel_token`].
+    cancel: CancelToken,
 
     killers: Vec<[Option<Action>; 2]>,
     /// `[mover - 1][cell index]`; only the two 1v1 seats are tracked.
@@ -374,7 +447,7 @@ impl Searcher {
             deadline: None,
             clock_countdown: 0,
             timed_out: false,
-            stop: None,
+            cancel: CancelToken::new(),
             killers: vec![[None, None]; MAX_DEPTH as usize + 1],
             history: [Vec::new(), Vec::new()],
             stats: SearchStats::default(),
@@ -395,6 +468,33 @@ impl Searcher {
     /// Diagnostic counters from the searches run so far.
     pub fn stats(&self) -> &SearchStats {
         &self.stats
+    }
+
+    /// This searcher's cooperative stop flag.
+    ///
+    /// Clone it to another thread and call [`CancelToken::cancel`] to abort a
+    /// search that has been superseded. See [`CancelToken`] for what a cancelled
+    /// search returns — the short version is "whatever a deadline expiry at the
+    /// same instant would have returned", which is the property that makes this
+    /// safe to use on a live position.
+    ///
+    /// Every searcher owns an un-cancelled token from construction, so a caller
+    /// that never touches this observes no behaviour change whatsoever.
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
+    }
+
+    /// Adopts an externally owned stop flag, replacing this searcher's own.
+    ///
+    /// The intended shape for a searcher reused across moves: install a fresh
+    /// token per search, so a cancel left over from the previous move cannot
+    /// abort the next one before it starts. (The searcher deliberately never
+    /// clears the flag itself — see [`CancelToken`].)
+    ///
+    /// Takes effect at the next budget poll, so calling it on a searcher that is
+    /// mid-search is a race and not a supported use.
+    pub fn set_cancel_token(&mut self, token: CancelToken) {
+        self.cancel = token;
     }
 
     /// Whether the packed table already holds an entry for `state`.
@@ -524,10 +624,10 @@ impl Searcher {
         }
         self.begin_search(state, None, limit);
         let mut best = SearchResult::with_action(fallback);
-        let stop = Arc::new(AtomicBool::new(false));
+        let helper_stop = CancelToken::new();
         let helper_count = self.helper_count();
         std::thread::scope(|scope| {
-            self.spawn_helpers(scope, state, &stop, helper_count);
+            self.spawn_helpers(scope, state, &helper_stop, helper_count);
             let mut previous = None;
             let mut depth = 1;
             while depth <= MAX_DEPTH && self.nodes < limit {
@@ -539,7 +639,7 @@ impl Searcher {
                 best = result;
                 depth += 1;
             }
-            stop.store(true, AtomicOrdering::Relaxed);
+            helper_stop.cancel();
         });
         best.nodes = self.nodes;
         best.evaluations = self.evaluations;
@@ -572,6 +672,14 @@ impl Searcher {
     /// result is flagged [`SearchResult::salvaged`] and keeps the *completed*
     /// iteration's depth label.
     ///
+    /// # Cancellation
+    ///
+    /// [`Searcher::cancel_token`] aborts a search that is already running, for a
+    /// caller that has learned its position is superseded. It unwinds through
+    /// the identical path as a deadline expiry — same poll site, same discard of
+    /// the partial iteration, same guarded salvage — so everything the paragraph
+    /// above promises about the returned move holds for a cancelled search too.
+    ///
     /// # Panics
     /// Panics when `state`'s mover is not this searcher's root player.
     pub fn search_with_deadline(
@@ -588,11 +696,11 @@ impl Searcher {
         let budget = deadline.saturating_duration_since(start).as_nanos();
         self.begin_search(state, Some(deadline), 0);
         let mut best = SearchResult::with_action(fallback);
-        let stop = Arc::new(AtomicBool::new(false));
+        let helper_stop = CancelToken::new();
         let helper_count = self.helper_count();
         let soft = u128::from(self.options.soft_deadline_percent);
         std::thread::scope(|scope| {
-            self.spawn_helpers(scope, state, &stop, helper_count);
+            self.spawn_helpers(scope, state, &helper_stop, helper_count);
             let mut previous = None;
             for depth in 1..=MAX_DEPTH {
                 if self.options.enhanced
@@ -622,7 +730,7 @@ impl Searcher {
                     }
                 }
             }
-            stop.store(true, AtomicOrdering::Relaxed);
+            helper_stop.cancel();
         });
         Some(best)
     }
@@ -726,11 +834,20 @@ impl Searcher {
     /// aspirate around, and full-window bounds stay valid for whatever window
     /// the main thread happens to be searching. Their only output is the table
     /// entries they leave behind.
+    ///
+    /// `stop` is the helpers' shutdown handle, and it is the *same* mechanism an
+    /// outside caller drives through [`Searcher::set_cancel_token`] — a helper
+    /// simply adopts it as its own stop flag. Cancelling the root reaches the
+    /// helpers through the main thread rather than directly: the root's own poll
+    /// aborts its iteration, it breaks out of the deepening loop, and the scope
+    /// raises `stop` on the way out. So a cancelled SMP search winds its helpers
+    /// down within one budget poll of the main thread unwinding, and the scope
+    /// still joins them all before the search returns.
     fn spawn_helpers<'scope, 'env: 'scope>(
         &self,
         scope: &'scope std::thread::Scope<'scope, 'env>,
         state: &'env State,
-        stop: &'env Arc<AtomicBool>,
+        stop: &'env CancelToken,
         count: usize,
     ) {
         let Some(table) = self.tt.clone() else {
@@ -743,7 +860,7 @@ impl Searcher {
             let start_depth = 2 + (index as i32 & 1);
             scope.spawn(move || {
                 let mut helper = Searcher::with_table(state, options, Some(table));
-                helper.stop = Some(stop);
+                helper.set_cancel_token(stop);
                 helper.history = [vec![0; state.cell_count()], vec![0; state.cell_count()]];
                 for depth in start_depth..=MAX_DEPTH {
                     if helper
@@ -757,11 +874,12 @@ impl Searcher {
         }
     }
 
+    /// The one budget poll. Cancellation, the node limit and the deadline are
+    /// all read here, so they abort at identical points and produce identical
+    /// partial-result semantics.
     fn running(&mut self) -> bool {
-        if let Some(stop) = &self.stop {
-            if stop.load(AtomicOrdering::Relaxed) {
-                return false;
-            }
+        if self.cancel.is_cancelled() {
+            return false;
         }
         if self.node_limit > 0 && self.nodes >= self.node_limit {
             return false;
