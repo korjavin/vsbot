@@ -21,6 +21,35 @@
 //! 2. **Never handing the searcher a position it would panic on.** The library
 //!    asserts its root player, and a bot that panics its search worker mid-game
 //!    forfeits on the server's 120 s timer.
+//!
+//! # Cancellation: what this engine can and cannot honour
+//!
+//! [`SearchBudget`] asks an engine to stop at its deadline **and** to poll
+//! [`SearchBudget::is_cancelled`]. This one polls at entry and stops at the
+//! deadline, but it cannot abort a search already inside `virus-search`: the
+//! searcher's stop flag is private and reserved for its lazy-SMP helpers, and
+//! there is no public hook to raise it. So a superseded search runs on to its
+//! own deadline.
+//!
+//! The two obvious workarounds are both worse than the problem. Slicing the
+//! budget into short `search_with_deadline` calls restarts iterative deepening
+//! every slice, and — because a new iteration is not *started* past
+//! [`SearchOptions::soft_deadline_percent`] of the budget it was given — a
+//! sliced search stalls at a fixed shallow depth instead of deepening. The
+//! node-budget entry is deterministic rather than wall-clock and would break the
+//! deadline/depth consistency `virus-search` pins.
+//!
+//! What is bounded here instead is the *cost* of the overlap:
+//!
+//! * the deadline handed over is [`SearchBudget::deadline`], never the later
+//!   `ceiling`, so a stale search dies at the target rather than the extension;
+//! * a search that finds the cache lock held knows another search is still
+//!   running, and takes a [`CONTENDED_TT_LOG2`]-sized table instead of the full
+//!   one, so concurrent searches cannot multiply the engine's 32 MiB working set
+//!   inside the deployment's 512 MB container.
+//!
+//! Removing the residual needs a public stop flag on `virus-search::Searcher`,
+//! which is a change to that crate rather than to this adapter: bd `vsbot-tz7`.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +59,18 @@ use std::time::Instant;
 use virus_core::{Action, CellKind, Player, State, MAX_PLAYERS};
 use virus_proto::{SearchBudget, SearchEngine, SearchOutcome};
 use virus_search::{SearchOptions, SearchResult, Searcher};
+
+/// `log2` of the transposition table a *contended* search gets: 2^18 entries,
+/// 4 MiB against the cached searcher's 32 MiB.
+///
+/// Contention means a previous search is still running on this engine — the
+/// client cancelled it, but `virus-search` cannot be interrupted, so it holds
+/// its table until its own deadline. Giving every such overlap a second full
+/// table is how a 512 MB container runs out of memory during a burst of
+/// snapshots. A contended search starts on a cold table whatever its size, so
+/// the strength it gives up for the bound is small and it gives it up only on
+/// the rare path.
+const CONTENDED_TT_LOG2: u32 = 18;
 
 /// Enhanced iterative-deepening alpha-beta with the hand-tuned leaf evaluation.
 ///
@@ -48,7 +89,8 @@ pub struct AlphaBetaEngine {
     /// with a cold table rather than queueing behind a dead position's deadline,
     /// because a search that answers late is a forfeit and a search that answers
     /// with a cold table is merely a slightly worse move.
-    /// Paired with the shape it was built for, because that is the only thing a
+    ///
+    /// Paired with the shape it was built for, because that is the one thing a
     /// `Searcher` cannot be asked about after the fact.
     cached: Mutex<Option<(SearcherShape, Searcher)>>,
     /// Searchers constructed so far — see [`AlphaBetaEngine::searchers_built`].
@@ -133,7 +175,18 @@ impl AlphaBetaEngine {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                return self.fresh(state).search_with_deadline(state, deadline);
+                // A held lock *is* the signal that a superseded search is still
+                // running: it cannot be interrupted, so it keeps its table until
+                // its own deadline. This search gets a small one so the two
+                // cannot add up to two full working sets, and it is never
+                // cached — the searcher that owns the lock is the one that
+                // should stay warm.
+                let options = SearchOptions {
+                    tt_log2: CONTENDED_TT_LOG2,
+                    ..self.options
+                };
+                self.built.fetch_add(1, Ordering::SeqCst);
+                return Searcher::new(state, options).search_with_deadline(state, deadline);
             }
         };
         // The cached shape, not the position's own: comparing the position with
@@ -491,6 +544,55 @@ pub(crate) mod tests {
                 "{rows}x{cols} {players}p threw its warm table away mid-turn"
             );
         }
+    }
+
+    /// Two searches at once must both answer, and neither may wait for the
+    /// other.
+    ///
+    /// This is the liveness half of the cancellation story. The client cancels a
+    /// superseded search and immediately dispatches a new one, but
+    /// `virus-search` cannot be interrupted, so the old search keeps running —
+    /// and it holds the cache lock while it does. If the new search *queued* on
+    /// that lock it would inherit the dead position's remaining budget, answer
+    /// late, and the client would play its pre-selected fallback instead. A
+    /// forfeit-adjacent failure, so the lock is only ever tried.
+    #[test]
+    fn a_second_concurrent_search_answers_without_waiting_for_the_first() {
+        use std::sync::Arc;
+
+        let engine = Arc::new(AlphaBetaEngine::new());
+        let state = past_the_book(12, 12, 2);
+
+        // The slow one holds the lock for most of a second.
+        let long = {
+            let engine = Arc::clone(&engine);
+            let state = state.clone();
+            std::thread::spawn(move || engine.choose(&state, &budget(800)).map(|out| out.action))
+        };
+        // Give it time to take the lock, then race a short search past it.
+        std::thread::sleep(Duration::from_millis(120));
+        let started = Instant::now();
+        let quick = engine
+            .choose(&state, &budget(100))
+            .expect("the contended search still answers");
+        let waited = started.elapsed();
+
+        assert!(
+            state.apply(quick.action).is_ok(),
+            "the contended search returned an illegal action"
+        );
+        assert!(
+            waited < Duration::from_millis(500),
+            "the second search waited {waited:?} for the first — it queued on the lock \
+             instead of building its own searcher"
+        );
+        let slow = long.join().expect("the first search survived");
+        assert!(slow.is_some_and(|action| state.apply(action).is_ok()));
+        assert_eq!(
+            engine.searchers_built(),
+            2,
+            "the contended search must build its own searcher, not share one"
+        );
     }
 
     /// The other seat of the same board is a different searcher: root-relative
