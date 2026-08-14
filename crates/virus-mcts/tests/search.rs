@@ -446,6 +446,162 @@ fn visit_sampling_picks_legal_actions_and_follows_the_seed() {
     assert_eq!(sample(3), sample(3), "sampling is reproducible per seed");
 }
 
+// ------------------------------------------------------- DAG transpositions
+//
+// The structural claims (one node per position, pooled statistics, an index
+// that survives a re-root) are unit tests in `src/search.rs`, where the arena
+// is visible. What belongs out here is the *contract*: with a net in the loop
+// and through the public API only, does the DAG stay deterministic, stay legal,
+// and actually merge anything?
+
+fn dag(on: bool) -> Config {
+    Config {
+        value_source: ValueSource::Net,
+        dag: on,
+        ..Config::play()
+    }
+}
+
+/// The S3-T2 determinism bar: `batch_size: 1`, fixed seed, twice.
+///
+/// The transposition index is a `HashMap`, and a `HashMap` is the classic way
+/// to smuggle run-to-run variation into something that looks pure. This crate's
+/// index is keyed with a fixed, stateless hasher and is never iterated, so a
+/// repeat run must reproduce not only the move but the whole tree — right down
+/// to how many merges it made.
+#[test]
+fn a_dag_search_is_byte_stable_at_batch_size_one() {
+    let net = champion();
+    let config = Config {
+        batch_size: 1,
+        ..dag(true)
+    };
+    let a = run(midgame(), config, Some(&net), 400);
+    let b = run(midgame(), config, Some(&net), 400);
+    assert_eq!(a.root_visits(), b.root_visits(), "same seed, same tree");
+    assert_eq!(a.root_actions(), b.root_actions());
+    assert_eq!(a.best_action(), b.best_action());
+    assert_eq!(
+        a.root_value_abs().to_bits(),
+        b.root_value_abs().to_bits(),
+        "root value is bit-identical, not merely close"
+    );
+    assert_eq!(a.node_count(), b.node_count());
+    assert_eq!(a.merges(), b.merges(), "the merge count itself is stable");
+    assert!(
+        a.merges() > 0,
+        "nothing merged — determinism proved nothing"
+    );
+}
+
+/// The batched DAG is deterministic too, at every batch size.
+#[test]
+fn a_batched_dag_search_is_deterministic() {
+    let net = champion();
+    for batch_size in [1u16, 8, 16] {
+        let config = Config {
+            batch_size,
+            ..dag(true)
+        };
+        let a = run(midgame(), config, Some(&net), 240);
+        let b = run(midgame(), config, Some(&net), 240);
+        assert_eq!(a.root_visits(), b.root_visits(), "batch {batch_size}");
+        assert_eq!(
+            a.root_value_abs().to_bits(),
+            b.root_value_abs().to_bits(),
+            "batch {batch_size}: root value differs in the last bits"
+        );
+        assert_eq!(a.merges(), b.merges(), "batch {batch_size}");
+    }
+}
+
+/// Turning the flag off must give back the tree searcher exactly: no index, no
+/// merges, nothing to pay for.
+#[test]
+fn the_dag_is_genuinely_opt_out() {
+    let net = champion();
+    let plain = run(midgame(), dag(false), Some(&net), 300);
+    assert_eq!(plain.merges(), 0);
+    assert_eq!(plain.key_collisions(), 0);
+
+    let merged = run(midgame(), dag(true), Some(&net), 300);
+    assert!(
+        merged.merges() > 0,
+        "the two arms are indistinguishable — the flag does nothing"
+    );
+}
+
+/// Whatever the DAG does to the tree, the move it returns is legal and the
+/// value stays in range — the two things a caller is entitled to.
+#[test]
+fn a_dag_search_still_answers_legally() {
+    let net = champion();
+    let state = midgame();
+    let legal = state.legal_actions();
+    for batch_size in [1u16, 8] {
+        let mut searcher = MctsSearcher::new(
+            state.clone(),
+            Config {
+                batch_size,
+                ..dag(true)
+            },
+            Some(&net),
+        );
+        searcher.run_sims(300);
+        let action = searcher
+            .best_action()
+            .expect("a non-terminal root has a move");
+        assert!(
+            legal.contains(&action),
+            "batch {batch_size}: played an illegal action {action:?}"
+        );
+        assert!(searcher.root_value_abs().abs() <= 1.0);
+        assert_eq!(
+            searcher
+                .root_visits()
+                .iter()
+                .map(|n| u64::from(*n))
+                .sum::<u64>(),
+            searcher.sims_run(),
+            "batch {batch_size}: every simulation must land on a root edge"
+        );
+    }
+}
+
+/// The ponder path (PR #21) drives `rebase` and then asserts the tree is rooted
+/// where it thinks it is, using `root_state()`. A DAG must not disturb that.
+#[test]
+fn re_rooting_a_dag_keeps_the_tree_rooted_where_the_caller_thinks() {
+    let net = champion();
+    let root = midgame();
+    let mut searcher = MctsSearcher::new(root.clone(), dag(true), Some(&net));
+    searcher.run_sims(600);
+    assert!(searcher.merges() > 0);
+
+    let mut expected = root;
+    // Three actions is a whole turn, which is exactly the span over which the
+    // permutations that got merged live.
+    for _ in 0..3 {
+        let Some(action) = searcher.best_action() else {
+            break;
+        };
+        let next = expected.apply(action).expect("a searched action is legal");
+        assert!(searcher.rebase(action), "the searched child must exist");
+        expected = next;
+        assert_eq!(
+            searcher.root_state(),
+            &expected,
+            "the tree must be rooted at the position the action reaches"
+        );
+        assert_eq!(
+            searcher.root_state().hash(),
+            expected.hash(),
+            "invariant 6: `tree_is_rooted_at` compares these first"
+        );
+        searcher.run_sims(200);
+    }
+}
+
 // ---------------------------------------------------------------- action ids
 
 #[test]

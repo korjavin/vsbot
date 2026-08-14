@@ -54,5 +54,5 @@ pub use parallel::ParallelMcts;
 pub use rng::Rng;
 pub use search::{
     terminal_value_abs, Config, MctsSearcher, ValueSource, DEFAULT_BATCH_SIZE, DEFAULT_CPUCT,
-    DEFAULT_VALUE_SCALE, DEFAULT_VIRTUAL_LOSS, TEMPERATURE_PLIES,
+    DEFAULT_DAG, DEFAULT_VALUE_SCALE, DEFAULT_VIRTUAL_LOSS, TEMPERATURE_PLIES,
 };

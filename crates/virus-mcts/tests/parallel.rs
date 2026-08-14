@@ -43,11 +43,21 @@ fn midgame() -> State {
     State::from_grid(12, 12, 2, &cells, 1, 3, &[false, false]).expect("legal midgame")
 }
 
+/// `dag: false` throughout this file, deliberately.
+///
+/// `ParallelMcts` does not merge transpositions — the shared tree indexes its
+/// nodes by `Arc` identity, and a concurrent transposition index is its own
+/// piece of work — so it *ignores* [`Config::dag`], the mirror of
+/// `MctsSearcher` ignoring `Config::threads`. The bit-equality test below
+/// therefore has to ask the serial searcher for the same tree the parallel one
+/// can build. Turning it off here rather than papering over the difference
+/// keeps that test doing its job: it fails if the two PUCT formulas drift.
 fn config(batch: u16, threads: usize) -> Config {
     Config {
         value_source: ValueSource::Net,
         batch_size: batch,
         threads,
+        dag: false,
         ..Config::play()
     }
 }

@@ -188,6 +188,60 @@ fn main() {
     }
     println!();
 
+    // --- 4b. DAG transpositions, the S3-T2 sim-savings table ---
+    //
+    // Two different savings, and they are not the same number:
+    //
+    // * **duplicates** — expansions the plain tree spent on a position it had
+    //   already evaluated elsewhere in the tree. The DAG's arena is
+    //   duplicate-free by construction, so this column is the sim saving. At
+    //   `batch_size == 1` both arms hold `sims + 1` nodes; the difference is
+    //   what those nodes *are*.
+    // * **nodes** — under a batch, a merged node reached twice inside one round
+    //   is `pending` the second time and evaluated once, so the DAG's arena is
+    //   genuinely smaller as well.
+    //
+    // sims/s is reported alongside because the index is not free: it costs a
+    // key lookup per child creation, against whatever the reuse saves.
+    println!(
+        "{:<28} {:>9} {:>9} {:>9} {:>8} {:>11}",
+        "DAG sweep", "nodes", "distinct", "dup", "merges", "sims/s"
+    );
+    for batch in [1u16, 8] {
+        for dag in [false, true] {
+            let config = Config {
+                value_source: ValueSource::Net,
+                batch_size: batch,
+                dag,
+                ..Config::play()
+            };
+            MctsSearcher::new(state.clone(), config, Some(&net)).run_sims(100);
+            let mut rates = Vec::with_capacity(REPEATS);
+            let mut last = None;
+            for _ in 0..REPEATS {
+                let mut searcher = MctsSearcher::new(state.clone(), config, Some(&net));
+                let start = Instant::now();
+                searcher.run_sims(sims);
+                let elapsed = start.elapsed();
+                black_box(searcher.best_action());
+                rates.push(f64::from(sims) / elapsed.as_secs_f64());
+                last = Some(searcher);
+            }
+            rates.sort_by(f64::total_cmp);
+            let searcher = last.expect("REPEATS is non-zero");
+            let distinct = searcher.distinct_positions();
+            println!(
+                "  B={batch:<3} DAG {:<3}              {:>9} {distinct:>9} {:>9} {:>8} {:>11.0}",
+                if dag { "on" } else { "off" },
+                searcher.node_count(),
+                searcher.node_count() - distinct,
+                searcher.merges(),
+                rates[REPEATS / 2],
+            );
+        }
+    }
+    println!();
+
     // --- 5. threads, over the shared tree ---
     let available = std::thread::available_parallelism().map_or(1, |n| n.get());
     for threads in [1usize, 2, 3, 4, 6, 8] {
