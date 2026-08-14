@@ -40,7 +40,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use virus_mcts::PolicyValueNet;
-use virus_selfplay::{generate, GameConfig, Options, DEFAULT_MAX_TURNS, DEFAULT_SIMS};
+use virus_selfplay::{
+    generate, GameConfig, Options, ResignConfig, DEFAULT_MAX_TURNS, DEFAULT_SIMS,
+};
 
 const USAGE: &str = "\
 selfplay — MCTS self-play generator emitting SelfPlayMcts training rows
@@ -69,6 +71,24 @@ NET:
     --value-scale <F>    hand-tuned leaf tanh divisor [default: 12000]
     --batch <N>          leaves per batched net evaluation [default: 8]
 
+RESIGN (off unless --resign-threshold / RESIGN_THRESHOLD is given):
+    --resign-threshold <F>     resign a side once the absolute-frame root
+                               value has been beyond F against it for
+                               --resign-plies of its own plies. This flag is
+                               the on switch [suggested: 0.95]
+    --resign-plies <N>         consecutive hopeless plies BY THE RESIGNING
+                               SIDE; the opponent's plies in between do not
+                               reset the count [default: 8]
+    --resign-control-frac <F>  share of games that ignore the rule and play
+                               out, so the false-resign rate is measurable
+                               [default: 0.1]
+
+    Each has an env equivalent (RESIGN_THRESHOLD, RESIGN_PLIES,
+    RESIGN_CONTROL_FRAC); the flag wins when both are set. The other two are
+    an error without a threshold rather than a silent no-op — a generation
+    that ran RESIGN_PLIES=4 and quietly resigned nothing is the failure this
+    binary refuses unknown flags to avoid.
+
 OUTPUT:
     --out <PATH>         JSONL destination [default: - for stdout]
     -h, --help           this text
@@ -76,6 +96,10 @@ OUTPUT:
 Dirichlet root noise is always on and temperature-1 visit sampling always
 covers the first 21 plies: this binary only generates self-play, and both are
 what makes self-play data worth training on.
+
+Resignation is OFF by default and must stay off until a measurement run shows
+a false-resign rate under 5 %: it trades a correct label for a shorter game,
+and the control arm is the only thing that says which way that trade went.
 ";
 
 struct Args {
@@ -102,6 +126,78 @@ where
         .map_err(|error| format!("{what}: {error} (got {text:?})"))
 }
 
+/// A resign setting from the environment, or `None` when the variable is unset
+/// or empty.
+///
+/// An empty value reads as unset so that `RESIGN_THRESHOLD= selfplay ...` turns
+/// the feature off rather than failing to parse — the shape a generation script
+/// writes when it wants to clear an inherited setting.
+fn env_number<T>(name: &str) -> Result<Option<T>, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(name) {
+        Ok(text) if !text.trim().is_empty() => number(text.trim(), name).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Resign settings as the command line and environment left them: `threshold`
+/// present is the on switch, the other two only refine it.
+#[derive(Default)]
+struct ResignArgs {
+    threshold: Option<f64>,
+    plies: Option<u32>,
+    control_frac: Option<f64>,
+}
+
+impl ResignArgs {
+    /// Environment first, so a flag of the same name can overwrite it.
+    fn from_env() -> Result<ResignArgs, String> {
+        Ok(ResignArgs {
+            threshold: env_number("RESIGN_THRESHOLD")?,
+            plies: env_number("RESIGN_PLIES")?,
+            control_frac: env_number("RESIGN_CONTROL_FRAC")?,
+        })
+    }
+
+    fn resolve(self) -> Result<Option<ResignConfig>, String> {
+        let Some(threshold) = self.threshold else {
+            if self.plies.is_some() || self.control_frac.is_some() {
+                return Err("--resign-plies/--resign-control-frac (or RESIGN_PLIES/\
+                            RESIGN_CONTROL_FRAC) were set without a resign threshold, \
+                            so resignation would have stayed off. Pass \
+                            --resign-threshold 0.95 to turn it on."
+                    .to_owned());
+            }
+            return Ok(None);
+        };
+        let defaults = ResignConfig::default();
+        let config = ResignConfig {
+            threshold,
+            plies: self.plies.unwrap_or(defaults.plies),
+            control_frac: self.control_frac.unwrap_or(defaults.control_frac),
+        };
+        if !(0.0..=1.0).contains(&config.threshold) || config.threshold == 0.0 {
+            return Err(format!(
+                "--resign-threshold must be in (0, 1], got {}",
+                config.threshold
+            ));
+        }
+        if config.plies == 0 {
+            return Err("--resign-plies must be at least 1".to_owned());
+        }
+        if !(0.0..=1.0).contains(&config.control_frac) {
+            return Err(format!(
+                "--resign-control-frac must be in [0, 1], got {}",
+                config.control_frac
+            ));
+        }
+        Ok(Some(config))
+    }
+}
+
 fn parse() -> Result<Option<Args>, String> {
     let mut args = Args {
         options: Options::default(),
@@ -113,6 +209,7 @@ fn parse() -> Result<Option<Args>, String> {
         max_turns: DEFAULT_MAX_TURNS,
         ..GameConfig::default()
     };
+    let mut resign = ResignArgs::from_env()?;
 
     let mut raw = std::env::args().skip(1);
     while let Some(flag) = raw.next() {
@@ -132,6 +229,13 @@ fn parse() -> Result<Option<Args>, String> {
             "--cpuct" => args.options.game.cpuct = number(&value()?, "--cpuct")?,
             "--value-scale" => {
                 args.options.game.value_scale = number(&value()?, "--value-scale")?;
+            }
+            "--resign-threshold" => {
+                resign.threshold = Some(number(&value()?, "--resign-threshold")?);
+            }
+            "--resign-plies" => resign.plies = Some(number(&value()?, "--resign-plies")?),
+            "--resign-control-frac" => {
+                resign.control_frac = Some(number(&value()?, "--resign-control-frac")?);
             }
             "--net" => args.net = Some(PathBuf::from(value()?)),
             "--no-net" => args.net = None,
@@ -159,6 +263,7 @@ fn parse() -> Result<Option<Args>, String> {
     if args.options.game.sims == 0 {
         return Err("--sims must be at least 1".to_owned());
     }
+    args.options.game.resign = resign.resolve()?;
     Ok(Some(args))
 }
 
@@ -174,7 +279,7 @@ fn run(args: Args) -> Result<(), String> {
     // The banner goes to stderr so `--out -` stays a clean JSONL stream that a
     // caller can pipe straight into the validator.
     eprintln!(
-        "shard {}/{}: games {}, sims {}, seed {}, net {}",
+        "shard {}/{}: games {}, sims {}, seed {}, net {}, resign {}",
         args.options.shard_idx,
         args.options.shard_count,
         args.options.games,
@@ -183,6 +288,15 @@ fn run(args: Args) -> Result<(), String> {
         args.net
             .as_ref()
             .map_or_else(|| "hand-tuned".to_owned(), |p| p.display().to_string()),
+        args.options.game.resign.map_or_else(
+            || "off".to_owned(),
+            |r| format!(
+                "|v|>{} for {} plies, {:.0}% control",
+                r.threshold,
+                r.plies,
+                r.control_frac * 100.0
+            )
+        ),
     );
 
     let stats = match &args.out {
@@ -228,6 +342,51 @@ fn run(args: Args) -> Result<(), String> {
         per_game,
         if per_game > 0.0 { 3600.0 / per_game } else { 0.0 },
     );
+
+    // The resign report is the deliverable of a measurement run, so it is
+    // printed whether or not the rule fired: "0 resigned, 0 would have" is a
+    // result, and a run that printed nothing would be indistinguishable from
+    // one where the flag never reached the config.
+    if args.options.game.resign.is_some() {
+        let percent = |part: u64, whole: u64| {
+            if whole == 0 {
+                f64::NAN
+            } else {
+                100.0 * part as f64 / whole as f64
+            }
+        };
+        let resign_arm = stats.games - stats.control;
+        eprintln!(
+            "shard {}/{}: resign arm {} games, {} resigned ({:.1}%); control arm {} games, \
+             {} would have resigned ({:.1}%), {} of those were WRONG -> false-resign {:.1}% \
+             (bar: <5%); mean plies saved {:.1}, searches saved {}/{} = {:.1}% projected \
+             generation throughput gain {:.1}%",
+            args.options.shard_idx,
+            args.options.shard_count,
+            resign_arm,
+            stats.resigned,
+            percent(stats.resigned, resign_arm),
+            stats.control,
+            stats.control_would_resign,
+            percent(stats.control_would_resign, stats.control),
+            stats.control_false_resign,
+            stats.false_resign_rate().map_or(f64::NAN, |r| r * 100.0),
+            if stats.control_would_resign == 0 {
+                0.0
+            } else {
+                stats.control_plies_saved as f64 / stats.control_would_resign as f64
+            },
+            stats.control_searches_saved,
+            stats.control_searches,
+            stats
+                .projected_search_saving()
+                .map_or(f64::NAN, |r| r * 100.0),
+            // Saving s of the work means the same budget buys 1/(1-s) games.
+            stats
+                .projected_search_saving()
+                .map_or(f64::NAN, |s| (1.0 / (1.0 - s) - 1.0) * 100.0),
+        );
+    }
     Ok(())
 }
 
