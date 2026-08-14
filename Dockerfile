@@ -25,9 +25,14 @@ COPY crates/virus-search/Cargo.toml crates/virus-search/Cargo.toml
 COPY crates/virus-mcts/Cargo.toml   crates/virus-mcts/Cargo.toml
 COPY crates/virus-proto/Cargo.toml  crates/virus-proto/Cargo.toml
 COPY crates/virus-arena/Cargo.toml  crates/virus-arena/Cargo.toml
+COPY crates/virus-selfplay/Cargo.toml crates/virus-selfplay/Cargo.toml
 COPY crates/vsbot/Cargo.toml        crates/vsbot/Cargo.toml
+# Every workspace member's manifest must be present before cargo will load the
+# workspace at all — even the members this image never builds. A new crate that
+# is not listed here fails the stub layer with "failed to load manifest for
+# workspace member", which is a confusing way to learn about a two-line omission.
 RUN set -eux; \
-    for lib in virus-core virus-eval virus-search virus-mcts virus-proto virus-arena; do \
+    for lib in virus-core virus-eval virus-search virus-mcts virus-proto virus-arena virus-selfplay; do \
         mkdir -p "crates/$lib/src"; \
         : > "crates/$lib/src/lib.rs"; \
     done; \

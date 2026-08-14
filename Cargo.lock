@@ -648,6 +648,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "virus-selfplay"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "virus-core",
+ "virus-mcts",
+]
+
+[[package]]
 name = "vsbot"
 version = "0.1.0"
 dependencies = [

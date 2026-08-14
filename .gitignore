@@ -1,5 +1,9 @@
 /target
 **/target
+# Self-play generations: `trainer/README.md` puts them under work/mcts-rl and
+# the `selfplay` binary writes them there. A generation is hundreds of MB of
+# JSONL and is reproducible from (net, seed) — it is output, not source.
+/work
 Cargo.lock.orig
 *.log
 .env
