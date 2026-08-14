@@ -89,7 +89,9 @@ Cargo.toml for why that refusal is right and why this exists anyway.
 
 // Arena's own defaults, named here so a drift between the two harnesses would
 // be a compile-time import error rather than a silent difference in numbers.
-use virus_arena::gauntlet::{DEFAULT_EPSILON, DEFAULT_EXPLORE_TURNS, DEFAULT_MAX_TURNS};
+use virus_arena::gauntlet::{
+    GauntletConfig, DEFAULT_EPSILON, DEFAULT_EXPLORE_TURNS, DEFAULT_MAX_TURNS,
+};
 
 struct Args {
     a_net: String,
@@ -170,6 +172,32 @@ fn parse() -> Result<Option<Args>, String> {
         return Err("--sims 0: a side that never searches is not an engine".to_owned());
     }
     Ok(Some(args))
+}
+
+/// Runs every check `arena` runs, by building the config `arena` would build
+/// and asking it.
+///
+/// Reused rather than reimplemented for the same reason `engine::build` is:
+/// `GauntletConfig::validate` rejects zero games, an out-of-range epsilon, a
+/// zero turn cap and — the one most likely to bite here — a board that is not
+/// 12x12 when a net is playing, which would otherwise panic inside a worker
+/// and surface only as "a worker panicked". `--games 0` in particular would
+/// otherwise exit 0 having printed `RESULT ... n=0`, and the generation script
+/// would stamp its gauntlet stage complete on a tally that does not exist.
+fn validate(args: &Args, spec: &SideSpec) -> Result<(), SpecError> {
+    GauntletConfig {
+        side_a: spec.clone(),
+        side_b: spec.clone(),
+        games: args.games,
+        seed: args.seed,
+        rows: args.rows,
+        cols: args.cols,
+        max_turns: args.max_turns,
+        epsilon: args.epsilon,
+        explore_turns: args.explore_turns,
+        threads: args.jobs,
+    }
+    .validate()
 }
 
 /// How a game ended. Kept separate from the winner so a report can say whether
@@ -306,11 +334,14 @@ fn real_main() -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     };
 
-    let net_a = PolicyValueNet::load(&args.a_net).map_err(|e| format!("--a-net {}: {e}", args.a_net))?;
-    let net_b = PolicyValueNet::load(&args.b_net).map_err(|e| format!("--b-net {}: {e}", args.b_net))?;
+    let net_a =
+        PolicyValueNet::load(&args.a_net).map_err(|e| format!("--a-net {}: {e}", args.a_net))?;
+    let net_b =
+        PolicyValueNet::load(&args.b_net).map_err(|e| format!("--b-net {}: {e}", args.b_net))?;
     // `mcts` with no `:path`: the artifact comes from `engine::build`'s `net`
     // argument, which is where the two sides diverge.
     let spec = SideSpec::parse("mcts", Budget::Nodes(args.sims)).map_err(|e| e.0)?;
+    validate(&args, &spec).map_err(|e| e.0)?;
 
     let games = args.games.div_ceil(2) * 2;
     eprintln!(
@@ -416,7 +447,9 @@ fn real_main() -> Result<ExitCode, String> {
     );
 
     if stalled > 0 {
-        eprintln!("netgauntlet: WARNING — {stalled} game(s) stalled; this tally is not trustworthy");
+        eprintln!(
+            "netgauntlet: WARNING — {stalled} game(s) stalled; this tally is not trustworthy"
+        );
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)

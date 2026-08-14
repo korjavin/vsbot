@@ -139,15 +139,26 @@ CAND="$GDIR/candidate.json"
 ROWS="$GDIR/selfplay.jsonl"
 REPORT="$GDIR/report.md"
 
-# The champion is copied into $WORK once and read from there afterwards, so a
-# generation is reproducible from its own directory even after artifacts/ moves
-# on — and so the gauntlet cannot accidentally gate against a champion that was
-# swapped mid-run.
-CHAMP="$WORK/champion.json"
+# Per-generation champion snapshot. Taken once per generation, so a run
+# interrupted after self-play still gates against exactly the net its games were
+# played with even if `artifacts/` moved underneath it — and re-taken for the
+# NEXT generation, so a champion promoted by the canary pipeline is picked up.
+#
+# A single `$WORK/champion.json` shared by every generation had the second half
+# of that backwards: it was written once, ever, so after a promotion each later
+# generation kept self-playing and gating against the first champion the box had
+# ever seen, silently, with $CHAMPION pointing at the right file the whole time.
+CHAMP="$GDIR/champion.json"
 if [ ! -f "$CHAMP" ]; then
   [ -f "$CHAMPION" ] || die "no champion at $CHAMPION"
   cp "$CHAMPION" "$CHAMP"
+elif ! cmp -s "$CHAMP" "$CHAMPION"; then
+  # Not fatal: a resumed run MUST keep its snapshot. But say so, because the
+  # alternative is a report that names a champion the generation never played.
+  echo "NOTE: gen $GEN's champion snapshot differs from $CHAMPION — keeping the"
+  echo "      snapshot this generation started with. Bump GEN for a new champion."
 fi
+CHAMP_SHA="$(sha256sum "$CHAMP" | cut -c1-12)"
 
 SELFPLAY_BIN="$ROOT/target/release/selfplay"
 NETGAUNTLET_BIN="$ROOT/trainer/netgauntlet/target/release/netgauntlet"
@@ -213,7 +224,7 @@ stage_selfplay() {
   python3 "$ROOT/trainer/validate_rows.py" "$ROWS" \
     || die "row contract violated — the emitter and the trainer disagree; do NOT train on these"
 
-  ran selfplay "| self-play | $SELFPLAY_GAMES games, $SIMS sims/action, $SHARDS shards, seed $SELFPLAY_SEED, net \`$(basename "$CHAMP")\`, $(wc -l < "$ROWS" | tr -d ' ') rows, \`validate_rows.py\` clean |"
+  ran selfplay "| self-play | $SELFPLAY_GAMES games, $SIMS sims/action, $SHARDS shards, seed $SELFPLAY_SEED, champion \`$CHAMPION\` (sha256 $CHAMP_SHA), $(wc -l < "$ROWS" | tr -d ' ') rows, \`validate_rows.py\` clean |"
 }
 
 # ---------------------------------------------------------------- 2. train
@@ -237,9 +248,15 @@ stage_train() {
 
   rm -f "$CAND"
   # shellcheck disable=SC2086
+  # PYTHONUNBUFFERED because this stage runs for an hour on a real generation
+  # and python block-buffers stdout when it is a pipe: without it the epoch
+  # lines sit in the container's buffer until exit, so an interrupted run leaves
+  # an EMPTY train.log and the holdout curves — the diagnosis for a kept-back
+  # candidate — are gone. Learned the hard way on gen 6.
   docker run --rm \
     --user "$(id -u):$(id -g)" \
     --cpus "$JOBS" \
+    -e PYTHONUNBUFFERED=1 \
     -v "$TRAINER_HOME":/trainer:ro \
     -v "$WORK":/work \
     "$IMAGE" \
