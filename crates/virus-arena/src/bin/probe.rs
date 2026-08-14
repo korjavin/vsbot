@@ -296,8 +296,19 @@ fn mine_db(args: &[String]) -> Result<(), Failure> {
     )?;
     let games_path = PathBuf::from(flags.required("--games")?);
     let out_path = PathBuf::from(flags.required("--out")?);
+    let horizon = flags.number("--horizon", 4u32)?;
+    // `mine_games` clamps this defensively, but a typo that silently became a
+    // different measurement is exactly the failure mode this crate exists to
+    // prevent: say so instead.
+    if horizon == 0 {
+        return Err(Failure(
+            "--horizon 0 measures nothing; the swing needs at least one \
+             follow-up turn of the mover's own"
+                .to_owned(),
+        ));
+    }
     let config = MineConfig {
-        horizon: flags.number("--horizon", 4u32)?,
+        horizon,
         min_swing: flags.number("--min-swing", 4i64)?,
         max_suspect: flags.number("--max-suspect", 30usize)?,
         max_control: flags.number("--max-control", 8usize)?,

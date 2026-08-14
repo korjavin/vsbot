@@ -430,6 +430,9 @@ pub struct MineStats {
     /// Neutral placements the placer lost with a swing shallower than
     /// `min_swing`: too flat to call suspect, and not a control either.
     pub dropped_flat: usize,
+    /// Neutral placements in a game whose recorded `result` names no winner:
+    /// both classes are defined by the outcome, so there is nothing to label.
+    pub dropped_no_winner: usize,
     /// Labelled placements dropped as a repeat of a position already kept.
     ///
     /// Not a rounding error: the corpus is mostly deterministic bots, which
@@ -510,6 +513,15 @@ fn initial_board(rows: usize, cols: usize) -> Vec<Cell> {
     board[0] = Cell::new(1, CellKind::Base);
     board[rows * cols - 1] = Cell::new(2, CellKind::Base);
     board
+}
+
+/// Whether `mover` won a game whose recorded `result` names a real seat, or
+/// `None` when the recording names no winner.
+fn decided(result: i32, mover: Player) -> Option<bool> {
+    match result {
+        1 | 2 => Some(result == mover as i32),
+        _ => None,
+    }
 }
 
 /// `owned_cells(mover) - owned_cells(opponent)`.
@@ -612,9 +624,20 @@ pub fn mine_games(
                 stats.dropped_short_horizon += 1;
                 continue;
             }
-            let horizon = (config.horizon as usize).min(later.len());
+            // Both classes are defined by who won, so a game with no winner
+            // recorded — `games.result` is 0 for a draw, an abandoned game, or
+            // one the recorder never resolved — cannot be labelled at all.
+            // Reading `result != mover` as "the placer lost" would file every
+            // such position under `LostAdvantage`, which is the one thing the
+            // class is documented not to contain.
+            let Some(placer_won) = decided(game.result, mover) else {
+                stats.dropped_no_winner += 1;
+                continue;
+            };
+            // `min(1)` on the horizon, not just on `later.len()`: `--horizon 0`
+            // is a legal thing to type and must not index `later[-1]`.
+            let horizon = (config.horizon.max(1) as usize).min(later.len());
             let after = later[horizon - 1];
-            let placer_won = game.result == mover as i32;
             let labels = label(
                 &position.state,
                 Some(&later[0].state),
@@ -710,6 +733,12 @@ fn take(
     };
     let mut kept = Vec::new();
     for candidate in ordered {
+        // Checked before the push, not after: `--max-control 0` is how a
+        // caller asks for no control group, and a post-push `== limit` would
+        // never fire and hand back every candidate instead of none.
+        if kept.len() >= limit {
+            break;
+        }
         if candidate.record.class != wanted {
             continue;
         }
@@ -718,9 +747,6 @@ fn take(
             continue;
         }
         kept.push(candidate.record.clone());
-        if kept.len() == limit {
-            break;
-        }
     }
     kept
 }
@@ -1427,6 +1453,111 @@ mod tests {
         // `movesLeft` is 2, so the position cannot host a neutral decision and
         // must not silently enter a probe set.
         assert!(record.state().is_err());
+    }
+
+    /// One placed cell, as the dump records it.
+    fn mv(row: i32, col: i32) -> DumpMove {
+        DumpMove {
+            kind: "move".to_owned(),
+            cells: vec![[row, col]],
+        }
+    }
+
+    /// A complete two-player game in which seat 2 places neutrals on turn 4
+    /// and then keeps losing ground. Seat 2 has two further turns of its own,
+    /// which is what the horizon needs.
+    fn game_with_a_neutral(result: i32) -> DumpGame {
+        let turn = |turn: u32, player: Player, moves: Vec<DumpMove>| DumpTurn {
+            turn,
+            player,
+            moves,
+        };
+        DumpGame {
+            id: "test-neutral-0001".to_owned(),
+            started_at: "2026-08-01 00:00:00".to_owned(),
+            rows: 12,
+            cols: 12,
+            players: vec!["A".to_owned(), "B".to_owned()],
+            result,
+            termination: "no_moves".to_owned(),
+            turns: vec![
+                turn(1, 1, vec![mv(1, 1), mv(2, 2), mv(3, 3)]),
+                turn(2, 2, vec![mv(10, 10), mv(9, 9), mv(8, 8)]),
+                turn(3, 1, vec![mv(4, 4), mv(5, 5), mv(6, 6)]),
+                turn(
+                    4,
+                    2,
+                    vec![DumpMove {
+                        kind: "neutrals".to_owned(),
+                        cells: vec![[10, 10], [9, 9]],
+                    }],
+                ),
+                turn(5, 1, vec![mv(7, 7), mv(4, 3), mv(3, 4)]),
+                turn(6, 2, vec![mv(10, 11), mv(11, 10), mv(9, 10)]),
+                turn(7, 1, vec![mv(7, 6), mv(6, 7), mv(8, 7)]),
+                turn(8, 2, vec![mv(11, 9), mv(10, 9), mv(11, 8)]),
+            ],
+        }
+    }
+
+    fn mine_config() -> MineConfig {
+        MineConfig {
+            horizon: 4,
+            min_swing: 4,
+            max_suspect: 10,
+            max_control: 10,
+        }
+    }
+
+    #[test]
+    fn a_lost_neutral_placement_is_mined_as_a_suspect() {
+        let (records, stats) = mine_games(&[game_with_a_neutral(1)], mine_config(), "unit test");
+        assert_eq!(stats.replayed, 1, "{stats:?}");
+        assert_eq!(stats.neutral_turns, 1, "{stats:?}");
+        assert_eq!(records.len(), 1, "{stats:?}");
+        assert_eq!(records[0].class, ProbeClass::LostAdvantage);
+        assert_eq!(records[0].labels.mover, 2);
+        assert_eq!(records[0].labels.placer_won, Some(false));
+        // The action's mechanical price is recorded separately from the swing.
+        assert!(records[0].labels.immediate_cost.unwrap() < 0);
+    }
+
+    #[test]
+    fn a_game_with_no_recorded_winner_is_not_labelled_a_loss() {
+        // `games.result == 0` means no winning seat. Reading that as "the
+        // placer lost" would file a draw under `LostAdvantage`, which is the
+        // one thing that class is documented not to contain.
+        let (records, stats) = mine_games(&[game_with_a_neutral(0)], mine_config(), "unit test");
+        assert!(records.is_empty(), "{records:#?}");
+        assert_eq!(stats.dropped_no_winner, 1, "{stats:?}");
+        assert_eq!(stats.dropped_flat, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn a_zero_horizon_does_not_index_off_the_front() {
+        // `--horizon 0` is a legal thing to type; it must clamp, not panic.
+        let config = MineConfig {
+            horizon: 0,
+            ..mine_config()
+        };
+        let (records, _) = mine_games(&[game_with_a_neutral(1)], config, "unit test");
+        let one = MineConfig {
+            horizon: 1,
+            ..mine_config()
+        };
+        let (expected, _) = mine_games(&[game_with_a_neutral(1)], one, "unit test");
+        assert_eq!(records, expected);
+    }
+
+    #[test]
+    fn a_zero_cap_takes_nothing() {
+        let config = MineConfig {
+            max_suspect: 0,
+            max_control: 0,
+            ..mine_config()
+        };
+        let (records, _) = mine_games(&[game_with_a_neutral(1)], config, "unit test");
+        assert!(records.is_empty(), "{records:#?}");
     }
 
     #[test]
