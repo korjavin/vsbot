@@ -329,11 +329,16 @@ fn run(args: Args) -> Result<(), String> {
         stats.seconds / stats.games as f64
     };
     eprintln!(
-        "shard {}/{}: games {}, rows {}, capped {}, outcomes p1={} draw={} p2={}, {:.1}s ({:.1} s/game, {:.1} games/hour)",
+        // `searches` is the run's cost in the only load-independent unit there
+        // is. Two runs over the same games are comparable on it; they are not
+        // comparable on wall clock, which on a shared box mostly measures the
+        // neighbours.
+        "shard {}/{}: games {}, rows {}, searches {}, capped {}, outcomes p1={} draw={} p2={}, {:.1}s ({:.1} s/game, {:.1} games/hour)",
         args.options.shard_idx,
         args.options.shard_count,
         stats.games,
         stats.rows,
+        stats.searches,
         stats.capped,
         stats.outcomes[2],
         stats.outcomes[1],

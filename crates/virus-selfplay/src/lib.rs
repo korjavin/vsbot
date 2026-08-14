@@ -1133,6 +1133,22 @@ mod tests {
     }
 
     #[test]
+    fn the_public_arm_predicate_answers_for_the_actual_run() {
+        // A generation script decides which shard to hand which games by asking
+        // `is_control_game`; if that ever disagreed with the coin the run
+        // itself flips, the script would be reasoning about a different
+        // experiment than the one that ran.
+        let frac = 0.5;
+        let rules = Some(ResignConfig {
+            control_frac: frac,
+            ..eager()
+        });
+        let (stats, _) = tiny_with(0, 1, 16, rules);
+        let predicted = (0..16u64).filter(|g| is_control_game(7, *g, frac)).count() as u64;
+        assert_eq!(stats.control, predicted);
+    }
+
+    #[test]
     fn a_control_game_is_byte_for_byte_the_resign_off_game() {
         // Everything is control, so the rule is evaluated but never acted on.
         let watching = ResignConfig {
