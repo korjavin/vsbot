@@ -29,12 +29,30 @@
 //! | `VSBOT_ITEST_GAUNTLET`   | unset — the ponder gauntlet skips           |
 //! | `VSBOT_ITEST_GAUNTLET_GAMES` | `100` — split across both directions    |
 //! | `VSBOT_ITEST_GAUNTLET_TURN_MS` | `600` — turn budget for the gauntlet  |
+//! | `VSBOT_ITEST_AB_MS`      | `200` — alpha-beta move budget              |
+//! | `VSBOT_ITEST_MP_PLAYERS` | `3` — seats in the multiplayer run (3 or 4) |
 //!
-//! Four scenarios live here. The protocol run pits two instant engines against
+//! Seven scenarios live here. The protocol run pits two instant engines against
 //! each other and is about *ordering*; the MCTS run puts the real champion on
 //! one side and is about the engine adapter — that a searched move survives the
 //! round trip and that the domain guard never lets an out-of-domain position
-//! reach the searcher's asserts. The **ponder soak** is the acceptance gate for
+//! reach the searcher's asserts.
+//!
+//! Three are the acceptance for bd `vsbot-3ss`, and they are about the games the
+//! champion **cannot** play. `SEARCH=ALPHABETA` plays full games on 12x12 and on
+//! a board the champion cannot encode; `SEARCH=MCTS` on a 16x16 board must warn
+//! loudly and then play alpha-beta rather than the greedy reference engine, with
+//! the warning line asserted verbatim; and a three-player lobby game exercises
+//! the max^n path live, which no other scenario here can reach at all.
+//!
+//! ```text
+//! VSBOT_ITEST=1 cargo test -p vsbot --test live_games --release \
+//!   alphabeta -- --nocapture
+//! VSBOT_ITEST=1 cargo test -p vsbot --test live_games --release \
+//!   mcts_falls_back -- --nocapture
+//! ```
+//!
+//! The **ponder soak** is the acceptance gate for
 //! S2's T3: twenty-plus games with `VSBOT_PONDER=true` on one side, asserting
 //! zero forfeits, zero illegal moves, and — the point of the exercise — zero
 //! out-of-turn emissions. The **ponder gauntlet** is the acceptance gate for
@@ -72,9 +90,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use virus_core::{Action, State};
 use virus_proto::{
-    Bot, BotConfig, EngineKind, GreedyEngine, SearchBudget, SearchEngine, SearchOutcome,
+    Bot, BotConfig, Diagnostics, EngineKind, GreedyEngine, Inbound, Outgoing, SearchBudget,
+    SearchEngine, SearchOutcome,
 };
-use vsbot::{build_engine, MctsSettings};
+use vsbot::{build_engine, build_mcts, MctsSettings};
 
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -135,6 +154,7 @@ async fn two_bots_play_full_games_without_a_single_illegal_move() {
         label: "protocol",
         target_games,
         budget: Budget::PerAction(Duration::from_millis(50)),
+        board: CHAMPION_BOARD,
         ponder: PonderSide::Neither,
         timeout: OVERALL_TIMEOUT,
         challenger: Arc::new(GreedyEngine),
@@ -200,6 +220,7 @@ async fn the_mcts_champion_plays_a_full_game_without_a_single_illegal_move() {
         label: "mcts",
         target_games,
         budget: Budget::PerAction(Duration::from_millis(move_millis)),
+        board: CHAMPION_BOARD,
         ponder: PonderSide::Neither,
         timeout: OVERALL_TIMEOUT,
         challenger: setup.engine,
@@ -214,6 +235,183 @@ async fn the_mcts_champion_plays_a_full_game_without_a_single_illegal_move() {
         report.challenger.games_finished,
         report.challenger.actions_sent,
         report.acceptor.actions_sent,
+    );
+}
+
+/// The acceptance gate for `SEARCH=ALPHABETA` (bd `vsbot-3ss`): the enhanced
+/// alpha-beta engine, built through the same [`build_engine`] the binary calls,
+/// plays complete games on the champion's board **and** on a board the champion
+/// cannot encode.
+///
+/// The off-12x12 half is the one that could not be run before this bead. The
+/// server takes its board size from the `challenge` frame, so putting the run on
+/// 16x16 is a two-field change — but until `virus-search` was wired there was no
+/// engine that could answer such a game with anything but "first capture I see".
+///
+/// The proof is the same as every other scenario's: the hub forfeits an illegal
+/// action instantly and logs it, so a completed game with a clean hub log is
+/// evidence that every action the searcher produced was legal in the *server's*
+/// copy of the position, on both board sizes.
+#[allow(clippy::await_holding_lock)] // see the note on the scenario above
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_alphabeta_engine_plays_full_games_on_and_off_the_champion_board() {
+    let Some(_guard) = enabled("alphabeta") else {
+        return;
+    };
+    let target_games: u64 = std::env::var("VSBOT_ITEST_GAMES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let move_millis: u64 = std::env::var("VSBOT_ITEST_AB_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200);
+
+    for (label, board) in [
+        ("alphabeta-12x12", CHAMPION_BOARD),
+        // Deliberately not square and not 12x12: a size assumption that survived
+        // 16x16 by symmetry would still fall over here.
+        ("alphabeta-off-board", (16, 14)),
+    ] {
+        // Exactly what `main` does for `SEARCH=ALPHABETA`. Note what it does
+        // *not* do: no artifact is loaded, because this engine needs none.
+        let setup = build_engine(EngineKind::AlphaBeta, &MctsSettings::default())
+            .expect("SEARCH=ALPHABETA needs no artifact");
+        assert_eq!(setup.engine.name(), "alphabeta");
+        eprintln!("vsbot: {}", setup.description);
+
+        let report = run_scenario(Scenario {
+            label,
+            target_games,
+            budget: Budget::PerAction(Duration::from_millis(move_millis)),
+            board,
+            ponder: PonderSide::Neither,
+            timeout: OVERALL_TIMEOUT,
+            challenger: setup.engine,
+            acceptor: Arc::new(GreedyEngine),
+        })
+        .await;
+
+        report.assert_clean(target_games);
+        assert_board(&report, board);
+        eprintln!(
+            "OK (ALPHABETA {}x{}): {} games at {move_millis}ms/move, alphabeta challenger sent \
+             {} actions, greedy acceptor sent {} actions, 0 illegal moves, 0 server errors",
+            board.0,
+            board.1,
+            report.challenger.games_finished,
+            report.challenger.actions_sent,
+            report.acceptor.actions_sent,
+        );
+    }
+}
+
+/// The other half of bd `vsbot-3ss`: `SEARCH=MCTS` offered a game it cannot
+/// play must **warn loudly and then play alpha-beta**, live, for a whole game.
+///
+/// Three separate things are asserted, because two of them used to hold while
+/// the third silently did not:
+///
+/// * the game completes with no illegal action and no forfeit — the champion's
+///   domain guard still keeps the 12x12-only searcher's asserts off the
+///   blocking worker on a 16x16 board;
+/// * the engine recorded exactly one degradation and its warning line names the
+///   alpha-beta engine — the Java `unwiredEvalWarning` post-mortem is that a
+///   quiet fallback let a run report the wrong engine's results, so the loud
+///   line *is* part of the deliverable and is asserted verbatim rather than
+///   assumed;
+/// * every action came from the search rather than the client's pre-selected
+///   fallback (`fallback_actions == 0`) and carried a real completed depth, so
+///   the degraded game was genuinely played by a searcher.
+#[allow(clippy::await_holding_lock)] // see the note on the scenario above
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcts_falls_back_to_alphabeta_on_a_board_it_cannot_encode() {
+    let Some(_guard) = enabled("mcts-fallback") else {
+        return;
+    };
+    let target_games: u64 = std::env::var("VSBOT_ITEST_GAMES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let move_millis: u64 = std::env::var("VSBOT_ITEST_AB_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200);
+    const BOARD: (usize, usize) = (16, 16);
+
+    // `build_mcts` is the arm `build_engine` calls for `SEARCH=MCTS`; going
+    // through it rather than assembling an engine by hand keeps this a test of
+    // the deployed wiring, while keeping the concrete type so the degradation
+    // bookkeeping can be read afterwards.
+    let engine = build_mcts(&MctsSettings {
+        artifact: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../artifacts/mcts_champion.json"),
+        seed: 1,
+        ponder_trace: tracing(),
+    })
+    .expect("the in-repo champion loads and validates");
+    assert_eq!(engine.degradations(), 0, "nothing has degraded yet");
+    assert_eq!(engine.name(), "mcts");
+
+    let report = run_scenario(Scenario {
+        label: "mcts-fallback",
+        target_games,
+        budget: Budget::PerAction(Duration::from_millis(move_millis)),
+        board: BOARD,
+        ponder: PonderSide::Neither,
+        timeout: OVERALL_TIMEOUT,
+        challenger: engine.clone(),
+        acceptor: Arc::new(GreedyEngine),
+    })
+    .await;
+
+    report.assert_clean(target_games);
+    assert_board(&report, BOARD);
+
+    // The warning, verbatim — what an operator would have seen on stderr.
+    let warning = engine
+        .last_warning()
+        .expect("a 16x16 game must have warned that the champion cannot play it");
+    eprintln!("asserted WARNING line: {warning}");
+    assert!(
+        warning.starts_with("WARNING: SEARCH=MCTS cannot play this game:"),
+        "{warning}"
+    );
+    assert!(warning.contains("2 players on a 16x16 board"), "{warning}");
+    assert!(
+        warning.contains("FALLING BACK TO THE ALPHA-BETA ENGINE (alphabeta)"),
+        "the warning must name the engine that is actually playing: {warning}"
+    );
+    assert!(
+        warning.contains("NOT the champion's"),
+        "the warning must say the moves are not the champion's: {warning}"
+    );
+    assert!(
+        !warning.contains("GREEDY"),
+        "the greedy fallback is what this bead replaced: {warning}"
+    );
+    assert_eq!(
+        engine.degradations(),
+        1,
+        "one board shape, one degradation — the warning is per transition, not per move"
+    );
+
+    // And the degraded game was played by a searcher, not by the client's
+    // pre-selected fallback action.
+    assert_eq!(
+        report.challenger.fallback_actions, 0,
+        "the fallback engine overran its budget {} times on a 16x16 board",
+        report.challenger.fallback_actions
+    );
+    assert!(report.challenger.actions_sent > 0);
+
+    eprintln!(
+        "OK (MCTS -> ALPHABETA on {}x{}): {} games at {move_millis}ms/move, {} actions sent, \
+         {} degradation(s), 0 fallback actions, 0 illegal moves, 0 server errors",
+        BOARD.0,
+        BOARD.1,
+        report.challenger.games_finished,
+        report.challenger.actions_sent,
+        engine.degradations(),
     );
 }
 
@@ -291,6 +489,7 @@ async fn ponder_soak_plays_twenty_games_without_a_forfeit_or_an_out_of_turn_acti
         label: "ponder-soak",
         target_games,
         budget: Budget::PerTurn(Duration::from_millis(turn_millis)),
+        board: CHAMPION_BOARD,
         ponder: PonderSide::Challenger,
         timeout: Duration::from_secs(1800),
         challenger: engine(1),
@@ -401,6 +600,7 @@ async fn ponder_on_is_not_weaker_than_ponder_off_over_a_local_gauntlet() {
             label,
             target_games: per_direction,
             budget: Budget::PerTurn(Duration::from_millis(turn_millis)),
+            board: CHAMPION_BOARD,
             ponder: side,
             timeout: Duration::from_secs(7_200),
             challenger: engine(1),
@@ -535,6 +735,14 @@ struct Scenario {
     label: &'static str,
     target_games: u64,
     budget: Budget,
+    /// Board the challenger asks for, as `(rows, cols)`.
+    ///
+    /// The server takes the size from the `challenge` frame and accepts
+    /// anything from 5x5 to 50x50, so this is the whole of what it takes to put
+    /// a run on a board the champion cannot encode — which is exactly the
+    /// condition the alpha-beta fallback exists for, and the reason it could not
+    /// be tested live before.
+    board: (usize, usize),
     /// Which side ponders. The other side is the control, so one run carries
     /// both the new behaviour and its baseline.
     ponder: PonderSide,
@@ -543,6 +751,9 @@ struct Scenario {
     challenger: Arc<dyn SearchEngine>,
     acceptor: Arc<dyn SearchEngine>,
 }
+
+/// The champion's board. Every scenario that is not about board size uses it.
+const CHAMPION_BOARD: (usize, usize) = (12, 12);
 
 impl Budget {
     fn apply(self, config: &mut BotConfig) {
@@ -628,13 +839,44 @@ impl Report {
     }
 }
 
-/// Builds and starts a server, plays the scenario, and stops the server.
-async fn run_scenario(scenario: Scenario) -> Report {
-    let workdir = std::env::temp_dir().join(format!(
-        "vsbot-itest-{}-{}",
-        std::process::id(),
-        scenario.label
-    ));
+/// Independent, server-side confirmation that the run really happened on the
+/// board it asked for.
+///
+/// Without this a scenario could silently be measuring 12x12 forever: the hub
+/// replaces any dimension outside 5..=50 with its own `defaultBoardSize` of 12
+/// and says nothing to the client about having done so, so a typo in
+/// `challenge_rows` would turn the whole off-board half of this bead's evidence
+/// into a second 12x12 run that passes. The hub logs the accepted size on the
+/// challenge it created (`hub.go:854`), which is the one place the client cannot
+/// influence.
+fn assert_board(report: &Report, board: (usize, usize)) {
+    let expected = format!("({}x{})", board.0, board.1);
+    assert!(
+        report.server_output.contains(&expected),
+        "the server never logged a challenge on {expected} — the run was not played on the \
+         board it asked for\n--- server log tail ---\n{}",
+        tail(&report.server_output)
+    );
+}
+
+/// A built-and-running Go server, plus where it is writing its log.
+struct RunningServer {
+    child: tokio::process::Child,
+    port: u16,
+    log: PathBuf,
+}
+
+impl RunningServer {
+    /// Kills the server and returns everything it logged.
+    async fn stop(mut self) -> String {
+        let _ = self.child.kill().await;
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+/// Builds the server from the checkout and starts it on a free port.
+fn start_server(label: &str) -> RunningServer {
+    let workdir = std::env::temp_dir().join(format!("vsbot-itest-{}-{label}", std::process::id()));
     std::fs::create_dir_all(&workdir).expect("temp workdir");
 
     let server = build_server(&workdir);
@@ -649,9 +891,9 @@ async fn run_scenario(scenario: Scenario) -> Report {
         8080
     };
 
-    let server_log = workdir.join("server.log");
-    let log_handle = std::fs::File::create(&server_log).expect("server log");
-    let mut child = tokio::process::Command::new(&server.binary)
+    let log = workdir.join("server.log");
+    let log_handle = std::fs::File::create(&log).expect("server log");
+    let child = tokio::process::Command::new(&server.binary)
         .current_dir(&workdir)
         .env("VSBOT_ITEST_PORT", port.to_string())
         .stdout(Stdio::from(log_handle.try_clone().expect("clone log")))
@@ -661,12 +903,19 @@ async fn run_scenario(scenario: Scenario) -> Report {
         .spawn()
         .unwrap_or_else(|error| panic!("could not start {}: {error}", server.binary.display()));
 
+    RunningServer { child, port, log }
+}
+
+/// Builds and starts a server, plays the scenario, and stops the server.
+async fn run_scenario(scenario: Scenario) -> Report {
+    let server = start_server(scenario.label);
+    let port = server.port;
+
     let target_games = scenario.target_games;
     let timeout = scenario.timeout;
     let outcome = tokio::time::timeout(timeout, play(port, scenario)).await;
 
-    let _ = child.kill().await;
-    let server_output = std::fs::read_to_string(&server_log).unwrap_or_default();
+    let server_output = server.stop().await;
 
     let Ok((challenger, acceptor)) = outcome else {
         panic!(
@@ -701,6 +950,8 @@ async fn play(port: u16, scenario: Scenario) -> (Side, Side) {
         name_prefix: "ITestChallenger".to_owned(),
         challenger: true,
         challenge_interval: Duration::from_secs(2),
+        challenge_rows: scenario.board.0,
+        challenge_cols: scenario.board.1,
         rng_seed: Some(0x5EED),
         // Exactly one side ponders, so one run carries both the new behaviour
         // and its control.
@@ -874,4 +1125,372 @@ async fn wait_for_port(port: u16) {
 fn tail(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(40)..].join("\n")
+}
+
+// ---------------------------------------------------------------- multiplayer
+//
+// The 3-4 player half of bd `vsbot-3ss`. It needs a different shape of harness
+// from the scenarios above: a 1v1 game starts from a `challenge`, which
+// `virus-proto` sends, but a multiplayer game starts from a *lobby*, and hosting
+// one is not something a bot does. `create_lobby`, `add_bot` and
+// `start_multiplayer_game` are host frames; putting them in `virus-proto` would
+// add a whole outbound vocabulary to a crate whose entire job is to play the
+// games it is invited to. So the host is a raw socket in this file, and the bots
+// under test join it exactly the way the deployment does — through the server's
+// `bot_wanted` broadcast, which `virus-proto` already answers.
+
+/// What each bot seat of a multiplayer run reported.
+struct MultiplayerReport {
+    seats: Vec<Side>,
+    server_output: String,
+    /// Board the host asked the lobby for.
+    board: (usize, usize),
+    /// Seats the server seated, host included.
+    players: usize,
+}
+
+/// A three- or four-player live game, hosted by a raw socket and played out by
+/// `players - 1` bots running `engine`.
+///
+/// The host occupies seat 1 and plays instantly: it is a referee that has to
+/// hold a chair, not an opponent worth measuring. What is under test is that the
+/// bots' engine produces legal actions in a max^n game against a real server —
+/// the hub forfeits an illegal action instantly and logs it, and a seat that
+/// stops moving is resigned, so a game that reaches `game_end` with a clean log
+/// is the evidence.
+async fn run_multiplayer(
+    label: &'static str,
+    board: (usize, usize),
+    players: usize,
+    move_millis: u64,
+    engine: impl Fn() -> Arc<dyn SearchEngine>,
+    timeout: Duration,
+) -> MultiplayerReport {
+    assert!(
+        (3..=4).contains(&players),
+        "this harness exists for the 3-4 player games; {players} is a 1v1 scenario"
+    );
+    let server = start_server(label);
+    let port = server.port;
+    let outcome = tokio::time::timeout(
+        timeout,
+        play_multiplayer(port, board, players, move_millis, engine),
+    )
+    .await;
+    let server_output = server.stop().await;
+
+    let Ok(seats) = outcome else {
+        panic!(
+            "the {players}-player run did not finish within {timeout:?}\n\
+             --- server log tail ---\n{}",
+            tail(&server_output)
+        );
+    };
+    MultiplayerReport {
+        seats,
+        server_output,
+        board,
+        players,
+    }
+}
+
+async fn play_multiplayer(
+    port: u16,
+    board: (usize, usize),
+    players: usize,
+    move_millis: u64,
+    engine: impl Fn() -> Arc<dyn SearchEngine>,
+) -> Vec<Side> {
+    wait_for_port(port).await;
+    let url = format!("ws://127.0.0.1:{port}/ws");
+
+    // Pure acceptors: nothing here challenges anybody, and the lobby is what
+    // puts them in a game. `bot_wanted` is only answered from the idle phase, so
+    // they must be connected and registered before the host starts adding bots
+    // — hence the settle below.
+    let bots: Vec<Bot> = (0..players - 1)
+        .map(|index| {
+            let config = BotConfig {
+                backend_url: url.clone(),
+                name_prefix: format!("ITestSeat{}", index + 2),
+                move_budget: Some(Duration::from_millis(move_millis)),
+                fallback_grace: Duration::from_secs(2),
+                ..BotConfig::default()
+            };
+            let (bot, mut inbox) = Bot::new(Arc::new(config), engine());
+            let driver = bot.clone();
+            tokio::spawn(async move { virus_proto::run_forever(&driver, &mut inbox).await });
+            bot
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let host = tokio::spawn(host_a_lobby(url, board, players));
+
+    loop {
+        if bots
+            .iter()
+            .all(|bot| bot.core().counters.games_finished >= 1)
+        {
+            break;
+        }
+        if host.is_finished() {
+            // The host returns on its own `game_end`; give the bots a moment to
+            // see the same message before their counters are read.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    host.abort();
+
+    bots.iter()
+        .enumerate()
+        // `Side::name` is a `&'static str` because the 1v1 scenarios have two
+        // fixed sides; a multiplayer run has at most three bot seats, so the
+        // three names it can ever need are spelled out.
+        .map(|(index, bot)| side(["seat-2", "seat-3", "seat-4"][index], bot))
+        .collect()
+}
+
+/// The lobby host: create, fill with bots, start, then play seat 1 instantly.
+///
+/// Deliberately dumb — first legal action, no search, no time budget. It exists
+/// so the game has a fourth wall; a thinking host would only make the run
+/// longer and would measure nothing.
+async fn host_a_lobby(url: String, board: (usize, usize), players: usize) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as Frame;
+
+    let (socket, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("the host connects");
+    let (mut sink, mut stream) = socket.split();
+
+    let mut seat = 0i32;
+    let mut game_id = String::new();
+    let mut bots_added = 0usize;
+    let mut started = false;
+    // Every frame the host acts on carries a snapshot, and several frames carry
+    // the *same* snapshot. Acting twice on one would send two actions for a
+    // single slot of the turn, and the second would come back as the out-of-turn
+    // error the 1v1 scenarios assert against. The position hash is the cheapest
+    // way to say "this is the board I already answered".
+    let mut answered: Option<u64> = None;
+
+    while let Some(Ok(frame)) = stream.next().await {
+        let Frame::Text(text) = frame else {
+            continue;
+        };
+        let Ok(raw) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let kind = raw["type"].as_str().unwrap_or_default().to_owned();
+        let outgoing: serde_json::Value = match kind.as_str() {
+            "welcome" => serde_json::json!({
+                "type": "create_lobby",
+                "rows": board.0,
+                "cols": board.1,
+            }),
+
+            // Both carry the lobby's slot occupancy. The host fills one slot at
+            // a time and waits to see it filled: asking for both bots at once
+            // would broadcast two `bot_wanted`s into a field of idle bots and
+            // let them race for the same request id, and the server fulfils a
+            // request exactly once and ignores the loser — which would strand a
+            // slot and hang the run.
+            "lobby_created" | "lobby_update" => {
+                if started {
+                    continue;
+                }
+                let occupied = raw["lobby"]["players"]
+                    .as_array()
+                    .map(|slots| {
+                        slots
+                            .iter()
+                            .filter(|slot| slot["isEmpty"] != serde_json::Value::Bool(true))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                if occupied >= players {
+                    started = true;
+                    serde_json::json!({ "type": "start_multiplayer_game" })
+                } else if occupied == bots_added + 1 && bots_added < players - 1 {
+                    bots_added += 1;
+                    serde_json::json!({ "type": "add_bot" })
+                } else {
+                    continue;
+                }
+            }
+
+            "multiplayer_game_start" | "game_state" | "turn_change" => {
+                let Ok(message) = serde_json::from_value::<Inbound>(raw) else {
+                    continue;
+                };
+                if kind == "multiplayer_game_start" {
+                    seat = message.your_player;
+                    game_id = message.game_id.clone();
+                }
+                let Some(state) = message
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.decode().ok())
+                else {
+                    continue;
+                };
+                if i32::from(state.current_player()) != seat
+                    || !state.can_act()
+                    || answered == Some(state.hash())
+                {
+                    continue;
+                }
+                let Some(action) = state.legal_actions().first().copied() else {
+                    continue;
+                };
+                answered = Some(state.hash());
+                let message = Outgoing::action(
+                    &game_id,
+                    &uuid::Uuid::new_v4().to_string(),
+                    action,
+                    Diagnostics::default(),
+                );
+                serde_json::to_value(&message).expect("an outbound frame serialises")
+            }
+
+            "game_end" => return,
+            _ => continue,
+        };
+        if sink
+            .send(Frame::Text(outgoing.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+impl MultiplayerReport {
+    /// The multiplayer analogue of [`Report::assert_clean`].
+    fn assert_clean(&self) {
+        assert!(
+            !self.server_output.contains("made illegal move"),
+            "the server logged an illegal move:\n{}",
+            tail(&self.server_output)
+        );
+        // Independent, server-side confirmation that the game really was
+        // multiplayer and really was on the board the host asked for. The hub
+        // replaces an out-of-range size with its own 12x12 default silently, and
+        // a lobby that started short would be a 1v1 run wearing this test's
+        // name — either would turn the whole multiplayer acceptance into a
+        // pass that proved nothing. `hub.go` logs both facts itself.
+        let lobby = format!("{}x{})", self.board.0, self.board.1);
+        assert!(
+            self.server_output
+                .lines()
+                .any(|line| line.contains("Lobby created") && line.ends_with(&lobby)),
+            "the server never logged a lobby on {}x{}\n--- server log tail ---\n{}",
+            self.board.0,
+            self.board.1,
+            tail(&self.server_output)
+        );
+        let seated = format!("with {} active players", self.players);
+        assert!(
+            self.server_output
+                .lines()
+                .any(|line| line.contains("Multiplayer game created") && line.contains(&seated)),
+            "the server never created a game {seated}\n--- server log tail ---\n{}",
+            tail(&self.server_output)
+        );
+        for seat in &self.seats {
+            assert_eq!(
+                seat.illegal_moves, 0,
+                "{} was forfeited for an illegal move: {:?}",
+                seat.name, seat.last_error
+            );
+            assert_eq!(
+                seat.errors, 0,
+                "{} received {} server errors, last: {:?}",
+                seat.name, seat.errors, seat.last_error
+            );
+            assert!(seat.actions_sent > 0, "{} never acted", seat.name);
+            assert_eq!(
+                seat.fallback_actions, 0,
+                "{} answered with its pre-selected fallback {} times — the max^n search did \
+                 not hold its budget",
+                seat.name, seat.fallback_actions
+            );
+        }
+        assert!(
+            self.seats.iter().any(|seat| seat.games_finished > 0),
+            "no seat ever saw the game end"
+        );
+    }
+}
+
+/// The live half of the multiplayer acceptance for bd `vsbot-3ss`.
+///
+/// `SEARCH=ALPHABETA` is the only engine in this repository that can play a
+/// three- or four-player game at all — the champion's absolute-frame backup has
+/// nowhere to put a third seat's win, and `MctsSearcher::new` asserts two
+/// players. So this run is at once the acceptance for the standalone engine in
+/// multiplayer and for the fallback the champion now uses there: either way the
+/// actions come out of the same `AlphaBetaEngine::choose` and the same max^n
+/// search.
+///
+/// The unit test `alphabeta::tests::multiplayer_positions_go_through_the_max_n_path`
+/// proves the max^n *branch* is the one taken (it is the only branch in the
+/// crate that can score a four-element vector); this proves the moves it returns
+/// survive a real server, in a real three-player game, for a whole game.
+///
+/// The board is 16x16 on purpose: multiplayer *and* off the champion's board, so
+/// the fallback is exercised on the hardest shape the server can offer.
+#[allow(clippy::await_holding_lock)] // see the note on the scenarios above
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn the_alphabeta_engine_plays_a_full_multiplayer_game() {
+    let Some(_guard) = enabled("alphabeta-multiplayer") else {
+        return;
+    };
+    let move_millis: u64 = std::env::var("VSBOT_ITEST_AB_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200);
+    let players: usize = std::env::var("VSBOT_ITEST_MP_PLAYERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+    const BOARD: (usize, usize) = (16, 16);
+
+    let report = run_multiplayer(
+        "alphabeta-multiplayer",
+        BOARD,
+        players,
+        move_millis,
+        || {
+            build_engine(EngineKind::AlphaBeta, &MctsSettings::default())
+                .expect("SEARCH=ALPHABETA needs no artifact")
+                .engine
+        },
+        Duration::from_secs(900),
+    )
+    .await;
+
+    report.assert_clean();
+    eprintln!(
+        "OK (ALPHABETA multiplayer): {} seats on {}x{} at {move_millis}ms/move, {} bot seats \
+         saw the game end, {} actions sent, 0 illegal moves, 0 server errors, 0 fallbacks",
+        report.players,
+        report.board.0,
+        report.board.1,
+        report
+            .seats
+            .iter()
+            .filter(|seat| seat.games_finished > 0)
+            .count(),
+        report
+            .seats
+            .iter()
+            .map(|seat| seat.actions_sent)
+            .sum::<u64>(),
+    );
 }

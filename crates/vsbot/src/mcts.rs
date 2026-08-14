@@ -9,14 +9,23 @@
 //! server's 120 s timer.
 //!
 //! So this adapter checks the *same two conditions* up front, per position, and
-//! plays the greedy reference engine for any position outside the domain —
+//! plays [`AlphaBetaEngine`] for any position outside the domain —
 //! **never silently**. The Java post-mortem (`GameLoopHandler.unwiredEvalWarning`)
 //! is the reason for the shouting: a quiet eval fallback once let a harness
 //! report hand-tuned results as the net's for a whole run.
+//!
+//! The fallback engine used to be the greedy reference engine ("first capture I
+//! see"), which meant every 16x16 or three-player game the server offered was
+//! played at a level no deployment would accept. `virus-search` has no domain
+//! restriction at all — any board size, two to four players, max^n for the
+//! multiplayer seats — so it is a real engine standing in for a real engine.
+//! The warning is unchanged in kind and loudness: a downgrade is still a
+//! downgrade, and it still says so on every change of verdict.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use virus_core::{Action, State};
@@ -24,6 +33,8 @@ use virus_mcts::{Config, MctsSearcher, NetError, PolicyValueNet, ValueSource, BO
 use virus_proto::clock::{verdict, MoveAllocation, RootProgress, Verdict};
 use virus_proto::ponder::{PonderInbox, PonderStep};
 use virus_proto::{GreedyEngine, SearchBudget, SearchEngine, SearchOutcome};
+
+use crate::alphabeta::AlphaBetaEngine;
 
 /// Longest uninterrupted stretch of simulations.
 ///
@@ -67,8 +78,8 @@ const MAX_REROOT_PLIES: usize = 3;
 /// position cannot turn tree reuse into a stall.
 const REROOT_APPLY_BUDGET: usize = 4_096;
 
-/// PUCT search over the policy/value artifact, with a greedy safety net for
-/// positions outside the searcher's domain.
+/// PUCT search over the policy/value artifact, with the alpha-beta engine as
+/// the safety net for positions outside the searcher's domain.
 #[derive(Debug)]
 pub struct MctsEngine {
     net: PolicyValueNet,
@@ -76,6 +87,14 @@ pub struct MctsEngine {
     artifact: PathBuf,
     /// Whether to print one [`trace_answer`] line per answered action.
     trace: bool,
+    /// What plays the games the champion cannot encode.
+    ///
+    /// Owned rather than borrowed so one `MctsEngine` is still the whole engine
+    /// from the binary's point of view — `build_engine` returns one trait object
+    /// and the deployment banner names one engine. It costs nothing until a
+    /// position needs it: [`AlphaBetaEngine`] allocates its transposition table
+    /// on its first search, not at construction.
+    fallback: AlphaBetaEngine,
     /// Shape of the most recent position whose domain verdict was logged.
     ///
     /// The bot plays game after game in one process, so the interesting event
@@ -83,6 +102,15 @@ pub struct MctsEngine {
     /// individual move. Logging per move would bury the warning in three lines
     /// a turn; logging once ever would hide a later game's downgrade.
     last_shape: AtomicU64,
+    /// How many times the engine has *entered* the degraded mode.
+    degradations: AtomicU64,
+    /// The most recent warning line, verbatim.
+    ///
+    /// The line itself is the deliverable — a deployment is diagnosed from the
+    /// log — so the live-game tests assert on the text rather than on a boolean
+    /// that could stay true while the message rotted. Keeping it here is how a
+    /// test that runs the bot in-process can read what an operator would see.
+    last_warning: Mutex<Option<String>>,
 }
 
 impl MctsEngine {
@@ -117,8 +145,27 @@ impl MctsEngine {
                 visit_sampling: false,
                 ..Config::play()
             },
+            fallback: AlphaBetaEngine::new(),
             last_shape: AtomicU64::new(NO_SHAPE),
+            degradations: AtomicU64::new(0),
+            last_warning: Mutex::new(None),
         })
+    }
+
+    /// How many times this engine has entered the degraded (fallback) mode.
+    ///
+    /// Counts *transitions into* it, not positions: one 16x16 game is one
+    /// degradation however many moves it lasts. Zero in a healthy deployment.
+    pub fn degradations(&self) -> u64 {
+        self.degradations.load(Ordering::SeqCst)
+    }
+
+    /// The most recent domain warning, exactly as it was printed.
+    pub fn last_warning(&self) -> Option<String> {
+        self.last_warning
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// The startup banner: artifact path and the meta the loader validated.
@@ -144,6 +191,15 @@ impl MctsEngine {
             self.net.simd(),
             self.config.seed,
         );
+        // Which engine plays the games this one cannot is part of what the
+        // process is, so it belongs in the line an operator checks a deployment
+        // against — not only in the warning that fires once such a game starts.
+        let _ = write!(
+            line,
+            " off_domain_fallback={} ({})",
+            self.fallback.name(),
+            self.fallback.describe()
+        );
         line
     }
 
@@ -161,12 +217,19 @@ impl MctsEngine {
         let previous = self.last_shape.swap(shape, Ordering::SeqCst);
         if previous != shape {
             if !usable {
-                eprintln!(
+                self.degradations.fetch_add(1, Ordering::SeqCst);
+                let warning = format!(
                     "WARNING: SEARCH=MCTS cannot play this game: {players} players on a \
                      {rows}x{cols} board, and the absolute-frame searcher is two-player \
-                     12x12 only. FALLING BACK TO THE GREEDY REFERENCE ENGINE for every \
-                     position of this shape — moves from now on are NOT the champion's."
+                     12x12 only. FALLING BACK TO THE ALPHA-BETA ENGINE ({}) for every \
+                     position of this shape — moves from now on are NOT the champion's.",
+                    self.fallback.name()
                 );
+                eprintln!("{warning}");
+                *self
+                    .last_warning
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(warning);
             } else if previous != NO_SHAPE {
                 eprintln!(
                     "vsbot: back inside the MCTS domain ({players} players, {rows}x{cols}); \
@@ -188,7 +251,11 @@ impl SearchEngine for MctsEngine {
             return None;
         }
         if !self.in_domain(state) {
-            return GreedyEngine.choose(state, budget);
+            // The same budget, unmodified: the fallback engine is driven by the
+            // very allocation the champion would have had, so a degraded game
+            // keeps the deployment's turn discipline rather than inventing its
+            // own.
+            return self.fallback.choose(state, budget);
         }
 
         // The clock starts before the root expansion, because the root
@@ -223,7 +290,11 @@ impl SearchEngine for MctsEngine {
     /// search starts, so an overrun costs a policy move instead of a forfeit.
     fn fallback(&self, state: &State) -> Option<Action> {
         if !self.in_domain(state) {
-            return GreedyEngine.fallback(state);
+            // Deliberately the *fallback* and not a search: this is the answer
+            // the client holds before the long search starts, and
+            // `AlphaBetaEngine::fallback` is one pass over `legal_actions` for
+            // exactly that reason.
+            return self.fallback.fallback(state);
         }
         let searcher = MctsSearcher::new(state.clone(), self.config, Some(&self.net));
         prior_argmax(&searcher).or_else(|| state.legal_actions().first().copied())
@@ -260,13 +331,11 @@ impl SearchEngine for MctsEngine {
 
             // Defence in depth behind `BotCore::may_ponder`. A position with a
             // live mover and `movesLeft == 0` is a transient the server really
-            // does publish, and it is poison: `State::legal_actions` does not
-            // filter on `movesLeft`, so it enumerates moves whose `apply`
-            // decrements `0 - 1` and panics indexing the Zobrist table. A
+            // does publish, and it is poison to a searcher that acts on it. A
             // panicking session takes a blocking worker with it and silently
             // degrades the rest of the game to the fallback, so the cheap check
             // belongs on both sides of the channel.
-            let searchable = !state.game_over() && state.moves_left() > 0 && self.in_domain(&state);
+            let searchable = state.can_act() && self.in_domain(&state);
             let reused = searchable
                 && tree
                     .as_mut()
@@ -317,9 +386,28 @@ impl SearchEngine for MctsEngine {
             // reply channel dangling would make the client wait out its
             // fallback timer for nothing.
             if let Some(reply) = reply {
-                let outcome = tree
-                    .as_ref()
-                    .and_then(|(_, searcher)| self.harvest(&state, searcher, &budget));
+                // No tree means the champion could not take this position: out
+                // of its domain, or nothing to act on. The first case must still
+                // be answered by the fallback *engine*, not left to the client's
+                // pre-selected fallback action.
+                //
+                // This is the one place the ponder path could quietly diverge
+                // from `choose`. `run_engine` prefers a live session over a
+                // fresh search, so a `None` here would make every out-of-domain
+                // turn of a `VSBOT_PONDER=true` deployment play the cheap
+                // one-pass fallback while the same game with pondering off
+                // played a real alpha-beta search — a strength difference
+                // produced by a time-management flag, which is precisely the
+                // class of silent downgrade this module exists to prevent.
+                //
+                // Emitting from here is safe for the same reason the pondered
+                // answer is: a session can only ever produce the reply to an
+                // `Answer` step, and the client only sends one off the
+                // authoritative turn driver.
+                let outcome = match tree.as_ref() {
+                    Some((_, searcher)) => self.harvest(&state, searcher, &budget),
+                    None => self.fallback.choose(&state, &budget),
+                };
                 if self.trace {
                     trace_answer(
                         AnswerTrace {
@@ -349,6 +437,15 @@ impl SearchEngine for MctsEngine {
 impl MctsEngine {
     /// Turns a finished search into an outcome, with the greedy engine as the
     /// last line of defence.
+    ///
+    /// This is the one fallback that stays greedy, and deliberately so. It is
+    /// not the *domain* fallback the alpha-beta engine replaced — that one fires
+    /// before any clock is spent, on a game the champion was never able to play.
+    /// This one fires after a full budget has already been burned on a root that
+    /// came back empty, which is a bug in the searcher or the snapshot. What is
+    /// needed there is an instant legal answer before the server's timer runs
+    /// out; starting a second, unbudgeted search (and allocating a 32 MiB table
+    /// to do it) is the opposite of that.
     fn harvest(
         &self,
         state: &State,
@@ -748,6 +845,12 @@ mod tests {
         assert!(banner.contains("channels="), "{banner}");
         assert!(banner.contains("layers="), "{banner}");
         assert!(banner.contains("value_head=net"), "{banner}");
+        // A deployment must be checkable against what it will actually play,
+        // and this engine plays a *different* one for any game off 12x12 or
+        // above two seats. Naming it here means the operator does not have to
+        // wait for the first such game — and its warning — to find out which.
+        assert!(banner.contains("off_domain_fallback=alphabeta"), "{banner}");
+        assert!(banner.contains("eval=hand-tuned"), "{banner}");
     }
 
     #[test]
@@ -795,43 +898,88 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_three_player_game_falls_back_to_greedy_instead_of_panicking() {
-        // `MctsSearcher::new` asserts two players. Reaching it with three would
-        // panic the blocking search worker and forfeit the game on the server's
-        // move timer, so the adapter must never let that position through.
+    /// A position outside the domain must reach a *real* engine, not a panic
+    /// and not the reference engine.
+    ///
+    /// `MctsSearcher::new` asserts two players and a 12x12 board. Reaching it
+    /// with either wrong would panic the blocking search worker and forfeit the
+    /// game on the server's move timer, so the adapter must never let such a
+    /// position through — and what it plays instead must be alpha-beta, which is
+    /// how the whole non-12x12 / three- and four-player half of the server's
+    /// game offerings stops being played at "first capture I see".
+    fn falls_back_off_domain(rows: usize, cols: usize, players: usize) {
         let engine = engine();
-        let state = State::new(12, 12, 3).expect("a legal three-player position");
+        // Past the opening book, which answers by fiat at depth 0 and would say
+        // nothing about which engine is behind it.
+        let state = crate::alphabeta::tests::past_the_book(rows, cols, players);
         let outcome = engine
-            .choose(&state, &budget(50))
-            .expect("greedy always has a move here");
-        assert!(state.legal_actions().contains(&outcome.action));
-        // Greedy's signature: depth 1 and a node count equal to the move list.
-        assert_eq!(outcome.depth, 1);
+            .choose(&state, &budget(400))
+            .expect("the fallback engine always has a move here");
+        assert!(
+            state.legal_actions().contains(&outcome.action),
+            "{rows}x{cols} {players}p: illegal fallback action"
+        );
+        // Greedy's signature was `depth == 1` and `nodes == the move list`. A
+        // real iterative-deepening search reports the depth it completed and
+        // visits far more nodes than there are root moves.
+        assert!(
+            outcome.depth > 1 && outcome.nodes > state.legal_actions().len() as i64,
+            "{rows}x{cols} {players}p: depth {} nodes {} — this is not an alpha-beta search",
+            outcome.depth,
+            outcome.nodes
+        );
+        assert_eq!(engine.degradations(), 1, "{rows}x{cols} {players}p");
+        let warning = engine.last_warning().expect("the downgrade warned");
+        assert!(
+            warning.starts_with("WARNING: SEARCH=MCTS cannot play"),
+            "{warning}"
+        );
+        assert!(warning.contains("ALPHA-BETA"), "{warning}");
+        assert!(warning.contains("alphabeta"), "{warning}");
+        assert!(warning.contains("NOT the champion's"), "{warning}");
     }
 
     #[test]
-    fn a_non_12x12_board_falls_back_to_greedy_instead_of_panicking() {
-        let engine = engine();
-        let state = State::new(10, 10, 2).expect("a legal 10x10 position");
-        let outcome = engine
-            .choose(&state, &budget(50))
-            .expect("greedy always has a move here");
-        assert!(state.legal_actions().contains(&outcome.action));
-        assert_eq!(outcome.depth, 1);
+    fn a_three_player_game_falls_back_to_alpha_beta_instead_of_panicking() {
+        falls_back_off_domain(12, 12, 3);
+    }
+
+    #[test]
+    fn a_four_player_game_falls_back_to_alpha_beta_instead_of_panicking() {
+        falls_back_off_domain(12, 12, 4);
+    }
+
+    #[test]
+    fn a_non_12x12_board_falls_back_to_alpha_beta_instead_of_panicking() {
+        falls_back_off_domain(10, 10, 2);
+        falls_back_off_domain(16, 16, 2);
     }
 
     #[test]
     fn the_fallback_verdict_is_logged_once_per_transition_not_once_per_process() {
         // Two different out-of-domain shapes must each warn, and a return to the
-        // domain must be announced. The counter proves the transition logic
-        // fires; the text itself goes to stderr, where the operator sees it.
+        // domain must be announced. The degradation counter proves the
+        // transition logic fires rather than warning per position or once per
+        // process; the text itself also goes to stderr, where the operator sees
+        // it.
         let engine = engine();
+        assert_eq!(engine.degradations(), 0);
+        assert!(engine.last_warning().is_none());
+
         assert!(!engine.in_domain(&State::new(12, 12, 3).expect("3p")));
+        assert_eq!(engine.degradations(), 1);
         assert!(!engine.in_domain(&State::new(12, 12, 3).expect("3p")));
+        assert_eq!(engine.degradations(), 1, "the same shape must not re-warn");
         assert!(!engine.in_domain(&State::new(10, 10, 2).expect("10x10")));
+        assert_eq!(engine.degradations(), 2, "a new shape warns again");
         assert!(engine.in_domain(&State::new(12, 12, 2).expect("2p 12x12")));
         assert!(engine.in_domain(&State::new(12, 12, 2).expect("2p 12x12")));
+        assert_eq!(engine.degradations(), 2, "coming back is not a degradation");
+
+        // The warning survives the return to the domain: it is the record of
+        // what happened, not a live flag.
+        let warning = engine.last_warning().expect("a warning was printed");
+        assert!(warning.contains("10x10"), "{warning}");
     }
 
     #[test]
@@ -915,16 +1063,30 @@ mod tests {
         );
     }
 
-    /// Out of the searcher's domain the fallback still answers, and legally.
+    /// Out of the searcher's domain the fallback still answers, legally — and
+    /// still instantly.
+    ///
+    /// The second half is the one that could regress now that the degraded mode
+    /// runs a real searcher: `fallback` is the answer the client holds *before*
+    /// the long search starts, so routing it into an alpha-beta search instead
+    /// of alpha-beta's own one-pass fallback would turn the safety net into a
+    /// second search and cost the forfeit it exists to prevent.
     #[test]
-    fn the_fallback_survives_an_out_of_domain_position() {
+    fn the_fallback_survives_an_out_of_domain_position_without_searching() {
         let engine = engine();
         for state in [
             State::new(12, 12, 3).expect("3p"),
             State::new(10, 10, 2).expect("10x10"),
+            State::new(20, 20, 4).expect("20x20 4p"),
         ] {
+            let started = Instant::now();
             let chosen = engine.fallback(&state).expect("a legal action exists");
             assert!(state.legal_actions().contains(&chosen));
+            assert!(
+                started.elapsed() < Duration::from_millis(100),
+                "the out-of-domain fallback took {:?} — it is searching",
+                started.elapsed()
+            );
         }
     }
 
@@ -1233,18 +1395,65 @@ mod tests {
 
     /// A ponder step for a position outside the searcher's domain must not reach
     /// the searcher's asserts — a panicking session would take a blocking worker
-    /// down mid-game.
+    /// down mid-game — and must still be answered by the fallback **engine**.
+    ///
+    /// The second half is the hole this bead closed. `BotCore::run_engine`
+    /// prefers a live pondering session over a fresh `choose`, so a session that
+    /// answered `None` here would make every out-of-domain turn of a
+    /// `VSBOT_PONDER=true` deployment play the client's cheap pre-selected
+    /// fallback, while the identical game with pondering off played a real
+    /// alpha-beta search. A strength difference produced by a time-management
+    /// flag is exactly the silent downgrade this module exists to prevent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_ponder_session_declines_an_out_of_domain_position() {
+    async fn a_ponder_session_answers_an_out_of_domain_position_with_the_fallback_engine() {
         let engine = Arc::new(engine());
         let (steps, inbox) = PonderInbox::channel();
-        let session = tokio::task::spawn_blocking(move || engine.ponder(&inbox));
+        let session = {
+            let engine = Arc::clone(&engine);
+            tokio::task::spawn_blocking(move || engine.ponder(&inbox))
+        };
 
-        let state = State::new(12, 12, 3).expect("a legal three-player position");
+        for state in [
+            crate::alphabeta::tests::past_the_book(12, 12, 3),
+            crate::alphabeta::tests::past_the_book(16, 16, 2),
+        ] {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            steps
+                .send(PonderStep::Answer {
+                    state: state.clone(),
+                    budget: SearchBudget::new(
+                        Instant::now() + Duration::from_millis(120),
+                        CancellationToken::new(),
+                    ),
+                    reply,
+                })
+                .expect("the session is alive");
+            let answered = tokio::time::timeout(Duration::from_secs(10), answer)
+                .await
+                .expect("the session answers rather than panicking")
+                .expect("the reply channel is open")
+                .expect("the fallback engine answers an out-of-domain position");
+            assert!(
+                state.legal_actions().contains(&answered.action),
+                "the pondered out-of-domain answer is illegal: {:?}",
+                answered.action
+            );
+            assert!(
+                answered.depth >= 1,
+                "depth {} — the answer did not come from a search",
+                answered.depth
+            );
+        }
+        assert!(engine.degradations() > 0, "the downgrade must have warned");
+
+        // And a position with nothing to act in is still declined outright.
+        let mut snapshot = State::new(12, 12, 3).expect("3p").snapshot();
+        snapshot.moves_left = 0;
+        let spent = snapshot.decode().expect("the transient decodes");
         let (reply, answer) = tokio::sync::oneshot::channel();
         steps
             .send(PonderStep::Answer {
-                state,
+                state: spent,
                 budget: SearchBudget::new(
                     Instant::now() + Duration::from_millis(20),
                     CancellationToken::new(),
@@ -1252,13 +1461,13 @@ mod tests {
                 reply,
             })
             .expect("the session is alive");
-        let answered = tokio::time::timeout(Duration::from_secs(5), answer)
-            .await
-            .expect("the session answers rather than panicking")
-            .expect("the reply channel is open");
         assert!(
-            answered.is_none(),
-            "an out-of-domain position has no pondered answer; the client falls back"
+            tokio::time::timeout(Duration::from_secs(5), answer)
+                .await
+                .expect("the session answers rather than panicking")
+                .expect("the reply channel is open")
+                .is_none(),
+            "a spent turn has no answer at all"
         );
 
         drop(steps);

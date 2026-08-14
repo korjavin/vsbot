@@ -661,10 +661,13 @@ dependencies = [
 name = "vsbot"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "rustls",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
+ "uuid",
  "virus-arena",
  "virus-core",
  "virus-eval",

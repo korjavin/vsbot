@@ -25,7 +25,15 @@ rustls = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "process"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "process", "sync"] }
 # `SearchBudget` is built from a `CancellationToken`, so any test that drives an
 # engine directly needs one.
 tokio-util = { workspace = true }
+# The multiplayer live game needs a lobby *host*, and hosting is not something a
+# bot does: `create_lobby`, `add_bot` and `start_multiplayer_game` have no place
+# in `virus-proto`, which exists to play games it is invited to. The test drives
+# a raw socket for those three frames instead, so the protocol crate stays the
+# shape the deployment needs it to be.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+uuid = { workspace = true }

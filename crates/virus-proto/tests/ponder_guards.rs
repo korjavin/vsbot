@@ -472,10 +472,13 @@ async fn pondering_off_means_no_session_at_all() {
 ///
 /// The server publishes a real transient where the mover is live and
 /// `movesLeft == 0`: the `move_made` echo of an opponent's third action arrives
-/// before the `turn_change` that rotates the turn. `State::legal_actions` does
-/// not filter on `movesLeft`, so such a position enumerates moves whose `apply`
-/// decrements `0 - 1`; the underflow indexes the Zobrist `movesLeft` table at
-/// 255 and panics the search worker.
+/// before the `turn_change` that rotates the turn. Handing it to a searcher used
+/// to panic the search worker — `State::legal_actions` enumerated moves whose
+/// `apply` decremented `0 - 1`, and the underflow indexed the Zobrist
+/// `movesLeft` table at 255. `legal_actions` now filters on `can_act` and
+/// returns nothing for such a position, so the panic is fixed at the root; the
+/// client-side guard stays because a searcher that is handed nothing to do is
+/// still a search worker spent on a position that cannot be acted in.
 ///
 /// `may_act` has always excluded `movesLeft == 0`, which is why nothing before
 /// pondering could reach it. `may_ponder` must exclude it for the same reason.
