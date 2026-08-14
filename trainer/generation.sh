@@ -301,6 +301,12 @@ stage_gauntlet() {
     || die "no $NETGAUNTLET_BIN — (cd trainer/netgauntlet && cargo build --release --jobs $JOBS)"
   [ -s "$CAND" ] || die "no candidate at $CAND (run the train stage first)"
 
+  # Round to even up front, the way netgauntlet does internally, so every
+  # number this stage prints and records is the number of games that will
+  # actually be played. Colour pairing needs both chairs of each opening, so an
+  # odd request is impossible; reporting the odd request anyway put the "what
+  # ran" row in contradiction with the pooled n in the same report.
+  local per_instance=$(( (GATE_GAMES + 1) / 2 * 2 ))
   local instances="$GATE_INSTANCES" took_lock=0
   if [ "$GATE_AUTOSCALE" = 1 ] && [ "$instances" -lt "$GATE_FULL_INSTANCES" ]; then
     # mkdir is the atomic test-and-set. pgrep is the second condition because a
@@ -311,7 +317,7 @@ stage_gauntlet() {
     elif mkdir "$ARENA_LOCK" 2>/dev/null; then
       took_lock=1
       instances="$GATE_FULL_INSTANCES"
-      echo "autoscale: took $ARENA_LOCK — raising to $instances instances ($((instances * GATE_GAMES)) games)"
+      echo "autoscale: took $ARENA_LOCK — raising to $instances instances ($((instances * per_instance)) games)"
       # Release on ANY exit, including a stage failure, so the next user of the
       # box is not blocked by our crash.
       trap 'rmdir "$ARENA_LOCK" 2>/dev/null || true' EXIT
@@ -319,7 +325,7 @@ stage_gauntlet() {
       echo "autoscale: $ARENA_LOCK is held — staying at $instances instance(s)"
     fi
   fi
-  echo "$instances x $GATE_GAMES games, candidate vs champion, $GATE_SIMS sims, seeds spaced 1000"
+  echo "$instances x $per_instance games, candidate vs champion, $GATE_SIMS sims, seeds spaced 1000"
 
   # Stale logs from a run with more instances would be pooled by stage_report.
   rm -f "$GDIR"/logs/gauntlet_*.log
@@ -329,7 +335,7 @@ stage_gauntlet() {
     echo "   instance $i: seed $seed"
     "$NETGAUNTLET_BIN" \
       --a-net "$CAND" --b-net "$CHAMP" \
-      --games "$GATE_GAMES" --sims "$GATE_SIMS" --seed "$seed" --jobs "$GATE_JOBS" \
+      --games "$per_instance" --sims "$GATE_SIMS" --seed "$seed" --jobs "$GATE_JOBS" \
       > "$GDIR/logs/gauntlet_$i.log" 2>&1 \
       || die "gauntlet instance $i failed — see $GDIR/logs/gauntlet_$i.log"
     grep -h '^RESULT' "$GDIR/logs/gauntlet_$i.log"
@@ -339,7 +345,7 @@ stage_gauntlet() {
     trap - EXIT
   fi
 
-  ran gauntlet "| gauntlet | $instances x $GATE_GAMES games = $((instances * GATE_GAMES)) at $GATE_SIMS FIXED sims, colour-paired, per-instance seeds from $((SEED_BASE + GEN * 10000)) spaced 1000, $GATE_JOBS concurrent games$( [ "$took_lock" = 1 ] && echo ", arena lock held" || echo ", arena lock NOT held") |"
+  ran gauntlet "| gauntlet | $instances x $per_instance games = $((instances * per_instance)) at $GATE_SIMS FIXED sims, colour-paired, per-instance seeds from $((SEED_BASE + GEN * 10000)) spaced 1000, $GATE_JOBS concurrent games$( [ "$took_lock" = 1 ] && echo ", arena lock held" || echo ", arena lock NOT held") |"
 }
 
 # ---------------------------------------------------------------- 4. report
