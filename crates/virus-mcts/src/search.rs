@@ -213,10 +213,11 @@ pub const DEFAULT_VIRTUAL_LOSS: f64 = 1.0;
 /// whole duplicate subtree from ever forming.
 ///
 /// The fixed-simulation self-gauntlet against `dag: false`, both arms at the
-/// default batch size, scored **0.5600 pooled over 100 games**
-/// (wilson95 [46.2%, 65.3%]) — comfortably past the "no regression" bar S3-T2
-/// asks for. See the S3-T2 PR for the 400-game confirmation and the load
-/// caveats.
+/// default batch size, scored **0.5575 pooled over 400 games** — 223W 177L 0D,
+/// wilson95 [50.9%, 60.5%], four 100-game blocks on well-separated seeds
+/// scoring 0.56/0.51/0.54/0.62. S3-T2 only asks for no regression (>= 0.50);
+/// with the interval's lower bound above 50% this is a real gain rather than
+/// merely a safe change. See the S3-T2 PR for the load caveats.
 ///
 /// Set it to `false` for the plain tree searcher, node for node.
 pub const DEFAULT_DAG: bool = true;
