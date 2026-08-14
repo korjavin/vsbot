@@ -71,19 +71,69 @@
 #   TRAINER_HOME=~/Project/nnue-trainer      mounted READ-ONLY at /trainer
 #   IMAGE=vsbot-trainer:cpu
 #   JOBS=2                docker --cpus and cargo --jobs
+#   TRAIN_MEMORY=5g       hard cap on the training container (docker --memory).
+#                         NOT a tuning knob — a blast radius. This box has ~7.7G
+#                         and NO SWAP, and train_selfplay.py holds the whole
+#                         window in RAM (see "how big a window fits", below).
+#                         Uncapped, a window that does not fit does not fail:
+#                         the kernel OOM-killer picks a victim by badness score
+#                         and that can be another executor's arena or rustc,
+#                         silently corrupting someone else's run. Capped, the
+#                         container alone is killed (exit 137) and this script
+#                         says so.
+#
+# ## How big a window fits on this box
+#
+# train_selfplay.py is not streaming. It holds, all at once: the parsed row
+# dicts (never freed), the train tensors, the holdout tensors, AND — the term
+# that actually bites — `shuffled = [t[perm] for t in train_t]`, rebuilt every
+# epoch while the previous epoch's copy is still bound, so the tensors are
+# resident ~3x at the turn of each epoch.
+#
+# Measured on gen-7's rows (docker, cpu): 1.85 GB peak at 119,161 rows. It is
+# linear in rows, so:
+#
+#     ~1.9 GB @ 120k rows (1 generation)     fits easily
+#     ~3.7 GB @ 236k rows (2 generations)    fits
+#     ~5.5 GB @ 354k rows (3 generations)    does NOT fit under load
+#
+# The per-row cost is dominated by padding, not by information: the policy
+# target tensors are (n, k) where k is the dataset's MAX legal-action count
+# (326 on gen-7's rows) while the MEAN is ~25, so ~92% of those three tensors
+# is padding. A ragged/sparse policy target in nnue-trainer would cut the
+# window's footprint by an order of magnitude and is the fix if a 3-generation
+# window is wanted on this hardware; WINDOW=2 is the workaround until then.
 #
 # ## The $WINDOW=3 sliding window, and what it means for gen 6
 #
 # Training consumes the current generation plus the previous two. gen 6 is the
 # FIRST Rust generation: there is no work/gen4 or work/gen5 selfplay.jsonl on
 # this box (gens 1-5 were produced by the Java emitter, in that repo's work
-# tree), so the window here collapses to gen 6's own rows alone. That is a real
+# tree), so the window there collapsed to gen 6's own rows alone. That is a real
 # handicap and it is stated in the report, not hidden: a net trained on one
 # generation of its own predecessor's games is the exact overfitting case
-# WINDOW=3 exists to damp. From gen 7 the window fills naturally — gen 7 pools
-# gen6+gen7, gen 8 pools gen6+gen7+gen8, gen 9 drops gen6 — with no change to
-# this script, because the window is "generations that HAVE a selfplay.jsonl",
-# not "the last three directories".
+# WINDOW=3 exists to damp.
+#
+# ## $WORK MUST OUTLIVE THE RUN — set it to the main checkout
+#
+# "From gen 7 the window fills naturally" was the plan, and it did not survive
+# contact: gen 6 ran with a RELATIVE WORK=work from an executor's temporary git
+# worktree, so its 117,973 rows and its candidate lived in
+# .claude/worktrees/<agent>/work/gen6/ and were deleted with that worktree. gen 7
+# had nothing to pool and had to replay gen 6's round from (net, seed) to refill
+# the slot.
+#
+# The window is only cheap if the rows persist. Always run with an ABSOLUTE
+# $WORK under the main checkout:
+#
+#     WORK=/home/devbox/Project/vsbot/work trainer/generation.sh
+#
+# Rows are reproducible from (net, seed), so losing them costs an hour per
+# generation rather than correctness — but it costs it every time. See
+# work/PROVENANCE.md for which slot actually holds what.
+#
+# The window itself needs no change to fill: it is "generations that HAVE a
+# selfplay.jsonl", not "the last three directories", so gaps are skipped.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -127,6 +177,7 @@ done
 : "${TRAINER_HOME:=$HOME/Project/nnue-trainer}"
 : "${IMAGE:=vsbot-trainer:cpu}"
 : "${JOBS:=2}"
+: "${TRAIN_MEMORY:=5g}"
 
 die() { echo "ERROR: $*" >&2; exit 2; }
 step() { printf '\n>> [gen %s / %s] === %s\n' "$GEN" "$1" "$(date '+%Y-%m-%d %H:%M:%S')"; }
@@ -237,14 +288,22 @@ stage_train() {
     || die "no $IMAGE — build it with trainer/roundtrip.sh (step 1) or docker build -f trainer/Dockerfile trainer"
 
   # The window, over generations that HAVE rows — gaps are skipped, not fatal.
-  local datasets="" g
+  local datasets="" g window_rows=0 gen_rows
   for g in $(seq $((GEN - WINDOW + 1)) "$GEN"); do
     if [ "$g" -ge 1 ] && [ -s "$WORK/gen$g/selfplay.jsonl" ]; then
+      gen_rows="$(wc -l < "$WORK/gen$g/selfplay.jsonl" | tr -d ' ')"
       datasets="$datasets /work/gen$g/selfplay.jsonl"
-      echo "window: gen$g ($(wc -l < "$WORK/gen$g/selfplay.jsonl" | tr -d ' ') rows)"
+      window_rows=$((window_rows + gen_rows))
+      echo "window: gen$g ($gen_rows rows)"
     fi
   done
   [ -n "$datasets" ] || die "no self-play datasets for generations <= $GEN"
+
+  # Say the size out loud BEFORE the hour-long run, against the measured
+  # ~1.9 GB / 120k rows, so "this window cannot fit" is visible at second 1
+  # rather than inferred from an exit 137 an hour later.
+  awk -v r="$window_rows" -v cap="$TRAIN_MEMORY" 'BEGIN {
+    printf "window: %d rows total -> ~%.1f GB peak expected (cap %s)\n", r, r * 1.9 / 119161, cap }'
 
   rm -f "$CAND"
   # shellcheck disable=SC2086
@@ -253,9 +312,11 @@ stage_train() {
   # lines sit in the container's buffer until exit, so an interrupted run leaves
   # an EMPTY train.log and the holdout curves — the diagnosis for a kept-back
   # candidate — are gone. Learned the hard way on gen 6.
+  local rc=0
   docker run --rm \
     --user "$(id -u):$(id -g)" \
     --cpus "$JOBS" \
+    --memory "$TRAIN_MEMORY" \
     -e PYTHONUNBUFFERED=1 \
     -v "$TRAINER_HOME":/trainer:ro \
     -v "$WORK":/work \
@@ -263,7 +324,17 @@ stage_train() {
     python python/mcts/train_selfplay.py $datasets \
       --out "/work/gen$GEN/candidate.json" \
       --epochs "$EPOCHS" --channels "$CHANNELS" --layers "$LAYERS" --seed "$TRAIN_SEED" \
-    2>&1 | tee "$GDIR/logs/train.log"
+    2>&1 | tee "$GDIR/logs/train.log" || rc=$?
+  # 137 = SIGKILL, which for a --memory'd container means the cgroup OOM-killer.
+  # Worth naming: the generic "exited 137" sends the next person hunting a bug
+  # in the trainer instead of reading the window size off the line above.
+  if [ "$rc" = 137 ]; then
+    die "trainer OOM-killed at --memory $TRAIN_MEMORY on $window_rows rows.
+      The window does not fit. Either lower WINDOW (2 generations ~ 236k rows ~
+      3.7 GB) or raise TRAIN_MEMORY if this box actually has the headroom —
+      it has no swap, so 'actually' means free memory, not total."
+  fi
+  [ "$rc" = 0 ] || die "trainer exited $rc — see $GDIR/logs/train.log"
   [ -s "$CAND" ] || die "training exited 0 but wrote no candidate at $CAND"
 
   # Structural check against the champion. --require-identical because the
@@ -286,7 +357,7 @@ stage_train() {
     die "cargo not on PATH — the Rust load check is not optional here (export PATH=\"\$HOME/.cargo/bin:\$PATH\")"
   fi
 
-  ran train "| train | window=$WINDOW ($(echo $datasets | wc -w | tr -d ' ') generation(s):$(echo "$datasets" | sed 's#/work/gen#gen#g; s#/selfplay.jsonl##g')), epochs=$EPOCHS, ${CHANNELS}ch x ${LAYERS} layers, seed $TRAIN_SEED, nnue-trainer \`train_selfplay.py\` UNCHANGED in \`$IMAGE\`; artifact schema identical to the champion's; loaded by \`PolicyValueNet::load\` |"
+  ran train "| train | window=$WINDOW ($(echo $datasets | wc -w | tr -d ' ') generation(s):$(echo "$datasets" | sed 's#/work/gen#gen#g; s#/selfplay.jsonl##g'), $window_rows rows), epochs=$EPOCHS, ${CHANNELS}ch x ${LAYERS} layers, seed $TRAIN_SEED, nnue-trainer \`train_selfplay.py\` UNCHANGED in \`$IMAGE\`; artifact schema identical to the champion's; loaded by \`PolicyValueNet::load\` |"
 }
 
 # ---------------------------------------------------------------- 3. gauntlet
@@ -345,7 +416,20 @@ stage_gauntlet() {
     trap - EXIT
   fi
 
-  ran gauntlet "| gauntlet | $instances x $per_instance games = $((instances * per_instance)) at $GATE_SIMS FIXED sims, colour-paired, per-instance seeds from $((SEED_BASE + GEN * 10000)) spaced 1000, $GATE_JOBS concurrent games$( [ "$took_lock" = 1 ] && echo ", arena lock held" || echo ", arena lock NOT held") |"
+  # Report the lock's ACTUAL state, not just whether autoscale took it. A
+  # caller that holds the lock itself — which is what you must do to pin a full
+  # 400 while some other executor's timed `arena` is live, since autoscale
+  # declines in exactly that case — was being recorded as "arena lock NOT held",
+  # i.e. the report claimed the run was unprotected when it was.
+  local lock_note
+  if [ "$took_lock" = 1 ]; then
+    lock_note=", arena lock held (taken by this stage)"
+  elif [ -d "$ARENA_LOCK" ]; then
+    lock_note=", arena lock held (taken by the caller)"
+  else
+    lock_note=", arena lock NOT held"
+  fi
+  ran gauntlet "| gauntlet | $instances x $per_instance games = $((instances * per_instance)) at $GATE_SIMS FIXED sims, colour-paired, per-instance seeds from $((SEED_BASE + GEN * 10000)) spaced 1000, $GATE_JOBS concurrent games$lock_note |"
 }
 
 # ---------------------------------------------------------------- 4. report
