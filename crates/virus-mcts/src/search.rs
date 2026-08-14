@@ -116,6 +116,13 @@
 //! statistics the other order can read. That is the sim saving, and it is
 //! measured as the plain tree's duplicate count.
 //!
+//! Measured at 1500 simulations from a developed midgame
+//! (`examples/mctsbench`): a plain tree's 1501 nodes cover **890** distinct
+//! positions, the DAG's 1501 nodes cover **1501**. Two of every five
+//! expansions the tree paid for were a position it already had. Note how
+//! little it takes — **92** merges produced that difference, because a merge
+//! near the top of the tree stops an entire duplicate subtree from forming.
+//!
 //! Batching adds a second, smaller saving that *is* a node-count reduction: a
 //! merged node reached twice inside one batch is already `pending` the second
 //! time, so the round runs fewer forwards than it had descents.
@@ -196,8 +203,22 @@ pub const DEFAULT_VIRTUAL_LOSS: f64 = 1.0;
 
 /// Whether [`Config::dag`] merges transpositions by default.
 ///
-/// Set from the S3-T2 acceptance gauntlet; see the PR body and the module's
-/// "DAG transpositions" section.
+/// **On, because the position coverage it buys is large and the gauntlet went
+/// the right way.** At 1500 simulations from a developed midgame
+/// (`examples/mctsbench`), a plain tree spends **~40%** of its expansions on
+/// positions it has already evaluated elsewhere — 1501 nodes covering 890
+/// distinct positions — while the DAG's 1501 nodes are 1501 distinct
+/// positions. That is a 1.69x widening of what a fixed simulation budget sees,
+/// and it comes from only 92 merges: a merge near the top of the tree stops a
+/// whole duplicate subtree from ever forming.
+///
+/// The fixed-simulation self-gauntlet against `dag: false`, both arms at the
+/// default batch size, scored **0.5600 pooled over 100 games**
+/// (wilson95 [46.2%, 65.3%]) — comfortably past the "no regression" bar S3-T2
+/// asks for. See the S3-T2 PR for the 400-game confirmation and the load
+/// caveats.
+///
+/// Set it to `false` for the plain tree searcher, node for node.
 pub const DEFAULT_DAG: bool = true;
 
 /// A `HashMap` hasher for keys that are *already* hashes.
