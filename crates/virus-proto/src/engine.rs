@@ -2,8 +2,10 @@
 //!
 //! The client owns turn discipline, snapshot validation and cancellation; the
 //! engine owns move choice and nothing else. Everything strength-related plugs
-//! in through [`SearchEngine`], so the alpha-beta and MCTS crates can land
-//! later without touching a line of protocol code.
+//! in through [`SearchEngine`] — which is how the alpha-beta and MCTS crates
+//! both landed, and how the binary composes them (the champion delegating the
+//! games it cannot play to alpha-beta), without touching a line of protocol
+//! code.
 
 use crate::clock::{MoveAllocation, StopPolicy};
 use crate::ponder::PonderInbox;
@@ -217,8 +219,11 @@ impl SearchEngine for GreedyEngine {
 /// Which engine the binary should build.
 ///
 /// [`EngineKind::Mcts`] is the production default and [`EngineKind::Greedy`] is
-/// the reference engine in this crate; [`EngineKind::AlphaBeta`] is the
-/// documented plug-in point for `virus-search`, which is not merged yet.
+/// the reference engine in this crate. [`EngineKind::AlphaBeta`] selects
+/// `virus-search`, and is also what the `vsbot` binary falls back to per
+/// position when the champion is offered a game outside its two-player 12x12
+/// domain — this crate names the engines, but which one plays a given position
+/// is the binary's decision, not the protocol's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum EngineKind {
     /// PUCT + policy/value net (`virus-mcts`). The engine the bot plays with.
@@ -226,7 +231,8 @@ pub enum EngineKind {
     Mcts,
     /// The reference engine in this crate: deliberately weak and instant.
     Greedy,
-    /// Enhanced iterative-deepening alpha-beta (`virus-search`). Not merged.
+    /// Enhanced iterative-deepening alpha-beta (`virus-search`). Any board size,
+    /// two to four players.
     AlphaBeta,
 }
 

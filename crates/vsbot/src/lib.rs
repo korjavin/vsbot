@@ -31,6 +31,18 @@
 //! | `VSBOT_EXPLORE_TURNS`       | `8`                            | Window length, in *our own* turns. |
 //! | `VSBOT_EXPLORE_SEED`        | `1`                            | Base seed for the per-game opening stream. |
 //!
+//! # Which engine actually plays
+//!
+//! `SEARCH=MCTS` is the champion, but it is two-player 12x12 **only** — the
+//! absolute-frame encoder has no representation for another board size and
+//! nowhere to put a third seat's win. Every other game the server offers falls
+//! back, per position and with a loud warning, to the `SEARCH=ALPHABETA` engine,
+//! which has no domain restriction at all: any board size, two to four players,
+//! max^n for the multiplayer seats. Nothing needs configuring for that — it is
+//! simply what the bot does when it is offered a game the champion cannot play,
+//! and it replaced a fallback to the greedy reference engine that made those
+//! games unwinnable. `SEARCH=ALPHABETA` also runs standalone, on its own.
+//!
 //! `VSBOT_EXPLORE_EPS` is the one knob here that makes the bot **weaker on
 //! purpose**, so it is off unless a harness sets it — see [`explore`] for what
 //! it buys and why cross-play cannot be measured without it. It is refused
@@ -54,6 +66,7 @@
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 
+pub mod alphabeta;
 pub mod explore;
 pub mod mcts;
 
@@ -64,6 +77,7 @@ use std::time::Duration;
 
 use virus_proto::{BotConfig, EngineKind, GreedyEngine, SearchEngine, StopPolicy};
 
+pub use alphabeta::AlphaBetaEngine;
 pub use explore::{ExploreSettings, ExploringEngine};
 pub use mcts::MctsEngine;
 
@@ -340,33 +354,25 @@ impl fmt::Debug for EngineSetup {
 
 /// **Engine wiring point.**
 ///
-/// `virus-mcts` is wired. `virus-search` (enhanced alpha-beta) has landed as a
-/// crate but is deliberately **not** wired here — that is a separate bead — so
-/// `SEARCH=ALPHABETA` is a hard startup failure rather than a downgrade.
-/// Falling back to the greedy reference engine there would let a deployment
-/// believe it is running a real searcher while it plays at the level of "first
-/// capture I see".
+/// All three engines are wired. `SEARCH=MCTS` is the champion and the default;
+/// `SEARCH=ALPHABETA` is the enhanced alpha-beta searcher with the hand-tuned
+/// leaf, which plays any board size and two to four players; `SEARCH=GREEDY` is
+/// the reference engine and is only ever selected deliberately.
 ///
-/// A missing or invalid `MCTS_ARTIFACT` is a startup failure for the same
-/// reason. The *per-game* domain checks (two players, 12x12) are different in
-/// kind: they depend on a game the process has not been offered yet, so they
-/// cannot be decided here and are handled — loudly — inside [`MctsEngine`].
+/// A missing or invalid `MCTS_ARTIFACT` is a startup failure, never a quiet
+/// downgrade: a harness that believes it is measuring the net while the greedy
+/// engine plays is the Java `unwiredEvalWarning` post-mortem exactly. The
+/// *per-game* domain checks (two players, 12x12) are different in kind — they
+/// depend on a game the process has not been offered yet, so they cannot be
+/// decided here and are handled, loudly, inside [`MctsEngine`], which falls
+/// back to [`AlphaBetaEngine`] for any position it cannot encode.
 pub fn build_engine(kind: EngineKind, mcts: &MctsSettings) -> Result<EngineSetup, String> {
     match kind {
         EngineKind::Mcts => {
-            let engine = MctsEngine::load(&mcts.artifact, mcts.seed, mcts.ponder_trace).map_err(
-                |error| {
-                    format!(
-                        "SEARCH=MCTS could not load {}: {error}. Set MCTS_ARTIFACT to a valid \
-                         policy/value export, or run SEARCH=GREEDY deliberately — the bot will \
-                         not quietly downgrade itself.",
-                        mcts.artifact.display()
-                    )
-                },
-            )?;
+            let engine = build_mcts(mcts)?;
             let description = format!("engine=MCTS {}", engine.describe());
             Ok(EngineSetup {
-                engine: Arc::new(engine),
+                engine,
                 description,
             })
         }
@@ -375,12 +381,36 @@ pub fn build_engine(kind: EngineKind, mcts: &MctsSettings) -> Result<EngineSetup
             description: "engine=GREEDY (reference engine: first capture, else first legal move)"
                 .to_owned(),
         }),
-        EngineKind::AlphaBeta => Err(
-            "SEARCH=ALPHABETA is not wired into this binary yet (a follow-up bead extends the \
-             chain once virus-search has a deadline-safe entry point); use SEARCH=MCTS"
-                .to_owned(),
-        ),
+        EngineKind::AlphaBeta => {
+            let engine = AlphaBetaEngine::new();
+            let description = format!("engine=ALPHABETA {}", engine.describe());
+            Ok(EngineSetup {
+                engine: Arc::new(engine),
+                description,
+            })
+        }
     }
+}
+
+/// The `SEARCH=MCTS` arm of [`build_engine`], keeping the concrete type.
+///
+/// [`build_engine`] returns `Arc<dyn SearchEngine>`, which is what `Bot` wants
+/// and what every caller should use. This exists for the one thing the trait
+/// object cannot express: the live-game tests assert on the engine's *own*
+/// fallback bookkeeping ([`MctsEngine::degradations`]) after a game on a board
+/// the champion cannot play, and they must do it on the engine the deployment
+/// actually builds rather than a hand-assembled lookalike.
+pub fn build_mcts(mcts: &MctsSettings) -> Result<Arc<MctsEngine>, String> {
+    let engine =
+        MctsEngine::load(&mcts.artifact, mcts.seed, mcts.ponder_trace).map_err(|error| {
+            format!(
+            "SEARCH=MCTS could not load {}: {error}. Set MCTS_ARTIFACT to a valid policy/value \
+             export, or run SEARCH=GREEDY deliberately — the bot will not quietly downgrade \
+             itself.",
+            mcts.artifact.display()
+        )
+        })?;
+    Ok(Arc::new(engine))
 }
 
 #[cfg(test)]
@@ -658,11 +688,37 @@ mod tests {
         );
     }
 
+    /// `SEARCH=ALPHABETA` is a working standalone engine, not a startup failure
+    /// and not a downgrade to the reference engine.
     #[test]
-    fn alphabeta_errors_rather_than_falling_back() {
-        let error = build_engine(EngineKind::AlphaBeta, &champion())
-            .expect_err("virus-search is not wired into the binary");
-        assert!(error.contains("not wired into this binary"), "{error}");
+    fn alphabeta_is_wired_and_describes_itself() {
+        let setup = build_engine(EngineKind::AlphaBeta, &champion())
+            .expect("virus-search needs no artifact");
+        assert_eq!(setup.engine.name(), "alphabeta");
+        assert!(
+            setup.description.starts_with("engine=ALPHABETA "),
+            "{setup:?}"
+        );
+        assert!(setup.description.contains("enhanced=true"), "{setup:?}");
+        // Nothing but the champion loads the artifact, so a bad path must not
+        // stop the alpha-beta engine from starting.
+        let missing = MctsSettings {
+            artifact: PathBuf::from("/nonexistent/gen99.json"),
+            ..MctsSettings::default()
+        };
+        assert!(build_engine(EngineKind::AlphaBeta, &missing).is_ok());
+    }
+
+    /// The one engine that can play anything must be reachable from the same
+    /// `SEARCH` spellings the parser accepts.
+    #[test]
+    fn search_alphabeta_selects_the_alphabeta_engine() {
+        for spelling in ["ALPHABETA", "alphabeta", "alpha_beta", " AlphaBeta "] {
+            let chosen = settings(&[("SEARCH", spelling)])
+                .unwrap_or_else(|error| panic!("{spelling:?}: {error}"))
+                .engine;
+            assert_eq!(chosen, EngineKind::AlphaBeta, "{spelling:?}");
+        }
     }
 
     #[test]

@@ -9,10 +9,22 @@ How the bot is containerized and how it runs against the public server at
 conv policy/value net (`MCTS_ARTIFACT`, baked into the image), batched SIMD
 inference, driven by the intra-turn time allocator at 10 s per 3-action turn.
 A bad or missing artifact is a *hard startup failure*, and a per-game domain
-mismatch (>2 players, non-12×12) falls back to `GREEDY` with a `WARNING` line
+mismatch (>2 players, non-12×12) falls back to `ALPHABETA` with a `WARNING` line
 on every change of verdict — a deployment can never silently believe it is
-running the champion while playing at random. Strength claims still come only
-from ≥400-game gauntlets (`docs/benchmarks.md`), never from live play.
+running the champion while playing something else. Strength claims still come
+only from ≥400-game gauntlets (`docs/benchmarks.md`), never from live play.
+
+**The fallback is a real engine.** The champion is two-player 12×12 only: the
+absolute-frame encoder has no representation for another board size and nowhere
+to put a third seat's win. Every other game the server offers — any board from
+5×5 to 50×50, and every 3- or 4-player lobby game — is played by
+`virus-search`'s enhanced iterative-deepening alpha-beta with the hand-tuned
+leaf evaluation (max^n for the multiplayer seats), driven by the same intra-turn
+allocator. It used to fall back to `GREEDY` ("first capture I see"), which made
+those games unwinnable; the `WARNING` is unchanged in loudness and still names
+the engine that is actually playing. The startup banner names it too, so a
+deployment can be checked before it is ever offered such a game. `SEARCH=ALPHABETA`
+selects the same engine standalone, for every game, and needs no artifact.
 
 ## Environment knobs
 
@@ -31,7 +43,7 @@ unparseable value **fails startup** instead of quietly falling back.
 | `VSBOT_EXTENSION` | `true` | Run past an action's target toward its ceiling while the root is unstable. The ceiling is capped by what remains of the turn, so extensions can never break the turn bound. |
 | `VSBOT_PONDER` | `false` | Search the opponent's positions during their turn, re-rooting into the matched child on each of their actions. **Off pending bug `vsbot-gei`** (2026-08-13 canary found a quality regression); when fixed, it re-ships through the automated canary path (docs/CANARY.md). |
 | `VSBOT_PONDER_SECS` | `30` | Cap on one pondering step. Bounds CPU and tree memory on a host shared with the nightly trainer window. |
-| `SEARCH` | `MCTS` | `GREEDY` \| `ALPHABETA` \| `MCTS`. `MCTS` is the default (compose and image agree). `ALPHABETA` aborts startup — the crate is merged but not yet wired into the binary. |
+| `SEARCH` | `MCTS` | `GREEDY` \| `ALPHABETA` \| `MCTS`. `MCTS` is the default (compose and image agree) and is also what falls back to `ALPHABETA` off 12×12 or above two seats. `ALPHABETA` runs the same alpha-beta engine for *every* game and loads no artifact. `GREEDY` is the reference engine and is only ever set deliberately. |
 | `CHALLENGER` | `false` | Whether the bot initiates games on a timer. **Keep this `false` in production** (see below). |
 | `CHALLENGER_INTERVAL_SECS` | `300` | Challenger period; first tick is jittered. Irrelevant while `CHALLENGER=false`. |
 | `VSBOT_EXPLORE_EPS` | `0` *(off)* | **Measurement harness only — never set this in production.** Probability that an opening action is replaced by a uniformly random legal one, i.e. the bot playing *deliberately worse* so a cross-play run's games differ from each other (bd `vsbot-t3q.2`, `crates/vsbot/src/explore.rs`). At `0` no RNG is interposed at all. Refused together with `VSBOT_PONDER=true`. |
@@ -253,7 +265,7 @@ stack **Environment variables** table):
 | `BACKEND_URL` | `wss://vs.wandergeek.org/ws` | Pointing at a private/staging backend. |
 | `BOT_NAME_PREFIX` | `SuperiorBot` | **Set this if a second installation exists** — two hosts under the same prefix are indistinguishable in the lobby. |
 | `VSBOT_TURN_MILLIS` | `10000` | Slower/faster host, or a canary at the top of the UX bound. |
-| `SEARCH` | `MCTS` | Only to fall back to `GREEDY`. `ALPHABETA` aborts startup. |
+| `SEARCH` | `MCTS` | Rarely. `MCTS` already plays `ALPHABETA` for the games it cannot; set `ALPHABETA` only to run alpha-beta for *every* game, and `GREEDY` only to reduce the bot to the reference engine on purpose. |
 | `VSBOT_PONDER` | `false` | Off pending bd `vsbot-gei`; canary it, do not just turn it on. |
 | `CHALLENGER` | `false` | Keep false against the public server (see above). |
 | `VSBOT_CONTAINER_NAME` | `vsbot` | Only if another container on that host already owns the name. |
