@@ -255,6 +255,26 @@ impl GumbelPlan {
 
     /// The root edge the next descent must take.
     ///
+    /// **Round-robin over the candidates, not `per_action` in a row each.** The
+    /// two orders hand out identical totals and the difference looks cosmetic;
+    /// it is not, because of leaf batching. A round collects
+    /// [`crate::Config::batch_size`] descents before any of them backs up, and
+    /// a descent that reaches an already-collected node reuses its pending
+    /// evaluation instead of queueing a second one. So `per_action` consecutive
+    /// descents into a *fresh* candidate all land on the same newly created
+    /// child: the first expands it, the rest reuse it, and the phase spends
+    /// `per_action` simulations to learn what one net forward already said.
+    /// At the tuned batch size that wasted about a sixth of the whole budget in
+    /// the first phase, where every candidate is fresh by definition.
+    ///
+    /// Round-robin puts `min(batch, |alive|)` *different* candidates in the
+    /// first batch, so each pays for its own forward; by the time the cycle
+    /// comes back around their children are expanded and the descents continue
+    /// past them into genuinely new positions, decorrelated by the ordinary
+    /// virtual loss. It is also what `mctx` does — it selects the considered
+    /// action with the fewest visits, which with nothing in flight *is*
+    /// round-robin.
+    ///
     /// # Panics
     /// Panics when a halving is due; the searcher performs it first.
     pub(crate) fn take(&mut self) -> usize {
@@ -265,7 +285,7 @@ impl GumbelPlan {
         let slot = if self.alive.len() == 1 {
             0
         } else {
-            (self.given / self.per_action) as usize
+            self.given as usize % self.alive.len()
         };
         self.given += 1;
         self.scheduled += 1;

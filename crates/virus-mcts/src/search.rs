@@ -431,6 +431,17 @@ struct Node {
     terminal: bool,
     /// Absolute-frame terminal value; meaningful only when `terminal`.
     terminal_value_abs: f64,
+    /// This node's **own** leaf evaluation in the absolute frame — the value
+    /// its expansion backed up, or its terminal value.
+    ///
+    /// Distinct from the visit-weighted average of its children, which is what
+    /// [`MctsSearcher::root_value_abs`] reports, and the completed-Q `v_mix`
+    /// needs *this* one: `v_mix` interpolates the node's own estimate with its
+    /// children's, so feeding it the children's average again would collapse
+    /// the interpolation. Stored per node rather than beside the root so that
+    /// [`MctsSearcher::rebase`] promotes a child without having to re-derive or
+    /// re-evaluate anything.
+    leaf_value_abs: f64,
     expanded: bool,
     /// Set while this node is a collected-but-unevaluated leaf of the current
     /// batch, so a second descent in the same batch reuses its pending
@@ -465,6 +476,7 @@ impl Node {
             mover,
             terminal,
             terminal_value_abs,
+            leaf_value_abs: terminal_value_abs,
             expanded: false,
             pending: false,
             actions: Vec::new(),
@@ -559,14 +571,6 @@ pub struct MctsSearcher<'net> {
     /// Redrawn by [`MctsSearcher::rebase`], because a schedule belongs to one
     /// root and its edge indices mean nothing at the next one.
     gumbel: Option<GumbelPlan>,
-    /// The root's own leaf value, absolute frame — the net's `v(s_root)`, or
-    /// the hand-tuned squash when there is no value head.
-    ///
-    /// Kept because the completed-Q improved policy needs it: `v_mix`
-    /// interpolates between the root's *own* estimate and the visited
-    /// children's, and the visit-weighted [`MctsSearcher::root_value_abs`] is
-    /// not the same quantity — it is already the children's average.
-    root_leaf_value_abs: f64,
     rng: Rng,
     sims: u64,
     /// Reusable batch buffers, so a round of simulations allocates nothing
@@ -631,7 +635,6 @@ impl<'net> MctsSearcher<'net> {
             merges: 0,
             key_collisions: 0,
             gumbel: None,
-            root_leaf_value_abs: 0.0,
             rng: Rng::new(config.seed),
             sims: 0,
             path: Vec::with_capacity(1024),
@@ -646,10 +649,10 @@ impl<'net> MctsSearcher<'net> {
             eval_params: EvalParams::default(),
             eval_workspace: EvalWorkspace::new(),
         };
-        if searcher.nodes[0].terminal {
-            searcher.root_leaf_value_abs = searcher.nodes[0].terminal_value_abs;
-        } else {
-            searcher.root_leaf_value_abs = searcher.expand(0);
+        if !searcher.nodes[0].terminal {
+            // `expand` records the leaf value on the node itself, so nothing
+            // here has to hold on to it.
+            searcher.expand(0);
             if !searcher.nodes[0].terminal {
                 if searcher.config.root_noise {
                     searcher.apply_root_noise();
@@ -902,6 +905,19 @@ impl<'net> MctsSearcher<'net> {
         root.w.iter().sum::<f64>() / f64::from(root.visits)
     }
 
+    /// The root's **own** leaf evaluation in the absolute frame: the net's
+    /// `v(s_root)`, or the hand-tuned squash when the artifact has no value
+    /// head, or the terminal value at a finished position.
+    ///
+    /// Deliberately not the same number as [`MctsSearcher::root_value_abs`],
+    /// which averages the *children*. The completed-Q `v_mix` interpolates the
+    /// two, so confusing them collapses the interpolation onto one side — and
+    /// it does so silently, in a direction that looks plausible. This is the
+    /// accessor that lets a test say which one a re-rooted tree kept.
+    pub fn root_leaf_value_abs(&self) -> f64 {
+        self.nodes[0].leaf_value_abs
+    }
+
     /// Most-visited root action, ties broken by enumeration order. `None` at a
     /// terminal or stuck root.
     ///
@@ -1067,7 +1083,12 @@ impl<'net> MctsSearcher<'net> {
         // Self-play (the only caller that sets `gumbel`) builds a fresh
         // searcher per ply and never reaches this, so it is a well-definedness
         // guarantee rather than a hot path.
-        self.root_leaf_value_abs = self.root_value_abs();
+        //
+        // The promoted child carries its own `leaf_value_abs` from the
+        // expansion that created it, so `v_mix` is the same quantity a fresh
+        // searcher on this position would compute — no re-evaluation, and in
+        // particular *not* the child-visit average, which would double-count
+        // the children `v_mix` is interpolating against.
         self.gumbel = None;
         self.plan_gumbel();
         true
@@ -1325,6 +1346,7 @@ impl<'net> MctsSearcher<'net> {
             let node = &mut self.nodes[id];
             node.terminal = true;
             node.terminal_value_abs = terminal_value_abs(&node.state);
+            node.leaf_value_abs = node.terminal_value_abs;
             return false;
         }
         let node = &mut self.nodes[id];
@@ -1378,6 +1400,7 @@ impl<'net> MctsSearcher<'net> {
         let node = &mut self.nodes[id];
         node.prior = prior;
         node.expanded = true;
+        node.leaf_value_abs = value_abs;
         value_abs
     }
 
@@ -1519,7 +1542,7 @@ impl<'net> MctsSearcher<'net> {
                 prior_weighted_q += prior * q(a);
             }
         }
-        let v_root = sign * self.root_leaf_value_abs;
+        let v_root = sign * root.leaf_value_abs;
         let v_mix = if visits == 0 || prior_visited <= 0.0 {
             v_root
         } else {

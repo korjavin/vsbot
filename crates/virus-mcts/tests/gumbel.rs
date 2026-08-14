@@ -377,3 +377,71 @@ fn the_improved_policy_reads_q_from_the_root_movers_chair() {
         assert_ne!(lo, hi, "mover {mover}: the visited values are all equal");
     }
 }
+
+/// Leaf batching must not eat the schedule.
+///
+/// A round collects several descents before any backs up, and a descent onto an
+/// already-collected node reuses that node's pending evaluation. With the
+/// candidates visited in blocks (`per_action` in a row each) the first phase
+/// spends nearly all of its simulations re-reaching one freshly created child
+/// per candidate; round-robin puts a whole batch of *different* candidates in
+/// flight instead. The observable difference is how many distinct positions the
+/// budget bought.
+#[test]
+fn a_batched_gumbel_search_still_expands_a_position_per_simulation() {
+    let net = champion();
+    let sims = 192;
+    let config = Config {
+        batch_size: 8,
+        ..gumbel(31, sims, 16)
+    };
+    let searcher = run(midgame(1), config, Some(&net), sims);
+    let nodes = searcher.node_count();
+    assert!(
+        nodes as f64 >= 0.9 * f64::from(sims),
+        "a {sims}-simulation batched Gumbel search expanded only {nodes} nodes — \
+         the schedule is collapsing onto reused leaves"
+    );
+}
+
+/// Re-rooting must promote the child's **own** leaf evaluation, not the
+/// average of its children.
+///
+/// `v_mix` interpolates the root's own value with what its visited children
+/// measured, so handing it the children's average again collapses the
+/// interpolation — every unvisited action gets a completed-Q that no fresh
+/// searcher on the same position would produce, and the improved policy and the
+/// halving decisions drift with it. Self-play never re-roots (a fresh searcher
+/// per ply), which is exactly why this needs a test rather than a comment.
+#[test]
+fn rebasing_promotes_the_childs_own_leaf_value_not_its_childrens_average() {
+    let net = champion();
+    let config = gumbel(17, 128, 8);
+    let mut searcher = MctsSearcher::new(midgame(1), config, Some(&net));
+    searcher.run_sims(128);
+
+    let action = searcher.best_action().expect("an answer");
+    let child = midgame(1).apply(action).expect("the answer is legal");
+    assert!(searcher.rebase(action), "the searched child must exist");
+
+    let fresh = MctsSearcher::new(child, config, Some(&net));
+    assert_eq!(
+        searcher.root_leaf_value_abs().to_bits(),
+        fresh.root_leaf_value_abs().to_bits(),
+        "a promoted root must carry the same own-value a fresh searcher computes"
+    );
+    // And the two quantities really are different here, so the assertion above
+    // is not passing by coincidence on a tree where they happen to agree.
+    assert_ne!(
+        searcher.root_leaf_value_abs().to_bits(),
+        searcher.root_value_abs().to_bits(),
+        "the child-visit average and the root's own value coincided — this run \
+         cannot tell the two apart"
+    );
+    // The schedule is redrawn for the new root rather than carried over.
+    assert!(searcher.is_gumbel());
+    assert_eq!(
+        searcher.root_improved_policy().len(),
+        searcher.root_actions().len()
+    );
+}
